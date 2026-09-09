@@ -24,8 +24,9 @@ type Deliverer struct {
 	endpoints func(broadcast.WindowID) string
 	dialTO    time.Duration
 
-	mu    sync.Mutex
-	conns map[string]net.Conn // keyed by endpoint
+	mu     sync.Mutex
+	conns  map[string]net.Conn         // keyed by endpoint
+	warned map[broadcast.WindowID]bool // targets already warned about (no endpoint)
 }
 
 // New builds an agent Deliverer. endpoints resolves a target WindowID to its
@@ -35,6 +36,7 @@ func New(endpoints func(broadcast.WindowID) string) *Deliverer {
 		endpoints: endpoints,
 		dialTO:    2 * time.Second,
 		conns:     map[string]net.Conn{},
+		warned:    map[broadcast.WindowID]bool{},
 	}
 }
 
@@ -84,21 +86,47 @@ func (d *Deliverer) Deliver(_ context.Context, ev keys.Event, targets []broadcas
 	for _, t := range targets {
 		ep := d.endpoints(t)
 		if ep == "" {
-			notify("agent: no endpoint for "+string(t), true)
+			d.warnOnce(t, notify) // a ticked target with no --agent entry: warn once, not per key
 			continue
 		}
+		if d.send(ep, frame, notify) {
+			delivered++
+		}
+	}
+	return delivered, nil
+}
+
+// send writes frame to ep, transparently re-dialing once if the cached
+// connection is stale (a "connection reset"/broken pipe from an agent that
+// restarted or an idle-closed socket). Returns whether the frame was delivered.
+func (d *Deliverer) send(ep string, frame agentwire.Frame, notify func(string, bool)) bool {
+	for attempt := 0; attempt < 2; attempt++ {
 		c, err := d.conn(ep)
 		if err != nil {
 			notify("agent dial "+ep+": "+err.Error(), true)
-			continue
+			return false
 		}
 		if err := frame.Write(c); err != nil {
-			// stale/closed connection — drop it and report; next key re-dials.
-			d.drop(ep)
-			notify("agent send to "+ep+": "+err.Error(), true)
+			d.drop(ep) // stale connection — force a fresh dial on the retry
+			if attempt == 1 {
+				notify("agent send to "+ep+": "+err.Error(), true)
+				return false
+			}
 			continue
 		}
-		delivered++
+		return true
 	}
-	return delivered, nil
+	return false
+}
+
+// warnOnce reports a missing endpoint for a ticked target a single time, so a
+// deliberately-unmapped target (or a title typo) doesn't spam the log per key.
+func (d *Deliverer) warnOnce(t broadcast.WindowID, notify func(string, bool)) {
+	d.mu.Lock()
+	first := !d.warned[t]
+	d.warned[t] = true
+	d.mu.Unlock()
+	if first {
+		notify("agent: no endpoint mapped for target "+string(t)+" (ticked but not in --agent); ignoring it", true)
+	}
 }

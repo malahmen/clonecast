@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -43,6 +45,7 @@ var (
 	procGetWindowTextW   = user32.NewProc("GetWindowTextW")
 	procPostMessageW     = user32.NewProc("PostMessageW")
 	procPeekMessageW     = user32.NewProc("PeekMessageW")
+	procIsWindow         = user32.NewProc("IsWindow")
 )
 
 const (
@@ -103,6 +106,38 @@ func resolveHWND(title string) uintptr {
 	return 0
 }
 
+// resolver caches the game window's HWND but re-resolves it when it goes
+// stale. WoW recreates its top-level window across state changes (login ->
+// char-select -> world, loading screens), so a once-cached HWND becomes a dead
+// handle and PostMessage silently goes nowhere. Validity is checked cheaply
+// (IsWindow + the title still matches) on every send; only when that fails is
+// the full GetWindow tree-walk re-run.
+type resolver struct {
+	title string
+	mu    sync.Mutex
+	hwnd  uintptr
+}
+
+func (r *resolver) valid(h uintptr) bool {
+	if h == 0 {
+		return false
+	}
+	ok, _, _ := procIsWindow.Call(h)
+	return ok != 0 && getWindowText(h) == r.title
+}
+
+// current returns a live HWND for the target window, re-walking if the cached
+// one is stale. Returns 0 if the window can't be found right now.
+func (r *resolver) current() uintptr {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.valid(r.hwnd) {
+		return r.hwnd
+	}
+	r.hwnd = findByTitle(r.title)
+	return r.hwnd
+}
+
 func lparam(scan uint16, extended, up bool) uintptr {
 	lp := uint32(1) | uint32(scan)<<16 // repeat count 1, scancode
 	if extended {
@@ -114,10 +149,15 @@ func lparam(scan uint16, extended, up bool) uintptr {
 	return uintptr(lp)
 }
 
-func post(hwnd uintptr, f agentwire.Frame) {
+func post(r *resolver, f agentwire.Frame) {
 	vk, scan, ext, ok := agentwire.WinKey(f.Code)
 	if !ok {
 		logf("unmapped evdev code %d, ignored", f.Code)
+		return
+	}
+	hwnd := r.current()
+	if hwnd == 0 {
+		logf("target window not found (gone?), dropping evdev %d", f.Code)
 		return
 	}
 	msg := uintptr(wmKEYUP)
@@ -128,6 +168,14 @@ func post(hwnd uintptr, f agentwire.Frame) {
 }
 
 func main() {
+	// Pin to a single OS thread/P. Go's multi-threaded scheduler (and its
+	// sysmon/netpoller) has been observed to spin at ~100% CPU under Wine,
+	// nondeterministically, in a busy wineserver (one agent came up fine, a
+	// second spun). GOMAXPROCS(1) removes the multi-P scheduler contention
+	// that triggers it. This process does very little work, so one P is
+	// plenty.
+	runtime.GOMAXPROCS(1)
+
 	port := flag.Int("port", 48900, "loopback TCP port to listen on")
 	title := flag.String("title", "World of Warcraft", "exact window title to deliver keys to")
 	flag.Parse()
@@ -139,6 +187,7 @@ func main() {
 		os.Exit(1)
 	}
 	logf("window found: hwnd=0x%x", hwnd)
+	res := &resolver{title: *title, hwnd: hwnd}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	ln, err := net.Listen("tcp", addr)
@@ -157,7 +206,7 @@ func main() {
 		logf("client connected: %s", conn.RemoteAddr())
 		go func(c net.Conn) {
 			defer c.Close()
-			_ = agentwire.Read(c, func(f agentwire.Frame) { post(hwnd, f) })
+			_ = agentwire.Read(c, func(f agentwire.Frame) { post(res, f) })
 			logf("client disconnected")
 		}(conn)
 	}
