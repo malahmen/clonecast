@@ -199,10 +199,13 @@ func (d *deliverer) resolve(id broadcast.WindowID) (xproto.Window, bool) {
 	return w, true
 }
 
-func (d *deliverer) Deliver(_ context.Context, ev keys.Event, targets []broadcast.WindowID, notify func(string, bool)) (int, error) {
+func (d *deliverer) Deliver(_ context.Context, ev keys.Event, origin broadcast.WindowID, targets []broadcast.WindowID, notify func(string, bool)) (int, error) {
 	down := ev.State != keys.Up
 	delivered := 0
 	for _, t := range targets {
+		if t == origin {
+			continue // already received ev via passthrough
+		}
 		w, ok := d.resolve(t)
 		if !ok {
 			notify("xsend: no X window for "+string(t), true)

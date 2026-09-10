@@ -11,8 +11,13 @@
 //     one is actually in flight right now, on that single one. See the
 //     paragraphs below for why that distinction is load-bearing.
 //  2. If broadcasting is enabled and the key is in the allowlist, the engine
-//     then activates each target window in turn, replays the event, and finally
-//     restores focus to the original window.
+//     resolves the focused window (origin) fresh and hands it to the
+//     selected Deliverer along with the target set. The master is therefore
+//     whichever ticked window you're looking at right now, not a fixed one
+//     (REFERENCE.md 4.15/7.10) — every Deliverer skips origin, since step 1
+//     already delivered ev there, and by default (Config.RequireOriginTicked)
+//     nothing broadcasts at all unless origin is itself one of the ticked
+//     targets, so an unrelated focused window can't drive the whole session.
 //
 // Only Down and Up transitions are broadcast. Auto-repeat events are replayed
 // to the focused window only, because juggling focus at repeat rate is both
@@ -113,15 +118,25 @@ type Config struct {
 	ToggleKey keys.Code
 	// OpTimeout bounds each WindowManager call.
 	OpTimeout time.Duration
+	// RequireOriginTicked gates broadcast on the focused window (origin)
+	// itself being one of the ticked targets (REFERENCE.md 4.15/7.10): with
+	// it on (the default), typing in an unrelated window — the terminal
+	// clonecast runs in, a browser, anything not ticked — never broadcasts,
+	// even with broadcasting enabled and the key in the filter, since origin
+	// isn't part of "the multibox session." Turning it off restores the
+	// pre-4.15 behavior of always broadcasting to every ticked target
+	// regardless of what's focused.
+	RequireOriginTicked bool
 }
 
 // DefaultConfig is a sane starting point.
 func DefaultConfig() Config {
 	toggle, _ := keys.Parse("SCROLLLOCK")
 	return Config{
-		SettleDelay: 30 * time.Millisecond,
-		ToggleKey:   toggle,
-		OpTimeout:   2 * time.Second,
+		SettleDelay:         30 * time.Millisecond,
+		ToggleKey:           toggle,
+		OpTimeout:           2 * time.Second,
+		RequireOriginTicked: true,
 	}
 }
 
@@ -130,6 +145,7 @@ func DefaultConfig() Config {
 type Engine struct {
 	src Source
 	inj Injector
+	wm  WindowManager
 	cfg Config
 
 	// deliverer performs step 2 (broadcast). Defaults to the focus dance; swap
@@ -163,6 +179,7 @@ func New(src Source, inj Injector, wm WindowManager, cfg Config) *Engine {
 	e := &Engine{
 		src:     src,
 		inj:     inj,
+		wm:      wm,
 		cfg:     cfg,
 		notices: make(chan Notice, 64),
 		queue:   make(chan keys.Event, 16),
@@ -298,15 +315,16 @@ func (e *Engine) broadcastLoop(ctx context.Context) {
 func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 	e.mu.RLock()
 	targets := append([]WindowID(nil), e.targets...)
+	requireOriginTicked := e.cfg.RequireOriginTicked
 	e.mu.RUnlock()
 	if len(targets) == 0 {
 		return
 	}
 
 	// A focus-moving backend (the dance) must hold focusMu for its entire
-	// duration: from before it reads the origin window through the final
-	// restore, real focus may not be where passthrough assumes it is (see
-	// package doc). A focus-free backend (agent/xsend) never moves focus, so
+	// duration: from before origin is resolved through the final restore,
+	// real focus may not be where passthrough assumes it is (see package
+	// doc). A focus-free backend (agent/xsend) never moves focus, so
 	// passthrough need never wait on it and we skip the lock. Because a
 	// focus-moving delivery holds focusMu here, its own Emit calls (inside the
 	// deliverer) don't re-acquire it.
@@ -318,11 +336,37 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 	opCtx, cancel := context.WithTimeout(ctx, e.cfg.OpTimeout)
 	defer cancel()
 
-	delivered, err := e.deliverer.Deliver(opCtx, ev, targets, e.notify)
+	// The master is whichever ticked window is focused right now, not a
+	// fixed one (REFERENCE.md 4.15/7.10): resolved fresh on every broadcast
+	// key, once, and handed to the deliverer so every backend — not just the
+	// dance — skips it (origin already got ev via passthrough in step 1).
+	origin, err := e.wm.Active(opCtx)
+	if err != nil {
+		e.notify(fmt.Sprintf("active window: %v", err), true)
+		return
+	}
+
+	if requireOriginTicked && !containsID(targets, origin) {
+		// Focused window isn't part of the multibox session (e.g. you tabbed
+		// to the terminal or a browser): don't drive every ticked client from
+		// an unrelated window. See Config.RequireOriginTicked.
+		return
+	}
+
+	delivered, err := e.deliverer.Deliver(opCtx, ev, origin, targets, e.notify)
 	if err != nil {
 		return // deliverer already reported the failure via notify
 	}
 	e.notify(fmt.Sprintf("%v -> %d target(s)", ev, delivered), false)
+}
+
+func containsID(ids []WindowID, id WindowID) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
 }
 
 // passthroughEmit is step 1's Emit, guarded by focusMu so it can never fire

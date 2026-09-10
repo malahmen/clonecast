@@ -80,10 +80,13 @@ func (d *Deliverer) drop(ep string) {
 	d.mu.Unlock()
 }
 
-func (d *Deliverer) Deliver(_ context.Context, ev keys.Event, targets []broadcast.WindowID, notify func(string, bool)) (int, error) {
+func (d *Deliverer) Deliver(_ context.Context, ev keys.Event, origin broadcast.WindowID, targets []broadcast.WindowID, notify func(string, bool)) (int, error) {
 	frame := agentwire.Frame{Code: uint16(ev.Code), Down: ev.State != keys.Up}
 	delivered := 0
 	for _, t := range targets {
+		if t == origin {
+			continue // already received ev via passthrough
+		}
 		ep := d.endpoints(t)
 		if ep == "" {
 			d.warnOnce(t, notify) // a ticked target with no --agent entry: warn once, not per key

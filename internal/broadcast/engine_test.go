@@ -157,7 +157,10 @@ func TestPassthroughNeverFiresWhileADanceHoldsFocus(t *testing.T) {
 	rec := &recorder{active: "origin", delay: 50 * time.Millisecond}
 	src := &fakeSource{ch: make(chan keys.Event, 8)}
 	e := newEngine(rec, src)
-	e.SetTargets([]WindowID{"t1"})
+	// "origin" is ticked alongside "t1" so the default RequireOriginTicked
+	// gate (4.15) lets this broadcast through — origin is part of the
+	// multibox session, it just already got the key via passthrough.
+	e.SetTargets([]WindowID{"t1", "origin"})
 	a, _ := keys.Parse("a")
 	b, _ := keys.Parse("b")
 	e.SetFilter(keys.Of(a)) // only 'a' broadcasts; 'b' is passthrough-only
@@ -214,6 +217,135 @@ func TestToggleKeyIsConsumed(t *testing.T) {
 	}
 	if got := rec.snapshot(); len(got) != 0 {
 		t.Fatalf("toggle key leaked to injector: %v", got)
+	}
+}
+
+// fakeFocusFreeDeliverer mimics the shape of the agent/xsend backends (no
+// focus movement): it records exactly the origin and target set it was
+// handed, so tests can confirm the *engine* resolves origin once per
+// broadcast and that origin-skipping isn't dance-specific behavior anymore
+// (REFERENCE.md 4.15/7.10) — every backend gets origin from the engine and is
+// expected to skip it itself, same as the real agent/x11 deliverers do.
+type fakeFocusFreeDeliverer struct {
+	mu    sync.Mutex
+	calls []call
+}
+
+type call struct {
+	origin  WindowID
+	targets []WindowID
+}
+
+func (f *fakeFocusFreeDeliverer) MovesFocus() bool { return false }
+func (f *fakeFocusFreeDeliverer) Close() error     { return nil }
+
+func (f *fakeFocusFreeDeliverer) Deliver(_ context.Context, _ keys.Event, origin WindowID, targets []WindowID, _ func(string, bool)) (int, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, call{origin: origin, targets: append([]WindowID(nil), targets...)})
+	f.mu.Unlock()
+
+	delivered := 0
+	for _, t := range targets {
+		if t != origin { // exactly what the real agent/x11 deliverers do
+			delivered++
+		}
+	}
+	return delivered, nil
+}
+
+func (f *fakeFocusFreeDeliverer) snapshot() []call {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]call(nil), f.calls...)
+}
+
+// TestDynamicMasterOriginSkippedByNonDanceBackend is the regression test for
+// the bug 4.15 fixes: before it, only danceDeliverer resolved and skipped
+// origin — agentDeliverer and the xsend deliverer broadcast to every ticked
+// target unconditionally, so a focused target ticked alongside its peers
+// received the key twice (once via passthrough, once via the backend). Here,
+// with a focus-free fake deliverer standing in for agent/xsend, ticking the
+// currently-focused window ("malahmen") alongside "marx" must still result in
+// exactly one delivered target (marx) — proving the *engine*, not the
+// deliverer, is what resolves and threads origin through, so the fix applies
+// uniformly to every backend, not just the dance.
+func TestDynamicMasterOriginSkippedByNonDanceBackend(t *testing.T) {
+	rec := &recorder{active: "malahmen"} // focused window is a ticked target
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e := newEngine(rec, src)
+	fd := &fakeFocusFreeDeliverer{}
+	e.SetDeliverer(fd)
+	e.SetTargets([]WindowID{"malahmen", "marx"})
+	a, _ := keys.Parse("a")
+	e.SetFilter(keys.Of(a))
+	e.SetEnabled(true)
+
+	run(t, e, src, keys.Event{Code: a, State: keys.Down})
+
+	calls := fd.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("want exactly 1 Deliver call, got %d: %+v", len(calls), calls)
+	}
+	if calls[0].origin != "malahmen" {
+		t.Fatalf("origin should be the focused window %q, got %q", "malahmen", calls[0].origin)
+	}
+	delivered := 0
+	for _, tgt := range calls[0].targets {
+		if tgt != calls[0].origin {
+			delivered++
+		}
+	}
+	if delivered != 1 {
+		t.Fatalf("want exactly 1 non-origin target delivered (marx), got %d from targets %v", delivered, calls[0].targets)
+	}
+}
+
+// TestBroadcastGatedWhenOriginNotTicked verifies Config.RequireOriginTicked
+// (default on, 4.15): if the focused window isn't one of the ticked targets —
+// e.g. you tabbed to an unrelated window like the terminal — broadcast is
+// suppressed entirely, even though passthrough still fires. This is what
+// makes "tick all your clients" safe without a separate own-window exclusion.
+func TestBroadcastGatedWhenOriginNotTicked(t *testing.T) {
+	rec := &recorder{active: "konsole"} // focused, but NOT ticked
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e := newEngine(rec, src)
+	fd := &fakeFocusFreeDeliverer{}
+	e.SetDeliverer(fd)
+	e.SetTargets([]WindowID{"malahmen", "marx"})
+	a, _ := keys.Parse("a")
+	e.SetFilter(keys.Of(a))
+	e.SetEnabled(true)
+
+	run(t, e, src, keys.Event{Code: a, State: keys.Down})
+
+	if calls := fd.snapshot(); len(calls) != 0 {
+		t.Fatalf("broadcast should be gated (origin %q not ticked), but Deliver was called: %+v", rec.active, calls)
+	}
+	want := []string{"emit@konsole:A/down"} // passthrough still happens
+	assertLog(t, rec.snapshot(), want)
+}
+
+// TestBroadcastGateCanBeDisabled confirms RequireOriginTicked=false restores
+// the pre-4.15 behavior: broadcast to every ticked target regardless of what
+// currently has focus.
+func TestBroadcastGateCanBeDisabled(t *testing.T) {
+	rec := &recorder{active: "konsole"}
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	cfg := DefaultConfig()
+	cfg.SettleDelay = 0
+	cfg.RequireOriginTicked = false
+	e := New(src, rec, rec, cfg)
+	fd := &fakeFocusFreeDeliverer{}
+	e.SetDeliverer(fd)
+	e.SetTargets([]WindowID{"malahmen", "marx"})
+	a, _ := keys.Parse("a")
+	e.SetFilter(keys.Of(a))
+	e.SetEnabled(true)
+
+	run(t, e, src, keys.Event{Code: a, State: keys.Down})
+
+	if calls := fd.snapshot(); len(calls) != 1 {
+		t.Fatalf("want exactly 1 Deliver call with the gate disabled, got %d: %+v", len(calls), calls)
 	}
 }
 

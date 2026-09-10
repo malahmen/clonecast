@@ -22,12 +22,17 @@ import (
 //     moving real focus. Passthrough can run concurrently and never has to
 //     wait, so the engine skips the focus lock entirely.
 type Deliverer interface {
-	// Deliver sends ev to each target. Implementations that know the origin
-	// (focused) window skip it, since passthrough already delivered ev there.
+	// Deliver sends ev to each target except origin — origin already received
+	// ev via passthrough (step 1), so every implementation skips it; the
+	// engine resolves origin once per broadcast (via WindowManager.Active)
+	// and passes it in, rather than each backend querying it separately. This
+	// is what makes the "master" the currently focused window rather than a
+	// fixed one (REFERENCE.md 4.15/7.10): whichever ticked target you focus
+	// becomes origin on the very next broadcast key, with no re-ticking.
 	// Per-target failures are reported through notify; the returned count is
 	// how many targets actually received ev. A returned error is a whole-
-	// delivery failure (e.g. couldn't determine origin), not a per-target one.
-	Deliver(ctx context.Context, ev keys.Event, targets []WindowID, notify func(string, bool)) (int, error)
+	// delivery failure, not a per-target one.
+	Deliver(ctx context.Context, ev keys.Event, origin WindowID, targets []WindowID, notify func(string, bool)) (int, error)
 
 	// MovesFocus reports whether Deliver moves real OS input focus. When true
 	// the engine runs Deliver under its focus lock, blocking passthrough for
@@ -40,8 +45,8 @@ type Deliverer interface {
 }
 
 // danceDeliverer is the original focus-juggling delivery (REFERENCE.md 4.2):
-// read the focused window, then for each target activate it, wait SettleDelay,
-// inject, and finally restore focus to the origin. It is the default, and the
+// for each target activate it, wait SettleDelay, inject, and finally restore
+// focus to origin (passed in by the engine — see Deliverer's doc). It is the
 // last-resort fallback for targets that can take neither the agent nor xsend
 // backend. It moves focus, so the engine serialises it against passthrough.
 type danceDeliverer struct {
@@ -57,13 +62,7 @@ func newDanceDeliverer(wm WindowManager, inj Injector, cfg func() Config) *dance
 func (d *danceDeliverer) MovesFocus() bool { return true }
 func (d *danceDeliverer) Close() error     { return nil }
 
-func (d *danceDeliverer) Deliver(ctx context.Context, ev keys.Event, targets []WindowID, notify func(string, bool)) (int, error) {
-	origin, err := d.wm.Active(ctx)
-	if err != nil {
-		notify("active window: "+err.Error(), true)
-		return 0, err
-	}
-
+func (d *danceDeliverer) Deliver(ctx context.Context, ev keys.Event, origin WindowID, targets []WindowID, notify func(string, bool)) (int, error) {
 	cfg := d.settle()
 	delivered := 0
 	for _, t := range targets {
