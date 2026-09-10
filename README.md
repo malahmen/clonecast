@@ -24,6 +24,7 @@ See [REFERENCE.md](REFERENCE.md) for every design decision and the reasoning beh
 
 - Bazzite (or any KDE Plasma 6 Wayland desktop) in **desktop mode**. Game mode (gamescope) and the GNOME image are not supported.
 - Your user in the `input` group and a writable `/dev/uinput`. The setup script handles both.
+- `xdotool`, recommended but not required. Without it, focus switches are trusted on KWin's own report alone, which real testing found isn't reliable for actual game windows under real load (see REFERENCE.md 4.10) — keys can silently go nowhere. With it, each switch is independently verified against real focus and retried if needed. The setup script checks for it and prints an install hint if it's missing.
 
 ## Install
 
