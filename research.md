@@ -652,3 +652,163 @@ Each step has a pass criterion. Do them on the Bazzite box in desktop mode.
 - https://blizzardwatch.com/2020/11/12/blizzard-ban-multiboxing-wow/
 - https://us.forums.blizzard.com/en/wow/t/policy-update-for-input-broadcasting-may-2021/956610
 - https://nosygamer.blogspot.com/2014/12/why-change-key-rebroadcasting-in-eve.html
+
+---
+
+# Update 2026-09-10 — state after the agent milestone, open issues, and next-step research
+
+Date: 2026-09-10. \
+Scope: evaluate clonecast after the `feat/inbottle-postmessage` branch (four commits on 2026-09-09, not yet merged to `main`), fold in the owner's five objectives, and research solutions. Wine facts below were re-verified against `wine-mirror/wine` master on 2026-09-10; every claim links to its source in section G. Items marked _**(verify)**_ need a run on the Bazzite box.
+
+---
+
+## A. Where the project is
+
+**Proven on real hardware (two live WoW clients under Bottles, REFERENCE.md 4.11–4.14).** A physical key pressed on the focused master is mirrored by an unfocused follower with no focus change: evdev grab → engine → `agentDeliverer` → loopback TCP → in-bottle `clonecast-agent.exe` → `PostMessage(WM_KEYDOWN/UP)`. Discrete, no stuck keys, per-bottle isolation. This is HotkeyNet's `SendWinM` re-implemented without its keyboard hook.
+
+**What the branch contains.**
+
+| Piece | State |
+| --- | --- |
+| `internal/broadcast/deliverer.go` | `Deliverer` interface with `MovesFocus()`; the engine holds `focusMu` only for focus-moving backends, so agent/xsend never block passthrough |
+| `cmd/clonecast-agent` (Go, `GOOS=windows GOARCH=386`) | Finds the game window once by a callback-free `GetWindow` tree-walk on a fixed Win32 title (default `"World of Warcraft"`), re-validates the HWND per send, listens on `-port` (default 48900), `PostMessage`s frames. `GOMAXPROCS(1)` to stop the Go scheduler spinning under Wine |
+| `internal/agentwire` | Newline frames `D <evdev>` / `U <evdev>`, evdev → VK/scancode map |
+| `internal/platform/agent` | Linux deliverer: persistent connection per endpoint, one retry through a fresh dial, warn-once for unmapped targets |
+| `internal/platform/x11` | `xsend` backend (XSendEvent). Experimental: only reaches clients in Wine virtual-desktop mode and leaves a key stuck |
+| `cmd/clonecast --deliver dance\|agent\|xsend`, `--agent "Title=host:port,..."` | Backend selection; agent endpoints are a **static title→port map**, resolved through a 2 s title cache over KWin |
+| `cmd/kwindiag`, `cmd/e2ediag` | Diagnostics, not in `make` |
+| REFERENCE.md 7.10–7.12 | The owner's objectives are already recorded (dynamic master; decouple from dark-portal; agents self-register) |
+| README.md | Stale: still describes the focus dance as step 3 and lists the dance's limitations; nothing about `--deliver`, the agent, or how to run it |
+
+**How instances run today (dark-portal).** `flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<bottle> com.usebottles.bottles WoW.exe`, one Bottles bottle per instance, plus a background `_title_keeper` that renames the new X window to the instance name every 2 s. The agent was started by hand per bottle, on a hand-picked port, and its title→port pairing relies on the keeper's caption. Killing the agent from the host took the game down with it (4.14).
+
+**Correction to the 2026-09-09 report.** That report recommended XSendEvent as the primary path. On the real box it did not reach a windowed WoW client at all, only a virtual-desktop one, and it left a key engaged. The branch's decision (agent as default, xsend experimental) is right. The report's section 5.2 caveats about the 2019 virtual-desktop reports turned out to be the rule, not the exception.
+
+---
+
+## B. Issues
+
+Owner's five objectives (numbered O1–O5) plus what the code review found (I1–I10).
+
+| # | Issue | Evidence | Impact |
+| --- | --- | --- | --- |
+| O1/O2 | Master is static. The focused window should be the master, dynamically | `agentDeliverer.Deliver` sends to every ticked target; only the dance skips `origin` | With all clients ticked, the focused one receives the key twice (passthrough + PostMessage) |
+| O3 | Ticking all instances is pointless while the master must be left unticked | Same | UX: the user must re-tick when switching master |
+| O4 | Agent lifecycle is coupled to the instance launcher (dark-portal) and to a port | Agent started by hand or planned as a dark-portal step (4.14) | clonecast is not usable with Lutris/Steam/Bottles-GUI games without bespoke launch code |
+| O5 | Per-client static ports and a `--agent` title map duplicate the TUI tick | `deliver.go` `parseTitleMap`, `--agent` flag | Two mechanisms for "which targets"; ports are arbitrary; titles depend on dark-portal's keeper |
+| I1 | Modifiers: PostMessage does not set key state, so `GetKeyState(VK_SHIFT)` in the game stays up | Wine: only hardware messages update `keystate` (server/queue.c); HotkeyNet documented the same limit for `SendWinM` | Shift/Ctrl/Alt + key combos will not work through the agent as-is. Untested on WoW yet _**(verify)**_ |
+| I2 | Auto-repeat: the agent posts one Down and one Up; Windows would repeat `WM_KEYDOWN` while held | `post()` in agent | Fine for WoW movement (holds via Down/Up), wrong for anything that counts repeats (chat typing) |
+| I3 | Agent targets a fixed Win32 title | `-title` default `"World of Warcraft"` | Not generic; each game needs a title. Needs a class/exe/largest-window heuristic or per-prefix config |
+| I4 | Agent identity ↔ X window pairing uses the KWin caption set by dark-portal's keeper | `titleCache`, `--agent` keys | Breaks for any launcher without a title keeper; captions change at runtime |
+| I5 | Killing the agent from the host killed the game | 4.14 | Only a problem while the host owns the agent's lifetime; goes away if the prefix owns it |
+| I6 | Agent waits at most 60 s for the window, then exits | `resolveHWND` | Too short if the agent is started at prefix boot, before the game launcher |
+| I7 | On a 64-bit prefix an HKLM autostart entry runs twice (32- and 64-bit registry views) | wineboot.c `ProcessRunKeys` with `KEY_WOW64_32KEY` | Needs single-instance protection in the agent |
+| I8 | xsend stuck key unsolved | 4.12 | Keep experimental; not needed for WoW |
+| I9 | No tests for the agent deliverer, for origin skipping, or for the wire protocol | `engine_test.go` covers dance/filter/toggle only | Regressions in the new default path go unnoticed |
+| I10 | README stale (see A); `docs` lacks agent install/run instructions | — | New users cannot use the working path |
+
+---
+
+## C. Solutions researched
+
+### C1. Dynamic master = the focused window (O1–O3)
+
+Two independent mechanisms, both cheap; use both.
+
+**Engine side (authoritative).** Per broadcast, resolve `origin := wm.Active()` (KWin, ~1 ms measured) and pass it to `Deliverer.Deliver`. The agent and xsend deliverers skip the target paired to `origin`, exactly as the dance already does. The TUI then offers "select all" and the broadcast set is "all ticked minus focused". Add a gate: broadcast only when `origin` is itself a ticked target (default on), so typing in Konsole with broadcast enabled does not drive every client. The toggle hotkey stays as the manual override.
+
+**Agent side (safety net, zero pairing needed).** Inside the prefix, `GetForegroundWindow()` is prefix-global and is what winex11.drv updates on X focus changes: with an EWMH window manager such as KWin, a root `_NET_ACTIVE_WINDOW` change makes the game thread reconcile its foreground state, and on FocusOut without EWMH Wine sets the foreground to the desktop. So the agent can drop frames while `GetForegroundWindow() == gameHwnd` and report `F 1|0` transitions to clonecast. Reading it is a shared-memory read, no server round trip, so polling at 20–50 ms is free; or register `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, …, WINEVENT_OUTOFCONTEXT)`, which Wine implements cross-process (this is a WinEvent hook, not a keyboard hook, so it cannot corrupt typing the way HotkeyNet's `WH_KEYBOARD_LL` did). Caveats: the Win32 foreground can lag X focus by one message-loop iteration of the game thread; in Wine virtual-desktop mode FocusOut never resets the foreground (dark-portal does not use VD); KWin's brief grabs during Alt-Tab are ignored by Wine (`NotifyGrab`), which is what you want. _**(verify** that `GetForegroundWindow()` flips on the Bazzite box when clicking between two clients**)**
+
+Together: the engine skip removes the double delivery, the agent-side check covers the race where focus moved between `wm.Active()` and delivery, and the `F` report lets the TUI show which instance is master live.
+
+### C2. Decouple the agent from dark-portal (O4, I5, I6, I7)
+
+The constraint is only "the agent must run inside the target prefix." Wine has a launcher-agnostic hook for that.
+
+**Autostart via `HKLM\Software\Microsoft\Windows\CurrentVersion\RunServices`.** Every `wine some.exe` that starts a fresh wineserver implicitly runs `wineboot --init` (ntdll `run_wineboot()`), and `--init` processes `RunServicesOnce`, `RunServices` and `RunOnce`. It does **not** process `Run` or the Startup folder (those need an explicit `wineboot` without `--init`, which Bottles, Lutris, Proton and umu never run per launch). Proton only runs bare `wineboot` when creating the shared default prefix; umu never; Lutris only at prefix creation; Bottles only on its explicit "update" action. So a `RunServices` `REG_SZ` entry pointing at the agent starts it on every prefix boot, before the game, whatever launched the game. The agent then inherits the launcher's environment (`WINEPREFIX`, `STEAM_COMPAT_*`, any `CLONECAST_*`) and dies with the wineserver, so the host never signals it (closes I5). Consequences: raise the window wait from 60 s to indefinite with a slow poll (I6); guard against the WOW64 double start with a named mutex (I7); log to a file under the prefix, since there is no console.
+
+**Installing into a prefix without knowing the launcher.** `clonecast agent install --prefix <path>`: copy `clonecast-agent.exe` to `<prefix>/drive_c/clonecast/`, then add the registry entry. Two ways, both launcher-agnostic:
+- Prefix idle: edit `<prefix>/system.reg` directly (Wine's registry is plain text; it is rewritten on wineserver shutdown, so only edit when no wineserver runs for that prefix). Zero dependency on a wine binary.
+- Prefix running or preferred: `wine regedit /S clonecast.reg` (or `reg add`) with a wine command the user supplies once, e.g. for Bottles `flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<bottle> com.usebottles.bottles reg add …`, for Proton `PROTON_VERB=run umu-run reg add …` or `steam-runtime-launch-client --bus-name=com.steampowered.App<id> -- wine reg add …`.
+
+Why the exe lives inside `drive_c`: under Bottles Flatpak `Z:\` only shows the sandbox's bind mounts (`~/.var/app/com.usebottles.bottles`, `~/Games/umu`, `xdg-data/umu`), not `$HOME`, so a binary in `~/.local/bin` is invisible to the bottle. `drive_c` is always visible to its own prefix, under every launcher.
+
+**Discovering prefixes to install into.** Scan `/proc/*/environ` for `WINEPREFIX=` (readable for the user's own processes, Flatpak children included) to list currently running prefixes, so the TUI can offer "install agent into <prefix>" for a game that is already up. Installing while running only takes effect on the next prefix boot; for an immediate start clonecast still needs a wine command for that prefix. Accept that: one-time setup per game.
+
+**dark-portal's role shrinks to nothing.** It keeps launching WoW as it does; the agent starts because the bottle boots. Optionally dark-portal gains a one-line `clonecast agent install --prefix "$(_bottle_dir "$name")"` in `add-instance`, but clonecast must not depend on it.
+
+### C3. Replace static ports and the `--agent` map with self-registration (O5, I4)
+
+**Reverse the connection.** clonecast listens on one loopback port (default 48800, `--listen`); agents connect out. Bottles' Flatpak has `--share=network`, so host loopback is reachable from inside, as the current agent→host tests already showed for the other direction. No per-instance ports, no map. The agent finds the port from `CLONECAST_PORT` (Unix env vars pass through to Windows processes unchanged; Proton and umu forward `os.environ`) or from `HKCU\Software\clonecast\Port`, written by `agent install`; default otherwise.
+
+**Hello.** On connect the agent sends one line: `H 1 prefix=<WINEPREFIX> exe=<game exe> title=<win32 title> hwnd=<hex> pid=<win pid>` and thereafter `F 1|0` on foreground changes and a heartbeat; clonecast sends `D`/`U` frames (and later `M <mask>` for modifiers, see C4). Reconnect with backoff, so clonecast may start after the games.
+
+**Pairing an agent to a KWin window (the piece that makes "tick a window" enough).** Do not use `_NET_WM_PID` or captions. KWin's `Window.pid` is obtained through the XRes extension (`xcb_res_query_client_ids`, `LOCAL_CLIENT_PID`), which the X server derives from the socket peer credentials, so it is the **host** PID even for a Flatpak Wine client; `_NET_WM_PID` is the in-sandbox PID, which is why dark-portal saw bogus values through `xdotool getwindowpid`. Map host PID → `/proc/<pid>/environ` → `WINEPREFIX`, and match it to the prefix the agent announced. Result: the Targets list shows every window, marks those with a live agent, and ticking is the only action. _**(verify** that KWin's `pid` for a Bottles window resolves to a process whose environ carries the bottle's `WINEPREFIX`**)** Fallbacks if it does not: query XRes directly from `jezek/xgb` on the Xwayland display; or a title-token handshake, since `SetWindowTextW(gameHwnd, …)` from the agent propagates to `WM_NAME`/`_NET_WM_NAME` (viable but racy against dark-portal's title keeper).
+
+**TUI.** One Targets list; each row shows `●` when an agent is connected for it and `M` when it is the current master; `A` selects all; a window without an agent falls back to the configured non-agent backend or is greyed out.
+
+### C4. Modifiers, repeat, and target selection (I1–I3)
+
+**Modifiers.** In Wine, `GetKeyState`/`GetKeyboardState` read the thread-input key state and `GetAsyncKeyState` reads the desktop key state; only hardware input updates either, so posted `WM_KEYDOWN` for `VK_SHIFT` changes nothing. Wine implements `AttachThreadInput` (merges the two threads' input) and `SetKeyboardState` (writes the caller's thread-input key state, and the next sync will not overwrite it). So the agent can attach to the game thread once and set Shift/Ctrl/Alt bits before posting the key and clear them after; the game's `GetKeyState` will see them. `GetAsyncKeyState` and DirectInput/Raw Input will not, and cannot without hardware input. For Alt combos post `WM_SYSKEYDOWN` with the `KF_ALTDOWN` bit. Whether vanilla WoW reads modifiers via `GetKeyState` (works) or `GetAsyncKeyState` (does not) decides this; test Shift+1 _**(verify)**_. Engine side: track modifier state from the evdev stream and send it with each frame (`M <mask>`).
+
+**Auto-repeat.** Optional agent-side repeat: after a Down, post repeated `WM_KEYDOWN` with the repeat bit at the Windows default (500 ms delay, ~30 ms period) until the Up. Off by default for games, on for text-like targets.
+
+**Target window.** Replace the fixed title with: `agent install --title/--class` stored in the registry, else auto-pick the largest visible top-level window owned by a process other than the agent, explorer and services, re-evaluated when the cached HWND goes stale. The tree-walk stays; `EnumWindows`/`FindWindow` stay banned (4.13).
+
+### C5. Smaller items
+
+- `xsend`: leave experimental. Possible stuck-key lead for later: Wine synthesizes desktop key state from the synthetic press, and the release to a background window may be dropped by the game thread's `sync_input_keystate`; not worth pursuing while the agent works.
+- Steam/Proton: `RunServices` autostart applies to Proton prefixes too, since Proton launches go through the same implicit `wineboot --init`. Proton's container shares the host network by default _**(verify** loopback from a Proton game to the host**)**.
+- README and docs: rewrite "How it works" around the agent, document `agent install`, mark the dance as legacy.
+- Tests: engine origin-skip and gate; agent deliverer against a fake TCP agent; wire encode/decode; pairing (pid → prefix) with a fake `/proc`.
+- dark-portal: the keeper's race was fixed upstream (`dfeb4c1`), and with pid-based pairing clonecast no longer depends on captions at all.
+
+---
+
+## D. Proposed REFERENCE.md entries (paste after the branch merges; 7.10–7.12 already hold the objectives)
+
+- **4.15 Master is the focused window.** Engine resolves `wm.Active()` per broadcast and passes origin to every deliverer; focus-free deliverers skip it; broadcast is gated to origin ∈ targets. Agents additionally drop frames while their window is foreground and report `F` transitions. *Alternatives:* fixed master flag (rejected: forces re-ticking); agent-only detection (rejected as sole mechanism: lags one message-loop turn).
+- **4.16 Agents autostart from `HKLM\…\RunServices`, installed into `drive_c`.** Wine's implicit `wineboot --init` processes RunServices on every prefix boot under every launcher; `Run` is not processed. Agent is single-instance (named mutex), waits indefinitely for its window, dies with the wineserver. *Alternatives:* launcher-specific hooks (dark-portal, Steam launch options) rejected as coupling; `Run` key rejected because `--init` skips it.
+- **4.17 Agents connect to clonecast, not the reverse.** One `--listen` port; hello announces `WINEPREFIX`; pairing to KWin windows via KWin's XRes-derived host `pid` → `/proc/<pid>/environ`. *Alternatives:* per-agent ports + title map (the current 7.12 pain); file rendezvous on `Z:` rejected because Bottles Flatpak hides `$HOME`.
+- **7.13 Modifiers through the agent** via `AttachThreadInput` + `SetKeyboardState`; known not to reach `GetAsyncKeyState`/DirectInput games.
+
+---
+
+## E. Verification plan (ordered)
+
+1. **Foreground detection inside the prefix.** Add a debug log to the agent printing `GetForegroundWindow()==hwnd` every 500 ms; click between two clients and Konsole. Pass: flips within ~100 ms of a click, never flips during Alt-Tab grabs.
+2. **RunServices autostart.** Write the entry into one bottle's `system.reg` while it is down, copy the agent to `drive_c/clonecast/`, launch the instance from dark-portal. Pass: agent log appears before the game window exists, agent connects once (mutex), and it is gone after `wineserver -k`.
+3. **Pairing.** From clonecast, log KWin `pid` for each WoW window and the `WINEPREFIX` read from `/proc/<pid>/environ`. Pass: each pid maps to its own bottle path.
+4. **Reverse connection.** Agent dials `127.0.0.1:48800` from inside Bottles; clonecast shows the hello. Then the same from a Proton game (Steam launch option `CLONECAST_PORT=48800 %command%`).
+5. **Dynamic master end to end.** Tick all clients, focus A, press a broadcast key: A reacts once, others once; focus B, repeat. Then focus Konsole with the gate on: nothing broadcasts.
+6. **Modifiers.** With the attach-and-set path, Shift+1 on a follower triggers the Shift action bar. If not, WoW reads `GetAsyncKeyState` and the limitation is documented.
+7. **Repeat mode** in a chat box: held key produces repeated characters only when the option is on.
+
+---
+
+## F. Bottom line
+
+The hard problem is solved: focus-free delivery into unfocused Wine clients works with a hookless in-bottle agent. What remains is plumbing and product shape, and none of it needs new research: make the focused window the master (engine skip plus agent-side foreground check), let the prefix own the agent via `RunServices`, and let agents register themselves over one listening port with pairing by host PID → `WINEPREFIX`. Those three changes remove the `--agent` map, the per-client ports, the dark-portal coupling, and the double delivery to the master in one pass.
+
+---
+
+## G. Sources (2026-09-10)
+
+- Wine wineboot Run-key processing: https://raw.githubusercontent.com/wine-mirror/wine/master/programs/wineboot/wineboot.c
+- Wine ntdll implicit `wineboot --init`, environment passthrough: https://raw.githubusercontent.com/wine-mirror/wine/master/dlls/ntdll/unix/env.c
+- Wine winex11 focus handling (`focus_out`, `X11DRV_FocusIn`, `_NET_ACTIVE_WINDOW`): https://raw.githubusercontent.com/wine-mirror/wine/master/dlls/winex11.drv/event.c , https://raw.githubusercontent.com/wine-mirror/wine/master/dlls/winex11.drv/window.c , https://raw.githubusercontent.com/wine-mirror/wine/master/dlls/winex11.drv/x11drv_main.c
+- Wine server key state, `attach_thread_input`, `set_key_state`: https://raw.githubusercontent.com/wine-mirror/wine/master/server/queue.c
+- Wine WinEvent hooks cross-process: https://raw.githubusercontent.com/wine-mirror/wine/master/server/hook.c , https://raw.githubusercontent.com/wine-mirror/wine/master/dlls/win32u/hook.c , https://raw.githubusercontent.com/wine-mirror/wine/master/dlls/win32u/input.c
+- Wine dinput uses LL hooks / raw input only: https://raw.githubusercontent.com/wine-mirror/wine/master/dlls/dinput/dinput_main.c
+- Proton script (wineboot only on default-prefix creation): https://raw.githubusercontent.com/ValveSoftware/Proton/proton_9.0/proton , https://raw.githubusercontent.com/ValveSoftware/Proton/proton_10.0/proton
+- Proton launcher service: https://raw.githubusercontent.com/ValveSoftware/Proton/proton_9.0/docs/DEBUGGING.md , https://apple1417.dev/posts/2025-01-01-proton-multiple-game-instances
+- umu-launcher verbs and env: https://raw.githubusercontent.com/Open-Wine-Components/umu-launcher/main/umu/umu_run.py
+- Bottles wineboot flags: https://raw.githubusercontent.com/bottlesdevs/Bottles/main/bottles/backend/wine/wineboot.py
+- Bottles Flatpak permissions: https://raw.githubusercontent.com/flathub/com.usebottles.bottles/master/com.usebottles.bottles.yml , https://docs.usebottles.com/flatpak/expose-directories , https://docs.flatpak.org/en/latest/sandbox-permissions.html
+- Lutris wineboot at prefix creation only: https://raw.githubusercontent.com/lutris/lutris/master/lutris/runners/commands/wine.py
+- Flatpak PID namespace and `_NET_WM_PID`: https://github.com/flatpak/flatpak/issues/3600 , https://github.com/containers/bubblewrap/issues/373 , https://github.com/swaywm/wlroots/pull/2868
+- KWin resolves PIDs via XRes: https://invent.kde.org/plasma/kwin/-/raw/master/src/x11window.cpp , https://man.archlinux.org/man/xcb_res_query_client_ids.3.en
+- HotkeyNet `SendWinM` modifier limitation: https://hotkeynet.readthedocs.io/stable/02-Reference/ComparisonChartOfSendModes/index.html
+- Wine `Run` key history (disabled on init since 2008): https://bbs.archlinux.org/viewtopic.php?id=42648
+- clonecast branch under evaluation: `origin/feat/inbottle-postmessage` (commits dc1c17b, 68cf0fe, 8f9ba6b, 1a78267), REFERENCE.md 4.9–4.14 and 7.9–7.12
+- dark-portal launch and title keeper: `~/_code/_sh_scripts/dark-portal/dark-portal.sh` (`cmd_launch`, `_title_keeper`)
