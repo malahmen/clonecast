@@ -658,7 +658,7 @@ Each step has a pass criterion. Do them on the Bazzite box in desktop mode.
 # Update 2026-09-10 — state after the agent milestone, open issues, and next-step research
 
 Date: 2026-09-10. \
-Scope: evaluate clonecast after the `feat/inbottle-postmessage` branch (four commits on 2026-09-09, not yet merged to `main`), fold in the owner's five objectives, and research solutions. Wine facts below were re-verified against `wine-mirror/wine` master on 2026-09-10; every claim links to its source in section G. Items marked _**(verify)**_ need a run on the Bazzite box.
+Scope: evaluate clonecast after the `feat/inbottle-postmessage` branch (four commits on 2026-09-09; merged to `main` as PR #1, `cfca394`, on 2026-09-10 with no further code changes, so everything below applies to `main`), fold in the owner's five objectives, and research solutions. On `main` after the merge: `go vet` clean for linux/amd64 and the windows/386 agent, `go test ./...` green. Wine facts below were re-verified against `wine-mirror/wine` master on 2026-09-10; every claim links to its source in section G. Items marked _**(verify)**_ need a run on the Bazzite box.
 
 ---
 
@@ -679,6 +679,7 @@ Scope: evaluate clonecast after the `feat/inbottle-postmessage` branch (four com
 | `cmd/kwindiag`, `cmd/e2ediag` | Diagnostics, not in `make` |
 | REFERENCE.md 7.10–7.12 | The owner's objectives are already recorded (dynamic master; decouple from dark-portal; agents self-register) |
 | README.md | Stale: still describes the focus dance as step 3 and lists the dance's limitations; nothing about `--deliver`, the agent, or how to run it |
+| `--deliver` default | `cmd/clonecast/main.go:55` defaults to `dance`, while REFERENCE 4.12 and 7.9 declare the agent "the reliable default". Doc and code disagree on the mainline |
 
 **How instances run today (dark-portal).** `flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<bottle> com.usebottles.bottles WoW.exe`, one Bottles bottle per instance, plus a background `_title_keeper` that renames the new X window to the instance name every 2 s. The agent was started by hand per bottle, on a hand-picked port, and its title→port pairing relies on the keeper's caption. Killing the agent from the host took the game down with it (4.14).
 
@@ -706,6 +707,7 @@ Owner's five objectives (numbered O1–O5) plus what the code review found (I1�
 | I8 | xsend stuck key unsolved | 4.12 | Keep experimental; not needed for WoW |
 | I9 | No tests for the agent deliverer, for origin skipping, or for the wire protocol | `engine_test.go` covers dance/filter/toggle only | Regressions in the new default path go unnoticed |
 | I10 | README stale (see A); `docs` lacks agent install/run instructions | — | New users cannot use the working path |
+| I11 | Default backend is still the deprecated dance | `main.go:55` vs REFERENCE 4.12/7.9 | A user who runs `clonecast` without `--deliver agent` gets the focus dance the project has rejected |
 
 ---
 
@@ -765,7 +767,7 @@ Why the exe lives inside `drive_c`: under Bottles Flatpak `Z:\` only shows the s
 
 ---
 
-## D. Proposed REFERENCE.md entries (paste after the branch merges; 7.10–7.12 already hold the objectives)
+## D. Proposed REFERENCE.md entries (the branch is merged; these can go into `main`'s REFERENCE.md now. 7.10–7.12 already hold the objectives)
 
 - **4.15 Master is the focused window.** Engine resolves `wm.Active()` per broadcast and passes origin to every deliverer; focus-free deliverers skip it; broadcast is gated to origin ∈ targets. Agents additionally drop frames while their window is foreground and report `F` transitions. *Alternatives:* fixed master flag (rejected: forces re-ticking); agent-only detection (rejected as sole mechanism: lags one message-loop turn).
 - **4.16 Agents autostart from `HKLM\…\RunServices`, installed into `drive_c`.** Wine's implicit `wineboot --init` processes RunServices on every prefix boot under every launcher; `Run` is not processed. Agent is single-instance (named mutex), waits indefinitely for its window, dies with the wineserver. *Alternatives:* launcher-specific hooks (dark-portal, Steam launch options) rejected as coupling; `Run` key rejected because `--init` skips it.
