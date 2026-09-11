@@ -2,15 +2,25 @@
 //
 // Usage:
 //
-//	clonecast [--backend mock|linux] [--deliver dance|agent|xsend]
+//	clonecast [--backend mock|linux] [--deliver agent|dance|xsend]
 //	          [--agent "Title=host:port,..."] [--xsend "Title=X Title,..."]
-//	          [--keys "a b c"|all] [--toggle SCROLLLOCK] [--settle 30ms] [--log PATH]
+//	          [--keys "a b c"|all] [--toggle SCROLLLOCK] [--settle 30ms]
+//	          [--gate-origin=false] [--log PATH]
 //
 // --backend picks the platform (default "linux" on Linux, "mock" elsewhere).
-// --deliver picks how broadcast keys reach targets: the focus "dance" (default),
-// the in-bottle PostMessage "agent" (reliable for Wine/Proton; needs --agent to
-// map each target window title to its agent's loopback endpoint), or "xsend"
-// (experimental X11 XSendEvent; see REFERENCE.md 4.12).
+// --deliver picks how broadcast keys reach targets: the in-bottle PostMessage
+// "agent" (the default and the only path proven on real clients — needs
+// --agent to map each target window title to its agent's loopback endpoint),
+// the focus "dance" (legacy last resort, the default with --backend mock since
+// there are no agents to talk to there), or "xsend" (experimental X11
+// XSendEvent; see REFERENCE.md 4.12).
+//
+// The window that has focus is the master: it gets keys through passthrough
+// and is skipped by delivery. --gate-origin=false lifts the default rule that
+// the focused window must itself be a ticked target for anything to broadcast.
+//
+// Every flag below is also reachable from the TUI at runtime (Settings pane),
+// so flags are the starting values, not the only way to set them.
 package main
 
 import (
@@ -52,12 +62,13 @@ func run() error {
 		defBackend = "linux"
 	}
 	backend := flag.String("backend", defBackend, "mock or linux")
-	deliver := flag.String("deliver", "dance", "delivery backend: dance, agent, or xsend")
+	deliver := flag.String("deliver", "", "delivery backend: agent (default), dance (legacy fallback), or xsend (experimental); default dance with --backend mock")
 	agentSpec := flag.String("agent", "", `agent endpoints by window title, e.g. "Malahmen=127.0.0.1:48900,Marx=48901" (with --deliver agent)`)
 	xsendSpec := flag.String("xsend", "", `xsend X-window-title overrides by window title, e.g. "Almerinda=World of Warcraft" (with --deliver xsend)`)
 	keySpec := flag.String("keys", "", `initial key set: "all" or names like "a b c f1" (default: none)`)
 	toggle := flag.String("toggle", "SCROLLLOCK", "key that toggles broadcasting on/off")
 	settle := flag.Duration("settle", 30*time.Millisecond, "delay between focusing a target and injecting (dance backend)")
+	gateOrigin := flag.Bool("gate-origin", true, "only broadcast while the focused window is itself a ticked target")
 	logPath := flag.String("log", defaultLogPath(), "log file (stdout is the TUI)")
 	flag.Parse()
 
@@ -67,6 +78,7 @@ func run() error {
 
 	cfg := broadcast.DefaultConfig()
 	cfg.SettleDelay = *settle
+	cfg.GateOrigin = *gateOrigin
 	if *toggle != "" {
 		c, err := keys.Parse(*toggle)
 		if err != nil {
@@ -101,18 +113,18 @@ func run() error {
 		engine.SetFilter(set)
 	}
 
-	closeDeliverer, err := selectDeliverer(engine, p.wm, *deliver, *agentSpec, *xsendSpec)
-	if err != nil {
+	bs := newBackends(engine, p.wm, *agentSpec, *xsendSpec)
+	defer bs.Close()
+	if err := bs.Use(defaultDeliver(*deliver, *backend)); err != nil {
 		return err
 	}
-	defer closeDeliverer()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	engineErr := make(chan error, 1)
 	go func() { engineErr <- engine.Run(ctx) }()
 
-	prog := tea.NewProgram(tui.New(engine, p.wm), tea.WithAltScreen())
+	prog := tea.NewProgram(tui.New(engine, p.wm, bs), tea.WithAltScreen())
 	go func() {
 		if err := <-engineErr; err != nil && ctx.Err() == nil {
 			log.Error("engine stopped", "err", err)
@@ -122,6 +134,20 @@ func run() error {
 
 	_, err = prog.Run()
 	return err
+}
+
+// defaultDeliver resolves an empty --deliver. The agent backend is the
+// reliable one and therefore the mainline default (REFERENCE.md 4.12/7.9,
+// research issue I11); the mock platform has no Wine prefixes and so no
+// agents, so there the demo default stays the self-contained focus dance.
+func defaultDeliver(deliver, backend string) string {
+	if deliver != "" {
+		return deliver
+	}
+	if backend == "mock" {
+		return deliverDance
+	}
+	return deliverAgent
 }
 
 func defaultLogPath() string {

@@ -6,6 +6,23 @@ import (
 	"github.com/malahmen/clonecast/internal/keys"
 )
 
+// Delivery is one broadcast request: everything a Deliverer needs to place a
+// single key event on a set of windows. It is a struct rather than a longer
+// parameter list because Targets and Origin are both window identities and
+// read identically at a call site, and because this interface has already
+// grown a parameter once (Google Go style guide, "function argument lists").
+type Delivery struct {
+	// Event is the key transition to deliver.
+	Event keys.Event
+	// Targets are the ticked windows, in list order.
+	Targets []WindowID
+	// Origin is the focused window (the master). Always one of Targets when
+	// the gate is on, and always a window the engine actually resolved.
+	Origin WindowID
+	// Notify reports per-target failures to the engine's notice stream.
+	Notify func(string, bool)
+}
+
 // Deliverer is the pluggable step-2 mechanism: given a broadcast-worthy event
 // and the current target set, it delivers the event to each target. It is what
 // makes clonecast's delivery method swappable (see REFERENCE.md 7.9) — the
@@ -22,12 +39,22 @@ import (
 //     moving real focus. Passthrough can run concurrently and never has to
 //     wait, so the engine skips the focus lock entirely.
 type Deliverer interface {
-	// Deliver sends ev to each target. Implementations that know the origin
-	// (focused) window skip it, since passthrough already delivered ev there.
-	// Per-target failures are reported through notify; the returned count is
-	// how many targets actually received ev. A returned error is a whole-
-	// delivery failure (e.g. couldn't determine origin), not a per-target one.
-	Deliver(ctx context.Context, ev keys.Event, targets []WindowID, notify func(string, bool)) (int, error)
+	// Deliver sends req.Event to every target in req.Targets except
+	// req.Origin — the window that had real input focus when the engine
+	// picked the event up, i.e. the current "master" (REFERENCE.md 7.10).
+	// Origin already received the event through passthrough, so delivering
+	// to it again would double the key; every implementation MUST skip it.
+	// The engine resolves it once per broadcast (one wm.Active call, ~1ms,
+	// REFERENCE.md 7.6) rather than having every backend re-query it, and
+	// never calls Deliver at all when it could not be resolved.
+	//
+	// Per-target failures are reported through req.Notify; the returned count
+	// is how many targets actually received the event. A returned error is a
+	// whole-delivery failure, not a per-target one.
+	//
+	// Implementations must be safe for concurrent use only to the extent the
+	// engine needs: it calls Deliver from a single worker goroutine.
+	Deliver(ctx context.Context, req Delivery) (int, error)
 
 	// MovesFocus reports whether Deliver moves real OS input focus. When true
 	// the engine runs Deliver under its focus lock, blocking passthrough for
@@ -40,10 +67,12 @@ type Deliverer interface {
 }
 
 // danceDeliverer is the original focus-juggling delivery (REFERENCE.md 4.2):
-// read the focused window, then for each target activate it, wait SettleDelay,
-// inject, and finally restore focus to the origin. It is the default, and the
-// last-resort fallback for targets that can take neither the agent nor xsend
-// backend. It moves focus, so the engine serialises it against passthrough.
+// for each target activate it, wait SettleDelay, inject, and finally restore
+// focus to the origin the engine resolved. It is no longer the default
+// (REFERENCE.md 4.12/7.9 call it rejected for real multiboxing); it is the
+// last-resort fallback for targets that can take neither the agent nor the
+// xsend backend. It moves focus, so the engine serialises it against
+// passthrough.
 type danceDeliverer struct {
 	wm     WindowManager
 	inj    Injector
@@ -57,33 +86,27 @@ func newDanceDeliverer(wm WindowManager, inj Injector, cfg func() Config) *dance
 func (d *danceDeliverer) MovesFocus() bool { return true }
 func (d *danceDeliverer) Close() error     { return nil }
 
-func (d *danceDeliverer) Deliver(ctx context.Context, ev keys.Event, targets []WindowID, notify func(string, bool)) (int, error) {
-	origin, err := d.wm.Active(ctx)
-	if err != nil {
-		notify("active window: "+err.Error(), true)
-		return 0, err
-	}
-
+func (d *danceDeliverer) Deliver(ctx context.Context, req Delivery) (int, error) {
 	cfg := d.settle()
 	delivered := 0
-	for _, t := range targets {
-		if t == origin {
+	for _, t := range req.Targets {
+		if t == req.Origin {
 			continue // already received it in step 1 (passthrough)
 		}
 		if err := d.wm.Activate(ctx, t); err != nil {
-			notify("activate "+string(t)+": "+err.Error(), true)
+			req.Notify("activate "+string(t)+": "+err.Error(), true)
 			continue
 		}
 		sleep(ctx, cfg.SettleDelay)
-		if err := d.inj.Emit(ev); err != nil {
-			notify("emit "+ev.String()+" to "+string(t)+": "+err.Error(), true)
+		if err := d.inj.Emit(req.Event); err != nil {
+			req.Notify("emit "+req.Event.String()+" to "+string(t)+": "+err.Error(), true)
 			continue
 		}
 		delivered++
 	}
 
-	if err := d.wm.Activate(ctx, origin); err != nil {
-		notify("restore focus to "+string(origin)+": "+err.Error(), true)
+	if err := d.wm.Activate(ctx, req.Origin); err != nil {
+		req.Notify("restore focus to "+string(req.Origin)+": "+err.Error(), true)
 	}
 	return delivered, nil
 }

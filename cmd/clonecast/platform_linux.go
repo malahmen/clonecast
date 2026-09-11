@@ -44,20 +44,24 @@ func newLinuxPlatform() (*platform, error) {
 	}, nil
 }
 
+// xsendAvailable reports whether the xsend backend can be built at all; it is
+// X11-only, so the TUI must not offer it elsewhere.
+const xsendAvailable = true
+
 // setupXsend wires the experimental xsend backend (Technique A): XSendEvent to
 // each target's X window. spec optionally maps a target's KWin title to the X
 // window title to aim at ("KWin Title=X Title,..."); unmapped targets aim at a
 // window whose title equals their own KWin title. See REFERENCE.md 4.12/7.9 —
 // requires the client in Wine virtual-desktop mode and has an unsolved
 // stuck-key caveat, so it is opt-in only.
-func setupXsend(engine *broadcast.Engine, wm broadcast.WindowManager, spec string) (func(), error) {
+func setupXsend(wm broadcast.WindowManager, spec string) (broadcast.Deliverer, func(), error) {
 	xmap, err := parseTitleMap(spec)
 	if err != nil {
-		return nil, fmt.Errorf("--xsend: %w", err)
+		return nil, nil, fmt.Errorf("--xsend: %w", err)
 	}
 	s, err := x11.New()
 	if err != nil {
-		return nil, fmt.Errorf("xsend: %w", err)
+		return nil, nil, fmt.Errorf("xsend: %w", err)
 	}
 	tc := newTitleCache(wm)
 	titles := func(id broadcast.WindowID) string {
@@ -68,6 +72,5 @@ func setupXsend(engine *broadcast.Engine, wm broadcast.WindowManager, spec strin
 		return kt
 	}
 	d := x11.NewDeliverer(s, titles)
-	engine.SetDeliverer(d)
-	return func() { _ = d.Close() }, nil
+	return d, func() { _ = d.Close() }, nil
 }
