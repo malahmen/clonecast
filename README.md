@@ -13,11 +13,18 @@ Built for [Bazzite](https://bazzite.gg) desktop mode (KDE Plasma 6 on Wayland), 
 
 1. **Capture.** clonecast grabs your physical keyboard(s) through evdev, so nothing else sees the raw events.
 2. **Passthrough.** Every key is replayed through a virtual keyboard to whichever window has focus. Your keyboard keeps working normally.
-3. **Broadcast.** When broadcasting is on and the key is in your key set, clonecast asks KWin to focus each selected target in turn, replays the key, and restores focus to where you were.
+3. **Broadcast.** When broadcasting is on and the key is in your key set, clonecast delivers it to every ticked window **except the one you are looking at** — that one already got the key in step 2.
 
-Step 3 is a focus dance because Wayland offers no way to send input to a window that does not have focus. \
-It is fast enough for taps and hotkeys. \
-Held movement keys are a known weak spot. \
+The focused window is therefore the **master**: tick all your clients, and whichever one has focus plays your keys live while the others mirror. \
+Switch windows and the master switches with you; the Targets list marks it with `M`. \
+By default nothing is broadcast unless the focused window is itself a ticked target, so typing in the terminal that runs clonecast does not drive every client (`--gate-origin=false` lifts that).
+
+How step 3 reaches an unfocused window is a selectable backend (`--deliver`):
+
+- `agent` (default): a small `clonecast-agent.exe` inside each Wine/Proton prefix receives the key over loopback TCP and `PostMessage`s it to the game window. No focus changes at all. Needs `--agent` to say where each target's agent listens.
+- `dance` (last resort): the original focus juggling — focus each target, replay the key, restore focus. Fast enough for taps, poor for held movement keys, and rejected for real multiboxing (REFERENCE.md 4.11/4.12). It is the default with `--backend mock`, which has no agents to talk to.
+- `xsend`: experimental X11 `XSendEvent`; only reaches clients in a Wine virtual desktop and can stick a key.
+
 See [REFERENCE.md](REFERENCE.md) for every design decision and the reasoning behind it.
 
 ## Requirements
@@ -41,29 +48,38 @@ No Flatpak, no rpm-ostree layering: it is a single static binary and the permiss
 ## Usage
 
 ```sh
-clonecast                         # start with broadcasting OFF and an empty key set
+clonecast --agent "Malahmen=48900,Marx=48901"   # agent backend (default): one endpoint per target window
+clonecast --deliver dance         # legacy focus dance, no agents needed
 clonecast --keys "a b c"          # start with an explicit key set
 clonecast --keys all              # broadcast every key
 clonecast --toggle PAUSE          # change the on/off hotkey (default SCROLLLOCK)
-clonecast --settle 50ms           # more time between focusing a target and injecting
+clonecast --settle 50ms           # more time between focusing a target and injecting (dance)
+clonecast --gate-origin=false     # broadcast even when the focused window is not a target
 ```
+
+Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the settle delay and the toggle hotkey are all editable at runtime in the TUI's Settings pane.
 
 Key names are Linux `KEY_*` names without the prefix, case insensitive: `a`, `F1`, `LEFTSHIFT`, `SPACE`, `KP1`.
 
 Inside the TUI:
 
-| Key                 | Action                                                          |
-| ------------------- | --------------------------------------------------------------- |
-| `tab` / `shift+tab` | switch panel                                                    |
-| `j` / `k`, arrows   | move                                                            |
-| `space` / `enter`   | toggle the highlighted window as a target                       |
-| `b`                 | broadcasting on/off (same as the toggle hotkey)                 |
-| `a`                 | in Keys panel: switch between "all keys" and an explicit set    |
-| `e`                 | in Keys panel: edit the key set, `enter` applies, `esc` cancels |
-| `r`                 | refresh the window list (also refreshes every 5s)               |
-| `q`                 | quit                                                            |
+| Key                 | Action                                                                        |
+| ------------------- | ----------------------------------------------------------------------------- |
+| `tab` / `shift+tab` | switch panel (Targets, Keys, Settings, Log)                                   |
+| `j` / `k`, arrows   | move                                                                          |
+| `space` / `enter`   | in Targets: tick the highlighted window; in Settings: change the highlighted setting |
+| `a`                 | in Targets: tick/untick every window; in Keys: switch between "all keys" and an explicit set |
+| `f`                 | in Targets: focus the highlighted window, making it the master                |
+| `e`                 | in Keys: edit the key set; in Settings: type an exact value (`enter` applies, `esc` cancels) |
+| `b`                 | broadcasting on/off (same as the toggle hotkey)                               |
+| `g`                 | origin gate on/off (from any panel)                                           |
+| `r`                 | refresh the window list (also refreshes every 5s; the master is polled faster) |
+| `q`                 | quit                                                                          |
 
-The toggle hotkey (`SCROLLLOCK` by default) works from any window and is never delivered anywhere. Broadcasting always starts **off** and the key set starts **empty**, so nothing is broadcast until you opt in.
+The Settings panel holds the runtime-tunable options: delivery backend, origin gate, settle delay and the toggle hotkey. \
+`M` in the Targets list marks the master, `[x]` a ticked target.
+
+The toggle hotkey (`SCROLLLOCK` by default) works from any window and is never delivered anywhere.
 
 Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change).
 
@@ -71,10 +87,11 @@ Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change).
 
 Before trusting it with anything:
 
-1. Run `clonecast --keys a` in Konsole.
-2. Open two text editors and tick both as targets.
-3. Press `b`, then type `a` a few times in Konsole. Both editors should receive it and focus should return to Konsole.
-4. Check `~/.cache/clonecast/clonecast.log` for errors. If keys arrive in the wrong window, raise `--settle`.
+1. Run `clonecast --deliver dance --keys a` in Konsole (the dance needs no agents).
+2. Open two text editors and tick both as targets with `space` (`a` would tick every window, Konsole included).
+3. Press `b`, then click into **one of the editors** and type `a` a few times. That editor is the master: it gets the key directly, the other one gets it from clonecast. Click into the other editor and it swaps roles.
+4. Typing `a` in Konsole should broadcast nothing (Konsole is not a target — the log says so once). That is the origin gate; `--gate-origin=false`, or `g` in the TUI, lifts it.
+5. Check `~/.cache/clonecast/clonecast.log` for errors. If keys arrive in the wrong window, raise `--settle`.
 
 If a target ignores the injected key, that application reads input in a way uinput cannot satisfy (rare). Note it in an issue.
 
@@ -106,7 +123,7 @@ scripts/                 setup-bazzite.sh
 
 - **Modifiers are not tracked.** If `LEFTSHIFT` is not in your key set, targets get `a` when you type `A`. Add the modifier to the set, or use `all`.
 - **Held keys** reach targets as a single Down and a later Up, with the focus dance in between. Each target's own auto-repeat kicks in, but timing across targets is loose.
-- **The terminal running clonecast** is a window like any other. Do not tick it as a target, and use the toggle hotkey when you need to type in it.
+- **The terminal running clonecast** is a window like any other. Do not tick it as a target: with the origin gate on (the default) typing in it broadcasts nothing, which is the point, but ticking it would make it a real target.
 - **Wayland native only via KWin.** Any window KWin can list works, including XWayland ones. GNOME, Sway, Hyprland and gamescope are out of scope for now.
 - While broadcasting is on, the log records which broadcast keys were pressed. Turn it off before typing passwords.
 

@@ -199,10 +199,16 @@ func (d *deliverer) resolve(id broadcast.WindowID) (xproto.Window, bool) {
 	return w, true
 }
 
-func (d *deliverer) Deliver(_ context.Context, ev keys.Event, targets []broadcast.WindowID, notify func(string, bool)) (int, error) {
+// Deliver XSendEvents ev to every ticked target except origin — the focused
+// window already received it through passthrough (REFERENCE.md 7.10). An
+// empty origin matches no target, so every target is served.
+func (d *deliverer) Deliver(_ context.Context, ev keys.Event, targets []broadcast.WindowID, origin broadcast.WindowID, notify func(string, bool)) (int, error) {
 	down := ev.State != keys.Up
 	delivered := 0
 	for _, t := range targets {
+		if t == origin {
+			continue // the master: passthrough already delivered ev there
+		}
 		w, ok := d.resolve(t)
 		if !ok {
 			notify("xsend: no X window for "+string(t), true)

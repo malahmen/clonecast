@@ -11,8 +11,19 @@
 //     one is actually in flight right now, on that single one. See the
 //     paragraphs below for why that distinction is load-bearing.
 //  2. If broadcasting is enabled and the key is in the allowlist, the engine
-//     then activates each target window in turn, replays the event, and finally
-//     restores focus to the original window.
+//     resolves the origin — the window that has focus right now, i.e. the
+//     current master (REFERENCE.md 7.10) — and hands the event, the ticked
+//     targets and that origin to the selected Deliverer, which delivers to
+//     every target except the origin (it already got the key in step 1).
+//     With the built-in dance backend "delivering" means activating each
+//     target in turn, replaying the event, and restoring focus to the origin;
+//     the focus-free backends (agent, xsend) never move focus at all.
+//
+// Because the origin is resolved per broadcast, the master is dynamic: tick
+// every client and whichever one you are looking at is the one that plays the
+// keys live, with the others mirroring. Config.GateOrigin (on by default)
+// additionally requires the focused window to be one of the ticked targets,
+// so typing in the terminal that runs clonecast does not drive every client.
 //
 // Only Down and Up transitions are broadcast. Auto-repeat events are replayed
 // to the focused window only, because juggling focus at repeat rate is both
@@ -113,6 +124,14 @@ type Config struct {
 	ToggleKey keys.Code
 	// OpTimeout bounds each WindowManager call.
 	OpTimeout time.Duration
+	// GateOrigin restricts broadcasting to the case where the focused window
+	// (the master, see REFERENCE.md 7.10) is itself one of the ticked
+	// targets. On by default: without it, typing in the terminal that runs
+	// clonecast with broadcasting enabled drives every client. Turning it off
+	// restores the "broadcast to every ticked target, whatever has focus"
+	// behaviour, which is occasionally wanted (e.g. driving clients from a
+	// window that is deliberately not a target).
+	GateOrigin bool
 }
 
 // DefaultConfig is a sane starting point.
@@ -122,6 +141,7 @@ func DefaultConfig() Config {
 		SettleDelay: 30 * time.Millisecond,
 		ToggleKey:   toggle,
 		OpTimeout:   2 * time.Second,
+		GateOrigin:  true,
 	}
 }
 
@@ -130,13 +150,19 @@ func DefaultConfig() Config {
 type Engine struct {
 	src Source
 	inj Injector
-	cfg Config
+	// wm resolves the origin (focused) window once per broadcast, so that
+	// every deliverer can skip it instead of re-querying — see
+	// Deliverer.Deliver and REFERENCE.md 7.10.
+	wm WindowManager
 
 	// deliverer performs step 2 (broadcast). Defaults to the focus dance; swap
 	// with SetDeliverer for the agent or xsend backends. See REFERENCE.md 7.9.
+	// Guarded by delivMu so the UI can switch backends while the engine runs.
+	delivMu   sync.RWMutex
 	deliverer Deliverer
 
 	mu      sync.RWMutex
+	cfg     Config // live-tunable from the UI, hence under mu
 	targets []WindowID
 	filter  keys.Set
 	enabled bool
@@ -155,6 +181,12 @@ type Engine struct {
 	// through them; a full queue drops the newest event rather than ever
 	// blocking Run, with a notice so drops are visible instead of silent.
 	queue chan keys.Event
+
+	// gateBlocked / activeBroken keep the gate and the wm.Active failure path
+	// from writing one notice per keystroke. Only broadcastLoop touches them
+	// (single worker goroutine), so they need no lock.
+	gateBlocked  WindowID
+	activeBroken bool
 }
 
 // New wires an engine. The filter starts empty (nothing broadcast) and
@@ -163,19 +195,82 @@ func New(src Source, inj Injector, wm WindowManager, cfg Config) *Engine {
 	e := &Engine{
 		src:     src,
 		inj:     inj,
+		wm:      wm,
 		cfg:     cfg,
 		notices: make(chan Notice, 64),
 		queue:   make(chan keys.Event, 16),
 	}
-	// Default backend: the focus dance, reading SettleDelay live from cfg.
-	e.deliverer = newDanceDeliverer(wm, inj, func() Config { return e.cfg })
+	// Built-in backend: the focus dance, reading SettleDelay live from cfg.
+	// cmd/clonecast swaps in the agent backend for real runs (REFERENCE.md
+	// 4.12/7.9); the dance stays as the last-resort fallback.
+	e.deliverer = newDanceDeliverer(wm, inj, e.Config)
 	return e
 }
 
 // SetDeliverer swaps the broadcast delivery backend (see REFERENCE.md 7.9).
-// Call it before Run; it is not safe to swap while a delivery may be in
-// flight.
-func (e *Engine) SetDeliverer(d Deliverer) { e.deliverer = d }
+// Safe to call while the engine runs — a delivery already in flight finishes
+// with the old backend and the next one uses the new backend — so the UI can
+// offer the backend as a runtime setting. The caller keeps ownership of both
+// deliverers (the engine closes neither).
+func (e *Engine) SetDeliverer(d Deliverer) {
+	e.delivMu.Lock()
+	e.deliverer = d
+	e.delivMu.Unlock()
+}
+
+// DanceDeliverer returns a focus-dance backend bound to this engine's
+// WindowManager, Injector and live config — the same one New installs. It is
+// exported so a UI that switched to the agent or xsend backend can switch
+// back to the last-resort dance without rebuilding the engine.
+func (e *Engine) DanceDeliverer() Deliverer { return newDanceDeliverer(e.wm, e.inj, e.Config) }
+
+// Config returns the live configuration.
+func (e *Engine) Config() Config {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cfg
+}
+
+// SetSettleDelay changes how long delivery waits after activating a target
+// before injecting (dance backend only). Takes effect on the next delivery.
+func (e *Engine) SetSettleDelay(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	e.mu.Lock()
+	e.cfg.SettleDelay = d
+	e.mu.Unlock()
+	e.notify("settle delay "+d.String(), false)
+}
+
+// SetToggleKey changes the hotkey that flips broadcasting on and off. Zero
+// disables the hotkey. It is consumed and never replayed anywhere.
+func (e *Engine) SetToggleKey(c keys.Code) {
+	e.mu.Lock()
+	e.cfg.ToggleKey = c
+	e.mu.Unlock()
+	if c == 0 {
+		e.notify("toggle hotkey disabled", false)
+		return
+	}
+	e.notify("toggle hotkey "+keys.Name(c), false)
+}
+
+// SetGateOrigin turns the origin gate on or off (see Config.GateOrigin).
+func (e *Engine) SetGateOrigin(on bool) {
+	e.mu.Lock()
+	e.cfg.GateOrigin = on
+	e.mu.Unlock()
+	e.notify("origin gate "+onOff(on), false)
+}
+
+// GateOrigin reports whether broadcasting is gated on the focused window
+// being a ticked target.
+func (e *Engine) GateOrigin() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cfg.GateOrigin
+}
 
 // Notices delivers status lines. The channel is buffered and never blocks the
 // engine: if the consumer falls behind, notices are dropped.
@@ -245,7 +340,8 @@ func (e *Engine) Run(ctx context.Context) error {
 }
 
 func (e *Engine) handle(ev keys.Event) {
-	if e.cfg.ToggleKey != 0 && ev.Code == e.cfg.ToggleKey {
+	toggle := e.Config().ToggleKey
+	if toggle != 0 && ev.Code == toggle {
 		if ev.State == keys.Down {
 			e.SetEnabled(!e.Enabled())
 		}
@@ -298,10 +394,15 @@ func (e *Engine) broadcastLoop(ctx context.Context) {
 func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 	e.mu.RLock()
 	targets := append([]WindowID(nil), e.targets...)
+	cfg := e.cfg
 	e.mu.RUnlock()
 	if len(targets) == 0 {
 		return
 	}
+
+	e.delivMu.RLock()
+	d := e.deliverer
+	e.delivMu.RUnlock()
 
 	// A focus-moving backend (the dance) must hold focusMu for its entire
 	// duration: from before it reads the origin window through the final
@@ -309,20 +410,78 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 	// package doc). A focus-free backend (agent/xsend) never moves focus, so
 	// passthrough need never wait on it and we skip the lock. Because a
 	// focus-moving delivery holds focusMu here, its own Emit calls (inside the
-	// deliverer) don't re-acquire it.
-	if e.deliverer.MovesFocus() {
+	// deliverer) don't re-acquire it. Note the lock is taken *before* the
+	// origin lookup below, so "origin" is read while focus is still the
+	// user's, not a previous dance's.
+	if d.MovesFocus() {
 		e.focusMu.Lock()
 		defer e.focusMu.Unlock()
 	}
 
-	opCtx, cancel := context.WithTimeout(ctx, e.cfg.OpTimeout)
+	opCtx, cancel := context.WithTimeout(ctx, cfg.OpTimeout)
 	defer cancel()
 
-	delivered, err := e.deliverer.Deliver(opCtx, ev, targets, e.notify)
+	origin, ok := e.origin(opCtx, targets, cfg)
+	if !ok {
+		return
+	}
+
+	delivered, err := d.Deliver(opCtx, ev, targets, origin, e.notify)
 	if err != nil {
 		return // deliverer already reported the failure via notify
 	}
 	e.notify(fmt.Sprintf("%v -> %d target(s)", ev, delivered), false)
+}
+
+// origin resolves the master window for this broadcast and applies the origin
+// gate. ok=false means "do not broadcast this event".
+//
+// The failure mode that needs a deliberate choice is wm.Active returning an
+// error (compositor hiccup, KWin script timeout). Broadcasting blind then is
+// the dangerous option: without an origin nothing is skipped, so the focused
+// window would get every key twice, and with the gate on we would also be
+// ignoring the user's explicit "only broadcast from a target" instruction on
+// no evidence. So: gate on (the default) => report through notify and skip
+// the event, which costs one keystroke's broadcast and is recoverable; gate
+// off => the user has already said focus must not decide anything, so deliver
+// to every ticked target with an empty origin, exactly as clonecast behaved
+// before the origin was resolved at all.
+func (e *Engine) origin(ctx context.Context, targets []WindowID, cfg Config) (WindowID, bool) {
+	origin, err := e.wm.Active(ctx)
+	if err != nil {
+		if !e.activeBroken { // once per run of failures, not once per key
+			e.activeBroken = true
+			if cfg.GateOrigin {
+				e.notify("active window: "+err.Error()+" — skipping broadcast while the origin gate is on", true)
+			} else {
+				e.notify("active window: "+err.Error()+" — gate off, broadcasting to every target", true)
+			}
+		}
+		if cfg.GateOrigin {
+			return "", false
+		}
+		return "", true // "" matches no target: nothing is skipped
+	}
+	e.activeBroken = false
+
+	if cfg.GateOrigin && !contains(targets, origin) {
+		if e.gateBlocked != origin { // once per focused window, not once per key
+			e.gateBlocked = origin
+			e.notify("origin gate: "+string(origin)+" is not a target, not broadcasting", false)
+		}
+		return "", false
+	}
+	e.gateBlocked = ""
+	return origin, true
+}
+
+func contains(ids []WindowID, id WindowID) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
 }
 
 // passthroughEmit is step 1's Emit, guarded by focusMu so it can never fire
