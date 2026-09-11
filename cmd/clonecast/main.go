@@ -50,6 +50,13 @@ type platform struct {
 }
 
 func main() {
+	// Subcommand dispatch. `clonecast agent ...` is one-time setup (install
+	// the in-bottle agent into a Wine prefix, see agentcmd.go) and never
+	// starts the TUI; everything else is the broadcaster.
+	if len(os.Args) > 1 && os.Args[1] == "agent" {
+		os.Exit(agentCmdMain(os.Args[2:]))
+	}
+
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "clonecast:", err)
 		os.Exit(1)
