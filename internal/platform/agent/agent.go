@@ -86,19 +86,19 @@ func (d *Deliverer) drop(ep string) {
 // here would make that client see every broadcast key twice. An empty origin
 // (the engine could not resolve focus, gate off) matches no target, so every
 // target is served.
-func (d *Deliverer) Deliver(_ context.Context, ev keys.Event, targets []broadcast.WindowID, origin broadcast.WindowID, notify func(string, bool)) (int, error) {
-	frame := agentwire.Frame{Code: uint16(ev.Code), Down: ev.State != keys.Up}
+func (d *Deliverer) Deliver(_ context.Context, req broadcast.Delivery) (int, error) {
+	frame := agentwire.Frame{Code: uint16(req.Event.Code), Down: req.Event.State != keys.Up}
 	delivered := 0
-	for _, t := range targets {
-		if t == origin {
-			continue // the master: passthrough already delivered ev there
+	for _, t := range req.Targets {
+		if t == req.Origin {
+			continue // the master: passthrough already delivered the key there
 		}
 		ep := d.endpoints(t)
 		if ep == "" {
-			d.warnOnce(t, notify) // a ticked target with no --agent entry: warn once, not per key
+			d.warnOnce(t, req.Notify) // a ticked target with no --agent entry: warn once, not per key
 			continue
 		}
-		if d.send(ep, frame, notify) {
+		if d.send(ep, frame, req.Notify) {
 			delivered++
 		}
 	}

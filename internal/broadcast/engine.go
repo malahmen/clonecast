@@ -158,7 +158,9 @@ type Engine struct {
 	// deliverer performs step 2 (broadcast). Defaults to the focus dance; swap
 	// with SetDeliverer for the agent or xsend backends. See REFERENCE.md 7.9.
 	// Guarded by delivMu so the UI can switch backends while the engine runs.
-	delivMu   sync.RWMutex
+	// A plain Mutex: it covers a single field read once per broadcast key, far
+	// below the contention an RWMutex would need to justify itself.
+	delivMu   sync.Mutex
 	deliverer Deliverer
 
 	mu      sync.RWMutex
@@ -400,9 +402,9 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 		return
 	}
 
-	e.delivMu.RLock()
+	e.delivMu.Lock()
 	d := e.deliverer
-	e.delivMu.RUnlock()
+	e.delivMu.Unlock()
 
 	// A focus-moving backend (the dance) must hold focusMu for its entire
 	// duration: from before it reads the origin window through the final
@@ -426,7 +428,7 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 		return
 	}
 
-	delivered, err := d.Deliver(opCtx, ev, targets, origin, e.notify)
+	delivered, err := d.Deliver(opCtx, Delivery{Event: ev, Targets: targets, Origin: origin, Notify: e.notify})
 	if err != nil {
 		return // deliverer already reported the failure via notify
 	}
@@ -436,31 +438,23 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 // origin resolves the master window for this broadcast and applies the origin
 // gate. ok=false means "do not broadcast this event".
 //
-// The failure mode that needs a deliberate choice is wm.Active returning an
-// error (compositor hiccup, KWin script timeout). Broadcasting blind then is
-// the dangerous option: without an origin nothing is skipped, so the focused
-// window would get every key twice, and with the gate on we would also be
-// ignoring the user's explicit "only broadcast from a target" instruction on
-// no evidence. So: gate on (the default) => report through notify and skip
-// the event, which costs one keystroke's broadcast and is recoverable; gate
-// off => the user has already said focus must not decide anything, so deliver
-// to every ticked target with an empty origin, exactly as clonecast behaved
-// before the origin was resolved at all.
+// wm.Active failing (compositor hiccup, KWin script timeout) is a fail-closed
+// case, whatever the gate says: skip the event and report it. Broadcasting
+// without an origin would deliver to a window that already got the key from
+// passthrough, i.e. double every keystroke on the client being played — the
+// precise bug this whole mechanism exists to prevent. Suppressing costs one
+// keystroke's broadcast and is recoverable; a doubled key in a game is not.
+// This is fail-safe defaults (Saltzer & Schroeder; OWASP "fail securely")
+// applied to a tool that types into other people's applications. The notice
+// above is what keeps "fail closed" from meaning "fail silently".
 func (e *Engine) origin(ctx context.Context, targets []WindowID, cfg Config) (WindowID, bool) {
 	origin, err := e.wm.Active(ctx)
 	if err != nil {
 		if !e.activeBroken { // once per run of failures, not once per key
 			e.activeBroken = true
-			if cfg.GateOrigin {
-				e.notify("active window: "+err.Error()+" — skipping broadcast while the origin gate is on", true)
-			} else {
-				e.notify("active window: "+err.Error()+" — gate off, broadcasting to every target", true)
-			}
+			e.notify("active window: "+err.Error()+" — not broadcasting until the focused window is known again", true)
 		}
-		if cfg.GateOrigin {
-			return "", false
-		}
-		return "", true // "" matches no target: nothing is skipped
+		return "", false
 	}
 	e.activeBroken = false
 

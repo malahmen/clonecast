@@ -202,20 +202,20 @@ func (d *deliverer) resolve(id broadcast.WindowID) (xproto.Window, bool) {
 // Deliver XSendEvents ev to every ticked target except origin — the focused
 // window already received it through passthrough (REFERENCE.md 7.10). An
 // empty origin matches no target, so every target is served.
-func (d *deliverer) Deliver(_ context.Context, ev keys.Event, targets []broadcast.WindowID, origin broadcast.WindowID, notify func(string, bool)) (int, error) {
-	down := ev.State != keys.Up
+func (d *deliverer) Deliver(_ context.Context, req broadcast.Delivery) (int, error) {
+	down := req.Event.State != keys.Up
 	delivered := 0
-	for _, t := range targets {
-		if t == origin {
-			continue // the master: passthrough already delivered ev there
+	for _, t := range req.Targets {
+		if t == req.Origin {
+			continue // the master: passthrough already delivered the key there
 		}
 		w, ok := d.resolve(t)
 		if !ok {
-			notify("xsend: no X window for "+string(t), true)
+			req.Notify("xsend: no X window for "+string(t), true)
 			continue
 		}
-		if err := d.s.SendKey(w, ev.Code, down, 0); err != nil {
-			notify("xsend "+ev.String()+" to "+string(t)+": "+err.Error(), true)
+		if err := d.s.SendKey(w, req.Event.Code, down, 0); err != nil {
+			req.Notify("xsend "+req.Event.String()+" to "+string(t)+": "+err.Error(), true)
 			// a stale cached window (game closed) — drop it so the next try re-resolves
 			d.mu.Lock()
 			delete(d.cache, t)

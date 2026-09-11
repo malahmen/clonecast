@@ -248,16 +248,16 @@ type deliverCall struct {
 func (f *fakeDeliverer) MovesFocus() bool { return false }
 func (f *fakeDeliverer) Close() error     { return nil }
 
-func (f *fakeDeliverer) Deliver(_ context.Context, ev keys.Event, targets []WindowID, origin WindowID, _ func(string, bool)) (int, error) {
+func (f *fakeDeliverer) Deliver(_ context.Context, req Delivery) (int, error) {
 	var delivered []WindowID
-	for _, t := range targets {
-		if t == origin {
+	for _, t := range req.Targets {
+		if t == req.Origin {
 			continue
 		}
 		delivered = append(delivered, t)
 	}
 	f.mu.Lock()
-	f.calls = append(f.calls, deliverCall{ev: ev, origin: origin, targets: append([]WindowID(nil), targets...), delivered: delivered})
+	f.calls = append(f.calls, deliverCall{ev: req.Event, origin: req.Origin, targets: append([]WindowID(nil), req.Targets...), delivered: delivered})
 	f.mu.Unlock()
 	return len(delivered), nil
 }
@@ -396,10 +396,11 @@ func TestActiveFailureSkipsBroadcastWhenGated(t *testing.T) {
 	assertLog(t, rec.snapshot(), []string{"emit@origin:A/down"})
 }
 
-// TestActiveFailureDeliversToAllWhenGateOff: with the gate off the user has
-// already said focus decides nothing, so an unknown origin falls back to
-// pre-origin behaviour — every ticked target, nothing skipped.
-func TestActiveFailureDeliversToAllWhenGateOff(t *testing.T) {
+// TestActiveFailureSkipsBroadcastEvenWithGateOff: an unresolvable focused
+// window is fail-closed whatever the gate says. Broadcasting blind would
+// deliver to a window passthrough already served, doubling every keystroke on
+// the client being played — the bug this mechanism exists to prevent.
+func TestActiveFailureSkipsBroadcastEvenWithGateOff(t *testing.T) {
 	rec := &recorder{active: "origin", activeErr: errors.New("kwin script timeout")}
 	e, src, d := newFakeEngine(t, rec)
 	e.SetTargets([]WindowID{"t1", "t2"})
@@ -408,18 +409,11 @@ func TestActiveFailureDeliversToAllWhenGateOff(t *testing.T) {
 	a, _ := keys.Parse("a")
 	run(t, e, src, keys.Event{Code: a, State: keys.Down})
 
-	calls := d.snapshot()
-	if len(calls) != 1 {
-		t.Fatalf("want 1 delivery, got %d (%v)", len(calls), calls)
+	if calls := d.snapshot(); len(calls) != 0 {
+		t.Fatalf("want no delivery when the focused window is unknown, got %v", calls)
 	}
-	if calls[0].origin != "" {
-		t.Fatalf("origin %q, want empty (unknown)", calls[0].origin)
-	}
-	if got, want := calls[0].delivered, []WindowID{"t1", "t2"}; !sameIDs(got, want) {
-		t.Fatalf("delivered to %v, want %v", got, want)
-	}
-	if !hasNotice(notices(e), "gate off") {
-		t.Fatal("falling back to broadcasting everywhere was not reported")
+	if !hasNotice(notices(e), "active window") {
+		t.Fatal("the suppressed broadcast was not reported")
 	}
 }
 
@@ -445,4 +439,96 @@ func assertLog(t *testing.T, got, want []string) {
 			t.Fatalf("call %d = %q, want %q (full: %v)", i, got[i], want[i], got)
 		}
 	}
+}
+
+// TestDelivererSwapIsSafeMidDelivery exercises the contract SetDeliverer's doc
+// comment makes: a delivery already in flight finishes against the backend it
+// started with, and the next one uses the new backend. Documented happens-before
+// claims are worth nothing untested, since -race only sees executed paths.
+func TestDelivererSwapIsSafeMidDelivery(t *testing.T) {
+	rec := &recorder{active: "t1"}
+	e, src, _ := newFakeEngine(t, rec)
+	e.SetTargets([]WindowID{"t1", "t2"})
+
+	// A backend that blocks inside Deliver until released, so a swap is
+	// guaranteed to land while a delivery is genuinely in flight.
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	slow := &blockingDeliverer{entered: entered, release: release}
+	e.SetDeliverer(slow)
+
+	a, _ := keys.Parse("a")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = e.Run(ctx) }()
+
+	src.ch <- keys.Event{Code: a, State: keys.Down}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delivery never started")
+	}
+
+	swapped := &fakeDeliverer{}
+	e.SetDeliverer(swapped) // mid-flight swap
+	close(release)
+
+	src.ch <- keys.Event{Code: a, State: keys.Up}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(swapped.snapshot()) > 0 {
+			return // the second event went to the new backend: contract holds
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the swapped-in deliverer never received the next event")
+}
+
+// TestDelivererSwapUnderLoad hammers SetDeliverer while the broadcast worker
+// reads the field, so the race detector sees a genuinely concurrent
+// read/write pair. TestDelivererSwapIsSafeMidDelivery above covers the
+// semantics; this one covers the memory safety the doc comment claims.
+// Verified by removing delivMu and confirming -race then reports the race.
+func TestDelivererSwapUnderLoad(t *testing.T) {
+	rec := &recorder{active: "t1"}
+	e, src, _ := newFakeEngine(t, rec)
+	e.SetTargets([]WindowID{"t1", "t2"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = e.Run(ctx) }()
+
+	swapping := make(chan struct{})
+	go func() {
+		defer close(swapping)
+		for i := 0; i < 500; i++ {
+			e.SetDeliverer(&fakeDeliverer{})
+		}
+	}()
+
+	a, _ := keys.Parse("a")
+	for i := 0; i < 500; i++ {
+		select {
+		case src.ch <- keys.Event{Code: a, State: keys.Down}:
+		case <-time.After(time.Second):
+			t.Fatal("engine stopped consuming events")
+		}
+	}
+	<-swapping
+}
+
+type blockingDeliverer struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingDeliverer) MovesFocus() bool { return false }
+func (b *blockingDeliverer) Close() error     { return nil }
+func (b *blockingDeliverer) Deliver(_ context.Context, req Delivery) (int, error) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-b.release
+	return len(req.Targets), nil
 }
