@@ -15,9 +15,20 @@
 // GetWindow tree-walk (callback-free) and the HWND cached; thereafter only
 // PostMessage is used.
 //
+// Lifetime belongs to the prefix, not to clonecast and not to the launcher
+// (REFERENCE.md 4.16/7.11). `clonecast agent install --prefix <path>` copies
+// this binary into <prefix>/drive_c/clonecast and registers it under
+// HKLM\Software\Microsoft\Windows\CurrentVersion\RunServices, which Wine's
+// implicit `wineboot --init` runs on every prefix boot under every launcher.
+// Consequences visible here: it starts long before the game (so the window
+// wait is unbounded), it is started twice on a 64-bit prefix (so it takes a
+// named mutex), it has no console (so it logs to a file beside itself), and it
+// dies with the wineserver (so nothing on the host ever signals it — doing so
+// killed the game, 4.14).
+//
 // Usage:
 //
-//	clonecast-agent [-port N] [-title "World of Warcraft"]
+//	clonecast-agent [-port N] [-title "World of Warcraft"] [-log PATH]
 //
 // Build: GOOS=windows GOARCH=386 CGO_ENABLED=0 go build ./cmd/clonecast-agent
 // (386 because vanilla WoW / its Wine is 32-bit and 64-bit Go PE has been seen
@@ -27,8 +38,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"syscall"
@@ -46,6 +59,9 @@ var (
 	procPostMessageW     = user32.NewProc("PostMessageW")
 	procPeekMessageW     = user32.NewProc("PeekMessageW")
 	procIsWindow         = user32.NewProc("IsWindow")
+
+	kernel32        = syscall.NewLazyDLL("kernel32.dll")
+	procCreateMutex = kernel32.NewProc("CreateMutexW")
 )
 
 const (
@@ -54,10 +70,66 @@ const (
 
 	wmKEYDOWN = 0x0100
 	wmKEYUP   = 0x0101
+
+	errAlreadyExists = syscall.Errno(183) // ERROR_ALREADY_EXISTS
 )
 
+// out is where logf writes. Started from RunServices there is no console at
+// all, so the log file next to the exe inside the prefix is the only way to
+// see what the agent did (and when: it should appear before the game window
+// exists).
+var out io.Writer = os.Stderr
+
 func logf(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "[clonecast-agent] "+format+"\n", a...)
+	fmt.Fprintf(out, "%s [clonecast-agent] "+format+"\n",
+		append([]any{time.Now().Format("15:04:05.000")}, a...)...)
+}
+
+// setupLog tees the log to a file. Failure is not fatal: the agent is more
+// useful running without a log than not running at all.
+func setupLog(path string) {
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		logf("log file %s: %v (continuing without one)", path, err)
+		return
+	}
+	out = io.MultiWriter(os.Stderr, f)
+}
+
+// defaultLogPath puts the log next to the agent binary, i.e. inside the prefix
+// (C:\clonecast\clonecast-agent.log for an installed agent).
+func defaultLogPath() string {
+	self, err := os.Executable()
+	if err != nil {
+		return "clonecast-agent.log"
+	}
+	return filepath.Join(filepath.Dir(self), "clonecast-agent.log")
+}
+
+// singleInstance takes a named mutex and reports whether this process is the
+// first holder. It must be called before anything else: `wineboot --init`
+// processes the Run keys twice on a 64-bit prefix (it re-opens them with
+// KEY_WOW64_32KEY and this key is not redirected), so one RunServices entry
+// starts two agents. The second must exit quietly — otherwise it sits forever
+// waiting for a window it will never be allowed to serve, and races the first
+// for the listening port.
+//
+// The handle is deliberately never closed: it is released when the process
+// exits, which is exactly the lifetime we want.
+func singleInstance(name string) bool {
+	p, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		return true
+	}
+	h, _, callErr := procCreateMutex.Call(0, 0, uintptr(unsafe.Pointer(p)))
+	if h == 0 {
+		logf("CreateMutex(%s) failed: %v (continuing anyway)", name, callErr)
+		return true
+	}
+	return callErr != errAlreadyExists
 }
 
 func getWindowText(hwnd uintptr) string {
@@ -90,20 +162,37 @@ func findByTitle(want string) uintptr {
 	return walk(desktop, 0)
 }
 
-// resolveHWND blocks until the game window appears (or ~60s elapse), so the
-// agent can be launched before the game finished creating its window.
+// resolveHWND blocks until the game window appears. It never gives up: since
+// the agent is autostarted by the prefix itself (RunServices, see
+// `clonecast agent install`), it runs *before* the launcher starts the game,
+// and the wait is as long as the user takes to get to the character screen —
+// minutes, not the 60 s the hand-launched agent used to allow. The prefix owns
+// the agent's lifetime now, so "wait forever" costs nothing: the agent dies
+// with the wineserver.
+//
+// The poll starts fast (the game may already be up when a user installs and
+// relaunches) and slows to 5 s, so an idle agent is invisible in a busy
+// wineserver — the tree-walk is the only Win32 work it does while waiting.
 func resolveHWND(title string) uintptr {
 	// A stray PeekMessage so this thread has a message queue, matching what a
 	// normal GUI process does before touching window APIs.
 	var msg [12]uintptr
 	procPeekMessageW.Call(uintptr(unsafe.Pointer(&msg[0])), 0, 0, 0, 0)
-	for i := 0; i < 120; i++ {
+
+	wait := 500 * time.Millisecond
+	const maxWait = 5 * time.Second
+	for i := 0; ; i++ {
 		if h := findByTitle(title); h != 0 {
 			return h
 		}
-		time.Sleep(500 * time.Millisecond)
+		if i == 20 || (i > 20 && i%60 == 0) { // ~10 s, then every ~5 min
+			logf("still waiting for a window titled %q ...", title)
+		}
+		time.Sleep(wait)
+		if wait < maxWait {
+			wait += 250 * time.Millisecond
+		}
 	}
-	return 0
 }
 
 // resolver caches the game window's HWND but re-resolves it when it goes
@@ -178,14 +267,21 @@ func main() {
 
 	port := flag.Int("port", 48900, "loopback TCP port to listen on")
 	title := flag.String("title", "World of Warcraft", "exact window title to deliver keys to")
+	logPath := flag.String("log", defaultLogPath(), "log file (there is no console under RunServices autostart); empty to disable")
 	flag.Parse()
 
-	logf("locating window %q ...", *title)
-	hwnd := resolveHWND(*title)
-	if hwnd == 0 {
-		logf("window %q not found after timeout; exiting", *title)
-		os.Exit(1)
+	setupLog(*logPath)
+
+	// One agent per port per prefix. See singleInstance: a RunServices entry
+	// is started twice on a 64-bit prefix.
+	mutexName := fmt.Sprintf(`Local\clonecast-agent-%d`, *port)
+	if !singleInstance(mutexName) {
+		logf("another agent already holds %s; exiting (this is the expected second start on a 64-bit prefix)", mutexName)
+		return
 	}
+
+	logf("starting (pid %d, port %d), locating window %q ...", os.Getpid(), *port, *title)
+	hwnd := resolveHWND(*title)
 	logf("window found: hwnd=0x%x", hwnd)
 	res := &resolver{title: *title, hwnd: hwnd}
 
