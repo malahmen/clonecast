@@ -45,6 +45,35 @@ install -Dm755 clonecast-linux-amd64 ~/.local/bin/clonecast
 
 No Flatpak, no rpm-ostree layering: it is a single static binary and the permissions live in `/etc`, which is writable on Bazzite.
 
+### The in-bottle agent
+
+The `agent` delivery backend needs a small Windows helper running inside each
+game's Wine prefix; it is what places keys on an unfocused window without moving
+focus. Build it and install it into a prefix:
+
+```sh
+make agent                                  # bin/clonecast-agent.exe (GOOS=windows GOARCH=386)
+clonecast agent list                        # prefixes of currently running Wine processes
+clonecast agent install --prefix ~/.var/app/com.usebottles.bottles/data/bottles/bottles/Malahmen
+clonecast agent status  --prefix <path>
+clonecast agent uninstall --prefix <path>
+```
+
+`install` copies the agent to `<prefix>/drive_c/clonecast/` and registers it
+under `HKLM\Software\Microsoft\Windows\CurrentVersion\RunServices`, so it
+starts on every prefix boot whatever launches the game — Bottles, Lutris, Proton
+or umu — and dies with that prefix's wineserver. Nothing on the host ever has to
+signal it, which is what used to take the game down with it.
+
+It edits `system.reg` directly when the prefix is idle. If the prefix is already
+running, pass the wine command to use instead, for example
+`--wine "flatpak run --command=<runner>/bin/wine com.usebottles.bottles"` or
+`--wine "PROTON_VERB=run umu-run"`; the command chosen is reported either way.
+
+> Untested against a real prefix. The mechanism is derived from Wine's source
+> (see REFERENCE.md 4.16) but has not yet been run on the Bazzite box — verify
+> with `research.md` §E step 2 before relying on it.
+
 ## Usage
 
 ```sh
