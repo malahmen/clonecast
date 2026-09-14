@@ -40,7 +40,7 @@ const ExeName = "clonecast-agent.exe"
 type Config struct {
 	Prefix     string // host path to the Wine prefix
 	ExePath    string // host path to the built clonecast-agent.exe
-	Port       int    // agent's loopback listen port (0 = leave the agent's default)
+	Port       int    // clonecast's listening port for the agent to dial (0 = leave the agent's default)
 	Title      string // target window title passed to the agent ("" = agent default)
 	WineCmd    string // shell command that runs wine for this prefix, e.g. a flatpak invocation
 	Route      string // RouteAuto (default), RouteFile or RouteReg
@@ -142,6 +142,9 @@ func Install(cfg Config) (*Result, error) {
 		}
 	}
 	res.note("the agent starts on the prefix's next boot; it does not start an already-running prefix")
+	if cfg.Port > 0 {
+		res.note("it dials clonecast on port %d; CLONECAST_PORT in the prefix's environment overrides that per launch", cfg.Port)
+	}
 	return res, nil
 }
 
@@ -255,6 +258,14 @@ func Validate(prefix string) error {
 // commandLine builds the autostart command line stored in the registry. The
 // path is fixed and space-free, so it needs no quoting; the title may contain
 // spaces and is quoted the way CommandLineToArgvW expects.
+//
+// -port is clonecast's listening port, the one the agent dials (REFERENCE.md
+// 4.17). It used to be the port the agent itself listened on, back when
+// clonecast dialled in; the flag name is unchanged because the agent still
+// takes exactly this spelling, and the agent's own default is the same
+// 48800 clonecast listens on, so an entry written without a port keeps
+// working. The value here is baked in at install time, which is why the agent
+// lets CLONECAST_PORT in the environment override it per launch.
 func commandLine(cfg Config) string {
 	cmd := InstallDirWin + `\` + ExeName
 	if cfg.Port > 0 {

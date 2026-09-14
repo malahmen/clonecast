@@ -34,7 +34,7 @@ import (
 // values the `agent install` flags carry.
 type PrefixPaneConfig struct {
 	ExePath string // built clonecast-agent.exe ("" = look next to the binary)
-	Port    int    // agent listen port inside the prefix (0 = agent default)
+	Port    int    // clonecast port the installed agent dials (0 = agent default)
 	Title   string // target window title ("" = agent default)
 	WineCmd string // wine command for prefixes that are already booted
 }

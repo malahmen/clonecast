@@ -141,3 +141,34 @@ func TestSamePrefix(t *testing.T) {
 		t.Error("different directories compared equal")
 	}
 }
+
+// TestPrefixOfPIDIn covers the window -> pid -> environ -> WINEPREFIX join
+// that pairs a KWin window with a registered agent (REFERENCE.md 4.17),
+// including every way it can fail — each of which sends the caller to the
+// title fallback.
+func TestPrefixOfPIDIn(t *testing.T) {
+	bottle := t.TempDir()
+	root := fakeProc(t, map[string][]string{
+		"201": {"LANG=C", "WINEPREFIX=" + bottle + "/", "DISPLAY=:0"},
+		"202": {"HOME=/home/u"},   // a real process, not a Wine one
+		"203": nil,                // environ unreadable (another user's process)
+		"204": {"WINEPREFIX=   "}, // set but empty
+	}, nil)
+
+	got, err := PrefixOfPIDIn(root, 201)
+	if err != nil {
+		t.Fatalf("pid 201: %v", err)
+	}
+	if !SamePrefix(got, bottle) {
+		t.Errorf("pid 201: prefix = %q, want %q", got, bottle)
+	}
+	if got != CleanPrefix(got) {
+		t.Errorf("pid 201: prefix %q is not cleaned", got)
+	}
+
+	for _, pid := range []int{202, 203, 204, 999, 0, -1} {
+		if p, err := PrefixOfPIDIn(root, pid); err == nil {
+			t.Errorf("pid %d: want an error, got prefix %q", pid, p)
+		}
+	}
+}

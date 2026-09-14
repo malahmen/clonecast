@@ -9,8 +9,10 @@
 // Layout (lazygit style, four panels):
 //
 //	┌ Targets ──────────┐┌ Keys ─────────┐┌ Settings ─────┐
-//	│ [x] M Game — 1    ││ mode: explicit││ delivery agent│
-//	│ [x]   Game — 2    ││ A B C         ││ gate      ON  │
+//	│ [x] M Game — 1 ●  ││ mode: explicit││ delivery agent│
+//	│ [x]   Game — 2 ●  ││ A B C         ││ gate      ON  │
+//	│ [x]   Firefox     ││               ││ listen …48800 │
+//	│        no agent   ││               ││ 2 agents      │
 //	└───────────────────┘└───────────────┘└───────────────┘
 //	┌ Log ─────────────────────────────────────────────────┐
 //	│ 12:00:01 A down -> 2 target(s)                       │
@@ -22,6 +24,13 @@
 // you are looking at (REFERENCE.md 7.10) — tick every client and just switch
 // windows. The marker is polled on its own fast ticker, not with the 5s
 // window-list refresh, so it tracks focus live.
+//
+// "●" marks a window that has a live in-bottle agent registered for it
+// (REFERENCE.md 4.17). That is what makes ticking a row the only action target
+// selection needs: there is no endpoint to configure, so the list itself has
+// to say which windows delivery can actually reach — and a row that is ticked
+// without an agent says "no agent" in place, not once in the log where it
+// scrolls away.
 package tui
 
 import (
@@ -51,6 +60,24 @@ type Backends interface {
 	Use(name string) error
 }
 
+// Agents is the live agent registry as the UI sees it: how many in-bottle
+// agents have registered, which windows they cover, and where they connect.
+// cmd/clonecast implements it with *agent.Registry; a nil Agents just hides
+// the markers (the mock build in a test, say).
+type Agents interface {
+	// Addr is the address agents dial to register.
+	Addr() string
+	// Count is how many are connected right now.
+	Count() int
+	// Paired reports whether a live agent serves this window.
+	Paired(id broadcast.WindowID) bool
+	// Listen rebinds the listening address while clonecast runs.
+	Listen(addr string) error
+}
+
+// AgentMark is the Targets-list marker for "this window has a live agent".
+const AgentMark = "●"
+
 type pane int
 
 const (
@@ -69,6 +96,7 @@ const (
 	setGate
 	setSettle
 	setToggle
+	setListen
 	settingCount
 )
 
@@ -93,6 +121,7 @@ const (
 	editKeys
 	editSettle
 	editToggle
+	editListen
 )
 
 type (
@@ -114,6 +143,7 @@ type Model struct {
 	engine   *broadcast.Engine
 	wm       broadcast.WindowManager
 	backends Backends
+	agents   Agents
 
 	windows  []broadcast.Window
 	selected map[broadcast.WindowID]bool
@@ -138,14 +168,16 @@ type Model struct {
 }
 
 // New builds the model. The engine must already be running. backends may be
-// nil, in which case the delivery backend is shown but cannot be switched.
-func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends) Model {
+// nil, in which case the delivery backend is shown but cannot be switched;
+// agents may be nil, in which case the Targets list shows no agent markers.
+func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends, agents Agents) Model {
 	ti := textinput.New()
 	ti.CharLimit = 200
 	return Model{
 		engine:   engine,
 		wm:       wm,
 		backends: backends,
+		agents:   agents,
 		selected: map[broadcast.WindowID]bool{},
 		input:    ti,
 		logVP:    viewport.New(0, 0),
@@ -310,6 +342,14 @@ func (m *Model) applyEdit() error {
 			return fmt.Errorf("toggle key: %w", err)
 		}
 		m.engine.SetToggleKey(c)
+	case editListen:
+		if m.agents == nil {
+			return fmt.Errorf("this build has no agent registry")
+		}
+		if err := m.agents.Listen(value); err != nil {
+			return err
+		}
+		m.appendLog("agents listening on "+m.agents.Addr(), false)
 	}
 	return nil
 }
@@ -402,8 +442,8 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			switch m.setCursor {
 			case setSettle:
 				return m, m.startEdit(editSettle, m.engine.Config().SettleDelay.String(), "duration, e.g. 30ms")
-			case setToggle:
-				return m, m.startEdit(editToggle, toggleName(m.engine.Config().ToggleKey), "key name, or none")
+			case setToggle, setListen:
+				return m, m.changeSetting()
 			default:
 				return m, m.changeSetting()
 			}
@@ -454,6 +494,12 @@ func (m *Model) changeSetting() tea.Cmd {
 		m.engine.SetSettleDelay(next)
 	case setToggle:
 		return m.startEdit(editToggle, toggleName(m.engine.Config().ToggleKey), "key name, or none")
+	case setListen:
+		if m.agents == nil {
+			m.appendLog("no agent registry in this build", true)
+			return nil
+		}
+		return m.startEdit(editListen, m.agents.Addr(), "host:port agents dial, e.g. 127.0.0.1:48800")
 	}
 	return nil
 }
@@ -524,6 +570,7 @@ var (
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	cursorStyle = lipgloss.NewStyle().Reverse(true)
 	masterStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	agentStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
 )
 
 func (m *Model) layout() {
@@ -565,10 +612,14 @@ func (m Model) header() string {
 	if m.engine.Enabled() {
 		state = onStyle.Render("BROADCAST ON")
 	}
+	agents := ""
+	if m.agents != nil {
+		agents = fmt.Sprintf("  agents: %d", m.agents.Count())
+	}
 	return fmt.Sprintf(" %s  %s  %s  %s",
 		titleStyle.Render("clonecast"),
 		state,
-		dimStyle.Render(fmt.Sprintf("targets: %d  keys: %s", len(m.engine.Targets()), m.engine.Filter())),
+		dimStyle.Render(fmt.Sprintf("targets: %d%s  keys: %s", len(m.engine.Targets()), agents, m.engine.Filter())),
 		m.masterLine(),
 	)
 }
@@ -643,8 +694,21 @@ func (m Model) viewTargets(w, h int) string {
 		if m.isMaster(win) {
 			master = masterStyle.Render("M")
 		}
-		line := fmt.Sprintf("%s %s %s", mark, master, truncate(win.Title, max(0, w-8)))
-		line += dimStyle.Render("  " + truncate(win.Class, max(0, w-lipgloss.Width(line)-2)))
+		line := fmt.Sprintf("%s %s %s", mark, master, truncate(win.Title, max(0, w-12)))
+		switch {
+		case m.agents == nil:
+			// No registry (mock/dev build): nothing to say about agents.
+		case m.agents.Paired(win.ID):
+			// A live agent covers this window, so ticking it is enough.
+			line += " " + agentStyle.Render(AgentMark)
+		case m.selected[win.ID]:
+			// Ticked but unreachable. Say so on the row itself — the log
+			// says it once and then scrolls away (REFERENCE.md 4.17).
+			line += "  " + errStyle.Render("no agent")
+		}
+		if rest := max(0, w-lipgloss.Width(line)-2); rest > 3 {
+			line += dimStyle.Render("  " + truncate(win.Class, rest))
+		}
 		if i == m.cursor && m.pane == paneTargets {
 			line = cursorStyle.Render(line)
 		}
@@ -695,11 +759,25 @@ func (m Model) viewSettings(w int) string {
 	if cfg.GateOrigin {
 		gate = onStyle.Render("ON")
 	}
+	listen, agents := "—", dimStyle.Render("no agent registry")
+	if m.agents != nil {
+		listen = m.agents.Addr()
+		n := m.agents.Count()
+		switch n {
+		case 0:
+			agents = offStyle.Render("0 agents") + dimStyle.Render(" registered")
+		case 1:
+			agents = onStyle.Render("1 agent") + dimStyle.Render(" registered")
+		default:
+			agents = onStyle.Render(fmt.Sprintf("%d agents", n)) + dimStyle.Render(" registered")
+		}
+	}
 	rows := [settingCount]struct{ label, value string }{
 		setDelivery: {"delivery", backend},
 		setGate:     {"origin gate", gate},
 		setSettle:   {"settle", cfg.SettleDelay.String()},
 		setToggle:   {"toggle key", toggleName(cfg.ToggleKey)},
+		setListen:   {"listen", listen},
 	}
 	var b strings.Builder
 	for i, r := range rows {
@@ -709,7 +787,11 @@ func (m Model) viewSettings(w int) string {
 		}
 		b.WriteString(line + "\n")
 	}
-	if m.editing == editSettle || m.editing == editToggle {
+	// Not a row: agents register themselves, so there is nothing here to
+	// change — but how many have is the first thing to look at when a ticked
+	// window is not receiving keys.
+	b.WriteString(agents + "\n")
+	if m.editing == editSettle || m.editing == editToggle || m.editing == editListen {
 		b.WriteString("\n" + m.input.View())
 		if m.editErr != "" {
 			b.WriteString("\n" + errStyle.Render(m.editErr))

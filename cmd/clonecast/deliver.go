@@ -1,15 +1,14 @@
 package main
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
-	"time"
 
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/platform/agent"
+	"github.com/malahmen/clonecast/internal/tui"
 )
 
 // Delivery backend names, in the order the TUI cycles through them.
@@ -21,13 +20,13 @@ const (
 
 // backends owns every delivery backend available for this run and which one
 // the engine is currently using. Each backend is built at most once and kept
-// (agent connections survive a round trip through another backend), so the
-// TUI can switch delivery at runtime instead of the user restarting clonecast
-// with a different --deliver. See REFERENCE.md 7.9.
+// (the agent registry and its connections survive a round trip through another
+// backend), so the TUI can switch delivery at runtime instead of the user
+// restarting clonecast with a different --deliver. See REFERENCE.md 7.9.
 type backends struct {
 	engine    *broadcast.Engine
 	wm        broadcast.WindowManager
-	agentSpec string
+	agents    *agent.Registry
 	xsendSpec string
 
 	mu    sync.Mutex
@@ -36,11 +35,11 @@ type backends struct {
 	close map[string]func()
 }
 
-func newBackends(engine *broadcast.Engine, wm broadcast.WindowManager, agentSpec, xsendSpec string) *backends {
+func newBackends(engine *broadcast.Engine, wm broadcast.WindowManager, agents *agent.Registry, xsendSpec string) *backends {
 	return &backends{
 		engine:    engine,
 		wm:        wm,
-		agentSpec: agentSpec,
+		agents:    agents,
 		xsendSpec: xsendSpec,
 		made:      map[string]broadcast.Deliverer{},
 		close:     map[string]func(){},
@@ -48,11 +47,14 @@ func newBackends(engine *broadcast.Engine, wm broadcast.WindowManager, agentSpec
 }
 
 // Names lists the backends this run can actually use, so the TUI never cycles
-// into one that is guaranteed to fail: agent needs --agent endpoints, and
-// xsend only exists on Linux.
+// into one that is guaranteed to fail: the agent backend needs at least one
+// agent to have registered (REFERENCE.md 4.17 — there is nothing to configure
+// any more, so "is it usable?" is simply "did an agent show up?"), and xsend
+// only exists on Linux. The answer changes while clonecast runs, as prefixes
+// boot and shut down.
 func (b *backends) Names() []string {
 	names := []string{deliverDance}
-	if b.agentSpec != "" {
+	if b.agents != nil && b.agents.Count() > 0 {
 		names = append(names, deliverAgent)
 	}
 	if xsendAvailable {
@@ -72,6 +74,27 @@ func (b *backends) Current() string {
 // Use switches the engine to the named backend, building it on first use.
 // Safe while the engine runs (Engine.SetDeliverer is).
 func (b *backends) Use(name string) error {
+	if name == deliverAgent && b.agents != nil && b.agents.Count() == 0 {
+		return errNoAgentsRegistered(b.agents.Addr())
+	}
+	return b.use(name)
+}
+
+// Start selects the backend clonecast boots with. It differs from Use in one
+// place: picking the agent backend with nothing registered yet is a warning,
+// not a refusal. Registration is asynchronous — an agent may be seconds away
+// from connecting (or the game may not be launched yet) — so refusing to start
+// would mean quitting over a condition that fixes itself. The returned string
+// is the warning to show; "" means all is well.
+func (b *backends) Start(name string) (string, error) {
+	warn := ""
+	if name == deliverAgent && b.agents != nil && b.agents.Count() == 0 {
+		warn = errNoAgentsRegistered(b.agents.Addr()).Error()
+	}
+	return warn, b.use(name)
+}
+
+func (b *backends) use(name string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if name == b.cur {
@@ -103,7 +126,9 @@ func (b *backends) Use(name string) error {
 	return nil
 }
 
-// Close releases every backend that was built.
+// Close releases every backend that was built. The agent registry is not one
+// of them: it belongs to the run, not to the backend, so agents stay connected
+// while the user tries another backend.
 func (b *backends) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -114,101 +139,28 @@ func (b *backends) Close() {
 	}
 }
 
-// newAgent wires the agent backend: targets are matched to an in-bottle agent
-// endpoint by window title, per the --agent map.
+// newAgent wires the agent backend to the registry. There is nothing to
+// configure: targets are paired to registered agents by prefix (REFERENCE.md
+// 4.17), so ticking a window in the TUI is the whole of target selection.
 func (b *backends) newAgent() (broadcast.Deliverer, func(), error) {
-	m, err := parseTitleMap(b.agentSpec)
-	if err != nil {
-		return nil, nil, fmt.Errorf("--agent: %w", err)
+	if b.agents == nil {
+		return nil, nil, errors.New("this build has no agent registry")
 	}
-	if len(m) == 0 {
-		return nil, nil, errNoAgentEndpoints
-	}
-	// Normalise bare ports to a loopback endpoint.
-	for k, v := range m {
-		if !strings.Contains(v, ":") {
-			m[k] = "127.0.0.1:" + v
-		}
-	}
-	tc := newTitleCache(b.wm)
-	d := agent.New(func(id broadcast.WindowID) string { return m[tc.title(id)] })
+	d := agent.New(b.agents)
 	return d, func() { _ = d.Close() }, nil
 }
 
-// errNoAgentEndpoints is what a bare `clonecast` hits now that agent is the
-// default backend (REFERENCE.md 4.12/7.9): say what to pass and what the
-// fallback is, rather than starting up and silently broadcasting nowhere.
-var errNoAgentEndpoints = fmt.Errorf(`the "agent" delivery backend (the default) needs --agent "Title=host:port,...", one entry per target window,
-    pointing at the clonecast-agent.exe running inside that target's Wine prefix, e.g.
-        clonecast --agent "Malahmen=48900,Marx=48901"
-    Run one agent per prefix first (see README "Usage" and REFERENCE.md 4.13-4.14), or fall back to the legacy focus dance with
+// errNoAgentsRegistered is what a bare `clonecast` hits when no prefix has an
+// agent yet. It replaces the old "--agent is empty" error: the flag is gone,
+// so the actionable advice is now about installing and starting agents.
+func errNoAgentsRegistered(addr string) error {
+	return fmt.Errorf(`the "agent" delivery backend (the default) has no agents: nothing has connected to %s.
+    Each game's Wine prefix runs its own clonecast-agent.exe, which dials clonecast and registers itself:
+        make agent                                    # build it
+        clonecast agent list                          # prefixes of running Wine processes
+        clonecast agent install --prefix <prefix>     # autostart it on that prefix's next boot
+    Then restart the game (the agent starts with the prefix) and it appears in the Targets list with a %s marker.
+    Until then, fall back to the legacy focus dance with
         clonecast --deliver dance
-    (the dance moves real focus per key: slow, and rejected for multiboxing — see REFERENCE.md 4.11/4.12)`)
-
-// parseTitleMap parses "Title A=val,Title B=val2" into a map. Keys and values
-// are trimmed; empty entries are ignored. A key may contain spaces (window
-// titles do); only the first '=' separates key from value.
-func parseTitleMap(spec string) (map[string]string, error) {
-	m := map[string]string{}
-	for _, part := range strings.Split(spec, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		eq := strings.IndexByte(part, '=')
-		if eq < 0 {
-			return nil, fmt.Errorf("entry %q has no '='", part)
-		}
-		key := strings.TrimSpace(part[:eq])
-		val := strings.TrimSpace(part[eq+1:])
-		if key == "" || val == "" {
-			return nil, fmt.Errorf("entry %q has an empty key or value", part)
-		}
-		m[key] = val
-	}
-	return m, nil
-}
-
-// titleCache resolves a WindowID to its current title via the WindowManager,
-// cached briefly so per-key delivery doesn't do a compositor round-trip each
-// time. Refreshed on a miss or when older than ttl.
-type titleCache struct {
-	wm  broadcast.WindowManager
-	ttl time.Duration
-
-	mu sync.Mutex
-	at time.Time
-	m  map[broadcast.WindowID]string
-}
-
-func newTitleCache(wm broadcast.WindowManager) *titleCache {
-	return &titleCache{wm: wm, ttl: 2 * time.Second}
-}
-
-func (t *titleCache) title(id broadcast.WindowID) string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.m == nil || time.Since(t.at) > t.ttl {
-		t.refresh()
-	}
-	if s, ok := t.m[id]; ok {
-		return s
-	}
-	t.refresh() // a miss may just be a stale cache
-	return t.m[id]
-}
-
-func (t *titleCache) refresh() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	wins, err := t.wm.List(ctx)
-	if err != nil {
-		return
-	}
-	m := make(map[broadcast.WindowID]string, len(wins))
-	for _, w := range wins {
-		m[w.ID] = w.Title
-	}
-	t.m = m
-	t.at = time.Now()
+    (the dance moves real focus per key: slow, and rejected for multiboxing — see REFERENCE.md 4.11/4.12)`, addr, tui.AgentMark)
 }

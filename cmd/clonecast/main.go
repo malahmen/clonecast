@@ -3,17 +3,21 @@
 // Usage:
 //
 //	clonecast [--backend mock|linux] [--deliver agent|dance|xsend]
-//	          [--agent "Title=host:port,..."] [--xsend "Title=X Title,..."]
+//	          [--listen 127.0.0.1:48800] [--xsend "Title=X Title,..."]
 //	          [--keys "a b c"|all] [--toggle SCROLLLOCK] [--settle 30ms]
 //	          [--gate-origin=false] [--log PATH]
 //
 // --backend picks the platform (default "linux" on Linux, "mock" elsewhere).
 // --deliver picks how broadcast keys reach targets: the in-bottle PostMessage
-// "agent" (the default and the only path proven on real clients — needs
-// --agent to map each target window title to its agent's loopback endpoint),
-// the focus "dance" (legacy last resort, the default with --backend mock since
-// there are no agents to talk to there), or "xsend" (experimental X11
-// XSendEvent; see REFERENCE.md 4.12).
+// "agent" (the default and the only path proven on real clients), the focus
+// "dance" (legacy last resort, the default with --backend mock since no agent
+// can register there), or "xsend" (experimental X11 XSendEvent; see
+// REFERENCE.md 4.12).
+//
+// --listen is the one loopback address every in-bottle agent dials. Agents
+// register themselves and are paired to compositor windows by Wine prefix
+// (REFERENCE.md 4.17), so ticking a window in the TUI is all target selection
+// takes: there is no port to pick per instance and no title map to write.
 //
 // The window that has focus is the master: it gets keys through passthrough
 // and is skipped by delivery. --gate-origin=false lifts the default rule that
@@ -37,6 +41,7 @@ import (
 
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/keys"
+	"github.com/malahmen/clonecast/internal/platform/agent"
 	"github.com/malahmen/clonecast/internal/tui"
 )
 
@@ -70,7 +75,7 @@ func run() error {
 	}
 	backend := flag.String("backend", defBackend, "mock or linux")
 	deliver := flag.String("deliver", "", "delivery backend: agent (default), dance (legacy fallback), or xsend (experimental); default dance with --backend mock")
-	agentSpec := flag.String("agent", "", `agent endpoints by window title, e.g. "Malahmen=127.0.0.1:48900,Marx=48901" (with --deliver agent)`)
+	listen := flag.String("listen", agent.DefaultListen, "loopback address in-bottle agents connect to and register on")
 	xsendSpec := flag.String("xsend", "", `xsend X-window-title overrides by window title, e.g. "Almerinda=World of Warcraft" (with --deliver xsend)`)
 	keySpec := flag.String("keys", "", `initial key set: "all" or names like "a b c f1" (default: none)`)
 	toggle := flag.String("toggle", "SCROLLLOCK", "key that toggles broadcasting on/off")
@@ -112,6 +117,29 @@ func run() error {
 	defer p.close()
 
 	engine := broadcast.New(p.src, p.inj, p.wm, cfg)
+
+	// The agent registry listens for the whole run, whatever backend is
+	// selected: agents connect when their prefix boots, which may be long
+	// before (or after) the user switches delivery to them, and the TUI marks
+	// the windows they cover either way.
+	agents := agent.NewRegistry(agent.Options{
+		Windows: p.wm.List,
+		Notify:  engine.Notify,
+	})
+	defer agents.Close()
+	if err := agents.Listen(*listen); err != nil {
+		// On the real platform this is fatal: with nothing listening, no
+		// agent can ever register and the default backend has no targets to
+		// reach. With --backend mock nothing can register anyway, so a busy
+		// port (a second `make run-mock`) must not stop the demo — the
+		// Settings pane shows "(not listening)" and --listen/the TUI can
+		// point it somewhere free.
+		if *backend != "mock" {
+			return err
+		}
+		log.Warn("agent registry", "err", err)
+		engine.Notify(err.Error(), true)
+	}
 	if *keySpec != "" {
 		set, err := keys.ParseSet(*keySpec)
 		if err != nil {
@@ -120,18 +148,26 @@ func run() error {
 		engine.SetFilter(set)
 	}
 
-	bs := newBackends(engine, p.wm, *agentSpec, *xsendSpec)
+	bs := newBackends(engine, p.wm, agents, *xsendSpec)
 	defer bs.Close()
-	if err := bs.Use(defaultDeliver(*deliver, *backend)); err != nil {
+	warn, err := bs.Start(defaultDeliver(*deliver, *backend))
+	if err != nil {
 		return err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go agents.Run(ctx) // keeps window <-> agent pairing fresh
+	if warn != "" {
+		// Not fatal: an agent registers on its own schedule, so this is a
+		// state the run can grow out of without a restart.
+		engine.Notify(warn, true)
+		log.Warn(warn)
+	}
 	engineErr := make(chan error, 1)
 	go func() { engineErr <- engine.Run(ctx) }()
 
-	prog := tea.NewProgram(tui.New(engine, p.wm, bs), tea.WithAltScreen())
+	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents), tea.WithAltScreen())
 	go func() {
 		if err := <-engineErr; err != nil && ctx.Err() == nil {
 			log.Error("engine stopped", "err", err)
@@ -145,8 +181,9 @@ func run() error {
 
 // defaultDeliver resolves an empty --deliver. The agent backend is the
 // reliable one and therefore the mainline default (REFERENCE.md 4.12/7.9,
-// research issue I11); the mock platform has no Wine prefixes and so no
-// agents, so there the demo default stays the self-contained focus dance.
+// research issue I11); the mock platform has no Wine prefixes and so nothing
+// that could register, so there the demo default stays the self-contained
+// focus dance.
 func defaultDeliver(deliver, backend string) string {
 	if deliver != "" {
 		return deliver

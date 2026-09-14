@@ -1,6 +1,7 @@
 package prefix
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -69,6 +70,37 @@ func ScanProc(root string) ([]Running, error) {
 		return out[i].PID < out[j].PID
 	})
 	return out, nil
+}
+
+// PrefixOfPIDIn reads one process's WINEPREFIX out of a procfs root. It is the
+// join that lets clonecast pair a KWin window with a registered agent
+// (REFERENCE.md 4.17): KWin reports a window's *host* pid (it asks the X
+// server through XRes, which derives it from the socket peer credentials, so
+// it is the real host pid even for a Flatpak-sandboxed Wine client, unlike
+// _NET_WM_PID), and the prefix that pid runs in is exactly what the agent
+// announced in its hello.
+//
+// Not-a-Wine-process and cannot-read are both reported as errors rather than
+// an empty string, because the caller has a fallback (matching the announced
+// window title) and needs to know it must use it.
+//
+// The root is a parameter for the same reason ScanProc's is: the function is
+// portable and testable against a fake procfs, and only the decision to pass
+// "/proc" is Linux-only (see discover_linux.go, discover_other.go).
+func PrefixOfPIDIn(root string, pid int) (string, error) {
+	if pid <= 0 {
+		return "", fmt.Errorf("pid %d is not a process", pid)
+	}
+	name := strconv.Itoa(pid)
+	blob, err := os.ReadFile(filepath.Join(root, name, "environ"))
+	if err != nil {
+		return "", err
+	}
+	p, ok := envValue(string(blob), "WINEPREFIX")
+	if !ok || strings.TrimSpace(p) == "" {
+		return "", fmt.Errorf("pid %d has no WINEPREFIX", pid)
+	}
+	return CleanPrefix(p), nil
 }
 
 // GroupByPrefix collapses a process list into one entry per prefix.

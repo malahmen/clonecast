@@ -22,7 +22,7 @@ If KWin cannot report which window has focus, that keystroke is not broadcast at
 
 How step 3 reaches an unfocused window is a selectable backend (`--deliver`):
 
-- `agent` (default): a small `clonecast-agent.exe` inside each Wine/Proton prefix receives the key over loopback TCP and `PostMessage`s it to the game window. No focus changes at all. Needs `--agent` to say where each target's agent listens.
+- `agent` (default): a small `clonecast-agent.exe` inside each Wine/Proton prefix receives the key over loopback TCP and `PostMessage`s it to the game window. No focus changes at all. Each agent connects to clonecast by itself and says which prefix it serves, so there is nothing to configure: ticking a window is all it takes.
 - `dance` (last resort): the original focus juggling — focus each target, replay the key, restore focus. Fast enough for taps, poor for held movement keys, and rejected for real multiboxing (REFERENCE.md 4.11/4.12). It is the default with `--backend mock`, which has no agents to talk to.
 - `xsend`: experimental X11 `XSendEvent`; only reaches clients in a Wine virtual desktop and can stick a key.
 
@@ -66,6 +66,22 @@ starts on every prefix boot whatever launches the game — Bottles, Lutris, Prot
 or umu — and dies with that prefix's wineserver. Nothing on the host ever has to
 signal it, which is what used to take the game down with it.
 
+**Agents register themselves.** clonecast listens on one loopback address
+(`--listen`, default `127.0.0.1:48800`) and every agent dials in, announcing its
+`WINEPREFIX`, its window title, its Windows pid and the window handle it found.
+clonecast pairs that announcement with a window in the compositor's list by
+reading `WINEPREFIX` out of that window's process (`/proc/<pid>/environ`, using
+the host pid KWin gets from the X server), falling back to matching the window
+title when the pid or its environment cannot be read. So there is no per-instance
+port and no title→port map: a window with a live agent is marked `●` in the
+Targets list, and ticking it is the only action.
+
+The agent retries the connection with backoff forever, so it does not matter
+whether clonecast or the game starts first. `agent install --port N` is
+clonecast's port — the one the agent dials — and the agent also honours
+`CLONECAST_PORT` in the prefix's environment (a Steam launch option, a Bottles
+env var) and `HKCU\Software\clonecast\Port`, in that order of precedence.
+
 It edits `system.reg` directly when the prefix is idle. If the prefix is already
 running, pass the wine command to use instead, for example
 `--wine "flatpak run --command=<runner>/bin/wine com.usebottles.bottles"` or
@@ -78,7 +94,8 @@ running, pass the wine command to use instead, for example
 ## Usage
 
 ```sh
-clonecast --agent "Malahmen=48900,Marx=48901"   # agent backend (default): one endpoint per target window
+clonecast                         # agent backend (default): agents register themselves
+clonecast --listen 127.0.0.1:48800  # where agents connect (this is the default)
 clonecast --deliver dance         # legacy focus dance, no agents needed
 clonecast --keys "a b c"          # start with an explicit key set
 clonecast --keys all              # broadcast every key
@@ -87,7 +104,7 @@ clonecast --settle 50ms           # more time between focusing a target and inje
 clonecast --gate-origin=false     # broadcast even when the focused window is not a target
 ```
 
-Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the settle delay and the toggle hotkey are all editable at runtime in the TUI's Settings pane.
+Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the settle delay, the toggle hotkey and the agent listen address are all editable at runtime in the TUI's Settings pane.
 
 Key names are Linux `KEY_*` names without the prefix, case insensitive: `a`, `F1`, `LEFTSHIFT`, `SPACE`, `KP1`.
 
@@ -100,14 +117,14 @@ Inside the TUI:
 | `space` / `enter`   | in Targets: tick the highlighted window; in Settings: change the highlighted setting |
 | `a`                 | in Targets: tick/untick every window; in Keys: switch between "all keys" and an explicit set |
 | `f`                 | in Targets: focus the highlighted window, making it the master                |
-| `e`                 | in Keys: edit the key set; in Settings: type an exact value (`enter` applies, `esc` cancels) |
+| `e`                 | in Keys: edit the key set; in Settings: type an exact value — settle delay, toggle key, listen address (`enter` applies, `esc` cancels) |
 | `b`                 | broadcasting on/off (same as the toggle hotkey)                               |
 | `g`                 | origin gate on/off (from any panel)                                           |
 | `r`                 | refresh the window list (also refreshes every 5s; the master is polled faster) |
 | `q`                 | quit                                                                          |
 
-The Settings panel holds the runtime-tunable options: delivery backend, origin gate, settle delay and the toggle hotkey. \
-`M` in the Targets list marks the master, `[x]` a ticked target.
+The Settings panel holds the runtime-tunable options: delivery backend, origin gate, settle delay, toggle hotkey and the address agents connect to — and shows how many agents are registered. \
+In the Targets list, `M` marks the master, `[x]` a ticked target and `●` a window that has a live in-bottle agent. A ticked window with no agent says `no agent` on its own row: tick it and nothing will reach it until an agent for that prefix registers.
 
 The toggle hotkey (`SCROLLLOCK` by default) works from any window and is never delivered anywhere.
 
@@ -117,13 +134,21 @@ Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change).
 
 Before trusting it with anything:
 
-1. Run `clonecast --deliver dance --keys a` in Konsole (the dance needs no agents).
+1. Run `clonecast --deliver dance --keys a` in Konsole (the dance needs no agents; the agent backend needs one registered per target, and two text editors have none).
 2. Open two text editors and tick both as targets with `space` (`a` would tick every window, Konsole included).
 3. Press `b`, then click into **one of the editors** and type `a` a few times. That editor is the master: it gets the key directly, the other one gets it from clonecast. Click into the other editor and it swaps roles.
 4. Typing `a` in Konsole should broadcast nothing (Konsole is not a target — the log says so once). That is the origin gate; `--gate-origin=false`, or `g` in the TUI, lifts it.
 5. Check `~/.cache/clonecast/clonecast.log` for errors. If keys arrive in the wrong window, raise `--settle`.
 
 If a target ignores the injected key, that application reads input in a way uinput cannot satisfy (rare). Note it in an issue.
+
+Then the agent path, with a real game:
+
+1. `make agent`, then `clonecast agent install --prefix <prefix>` for each game prefix (`clonecast agent list` finds the running ones).
+2. Restart the game so its prefix boots and starts the agent.
+3. Run `clonecast`. The header should say `agents: N` and each game's row in Targets should carry `●`; the log says how each agent was paired (by prefix, or by window title as a fallback).
+4. Tick every game window — that is the whole of the setup — press `b`, and play on any of them. The one you are looking at is the master; the others mirror it.
+5. A ticked row that says `no agent` has none registered for that window: check the agent's log inside the prefix (`<prefix>/drive_c/clonecast/clonecast-agent.log`), which records the address it is dialling.
 
 ## Development
 
@@ -141,7 +166,10 @@ Layout:
 ```
 cmd/clonecast/           entrypoint, flags, backend selection (build tags)
 internal/keys/           key codes, names, and the allowlist (Set)
+internal/agentwire/      the clonecast <-> agent protocol: hello, keepalive, key frames (tested)
 internal/broadcast/      the engine: passthrough + focus-juggle delivery (tested)
+internal/platform/agent/ the agent registry: agents connect here and are paired to windows (tested)
+internal/prefix/         Wine prefix discovery and `clonecast agent install` (tested)
 internal/platform/evdev/ Linux capture (grab) and injection (uinput clone)
 internal/platform/kwin/  Linux window listing/activation via KWin scripting over DBus
 internal/platform/mock/  fake backend for development

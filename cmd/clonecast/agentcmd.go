@@ -16,17 +16,38 @@ package main
 // comes up under Bottles, Lutris, Proton or umu alike, with no launcher
 // integration and no dark-portal. It then dies with the wineserver, so the
 // host never signals it (killing it from outside used to kill the game, 4.14).
+//
+// --port is clonecast's port, the one the installed agent dials on every
+// prefix boot (REFERENCE.md 4.17) — not a port the agent listens on, which is
+// what it meant while clonecast dialled in and every instance needed its own.
 
 import (
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
+	"github.com/malahmen/clonecast/internal/platform/agent"
 	"github.com/malahmen/clonecast/internal/prefix"
 )
+
+// defaultAgentPort is the port in agent.DefaultListen, so `agent install` and
+// `clonecast --listen` cannot drift apart.
+func defaultAgentPort() int {
+	_, port, err := net.SplitHostPort(agent.DefaultListen)
+	if err != nil {
+		return 48800
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return 48800
+	}
+	return n
+}
 
 const agentUsage = `usage: clonecast agent <command> [flags]
 
@@ -95,7 +116,7 @@ func agentInstall(args []string, out io.Writer) error {
 	a := newAgentFlags("install")
 	a.writeFlags()
 	a.fs.StringVar(&a.cfg.ExePath, "exe", "", "built clonecast-agent.exe (default: next to this binary, or ./bin/)")
-	a.fs.IntVar(&a.cfg.Port, "port", 48900, "loopback port the agent listens on inside the prefix")
+	a.fs.IntVar(&a.cfg.Port, "port", defaultAgentPort(), "clonecast's listening port for the agent to dial (CLONECAST_PORT in the prefix's environment overrides it)")
 	a.fs.StringVar(&a.cfg.Title, "title", "", `window title the agent delivers to (default: the agent's own, "World of Warcraft")`)
 	if err := a.parse(args); err != nil {
 		return err
