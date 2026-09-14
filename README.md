@@ -17,7 +17,8 @@ Built for [Bazzite](https://bazzite.gg) desktop mode (KDE Plasma 6 on Wayland), 
 
 The focused window is therefore the **master**: tick all your clients, and whichever one has focus plays your keys live while the others mirror. \
 Switch windows and the master switches with you; the Targets list marks it with `M`. \
-By default nothing is broadcast unless the focused window is itself a ticked target, so typing in the terminal that runs clonecast does not drive every client (`--gate-origin=false` lifts that).
+By default nothing is broadcast unless the focused window is itself a ticked target, so typing in the terminal that runs clonecast does not drive every client (`--gate-origin=false` lifts that). \
+If KWin cannot report which window has focus, that keystroke is not broadcast at all and the log says so — clonecast would otherwise deliver to the window that just received the key through passthrough, doubling it on the client you are playing.
 
 How step 3 reaches an unfocused window is a selectable backend (`--deliver`):
 
