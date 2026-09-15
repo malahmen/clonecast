@@ -278,6 +278,13 @@ func (e *Engine) GateOrigin() bool {
 // engine: if the consumer falls behind, notices are dropped.
 func (e *Engine) Notices() <-chan Notice { return e.notices }
 
+// Notify puts a status line from outside the engine into the same stream the
+// UI already renders — the agent registry uses it to report registrations and
+// how each agent was paired (REFERENCE.md 4.17). Like the engine's own
+// notices it never blocks: a line dropped because the UI is behind is better
+// than a stalled broadcast.
+func (e *Engine) Notify(text string, isErr bool) { e.notify(text, isErr) }
+
 // SetTargets replaces the target list. Order is the delivery order.
 func (e *Engine) SetTargets(ids []WindowID) {
 	e.mu.Lock()

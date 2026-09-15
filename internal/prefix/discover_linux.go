@@ -33,3 +33,10 @@ func Busy(path string) (bool, []Running, error) {
 	}
 	return len(hits) > 0, hits, nil
 }
+
+// PrefixOfPID reports which Wine prefix a host pid runs in, by reading its
+// environment. See PrefixOfPIDIn for why this is the right join for pairing a
+// window to an agent.
+func PrefixOfPID(pid int) (string, error) {
+	return PrefixOfPIDIn("/proc", pid)
+}

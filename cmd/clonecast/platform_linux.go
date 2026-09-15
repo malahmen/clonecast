@@ -3,7 +3,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/malahmen/clonecast/internal/broadcast"
@@ -73,4 +76,77 @@ func setupXsend(wm broadcast.WindowManager, spec string) (broadcast.Deliverer, f
 	}
 	d := x11.NewDeliverer(s, titles)
 	return d, func() { _ = d.Close() }, nil
+}
+
+// parseTitleMap parses "Title A=val,Title B=val2" into a map. Keys and values
+// are trimmed; empty entries are ignored. A key may contain spaces (window
+// titles do); only the first '=' separates key from value.
+//
+// Only --xsend uses this now: the agent backend's title map is gone, replaced
+// by agents that register themselves and are paired by prefix (REFERENCE.md
+// 4.17). xsend is experimental and Linux-only, which is why the last of the
+// title-map machinery lives here rather than in deliver.go.
+func parseTitleMap(spec string) (map[string]string, error) {
+	m := map[string]string{}
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		eq := strings.IndexByte(part, '=')
+		if eq < 0 {
+			return nil, fmt.Errorf("entry %q has no '='", part)
+		}
+		key := strings.TrimSpace(part[:eq])
+		val := strings.TrimSpace(part[eq+1:])
+		if key == "" || val == "" {
+			return nil, fmt.Errorf("entry %q has an empty key or value", part)
+		}
+		m[key] = val
+	}
+	return m, nil
+}
+
+// titleCache resolves a WindowID to its current title via the WindowManager,
+// cached briefly so per-key delivery doesn't do a compositor round-trip each
+// time. Refreshed on a miss or when older than ttl.
+type titleCache struct {
+	wm  broadcast.WindowManager
+	ttl time.Duration
+
+	mu sync.Mutex
+	at time.Time
+	m  map[broadcast.WindowID]string
+}
+
+func newTitleCache(wm broadcast.WindowManager) *titleCache {
+	return &titleCache{wm: wm, ttl: 2 * time.Second}
+}
+
+func (t *titleCache) title(id broadcast.WindowID) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.m == nil || time.Since(t.at) > t.ttl {
+		t.refresh()
+	}
+	if s, ok := t.m[id]; ok {
+		return s
+	}
+	t.refresh() // a miss may just be a stale cache
+	return t.m[id]
+}
+
+func (t *titleCache) refresh() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	wins, err := t.wm.List(ctx)
+	if err != nil {
+		return
+	}
+	m := make(map[broadcast.WindowID]string, len(wins))
+	for _, w := range wins {
+		m[w.ID] = w.Title
+	}
+	t.m = m
+	t.at = time.Now()
 }
