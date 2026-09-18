@@ -178,7 +178,7 @@ func TestTUITickingIsEnough(t *testing.T) {
 	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
 	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{"w3": true}}
 
-	tm := startTUI(t, New(engine, wm, nil, agents))
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
 	tm.waitFor("the window list", "Game — instance 1")
 
 	// The header and the Settings pane both surface the registry: how many
@@ -226,7 +226,7 @@ func TestTUIKeysStillWork(t *testing.T) {
 	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
 	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{"w3": true}}
 
-	tm := startTUI(t, New(engine, wm, nil, agents))
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
 	tm.waitFor("the window list", "Game — instance 2")
 
 	// `a` on the Targets pane ticks every window.
@@ -253,6 +253,35 @@ func TestTUIKeysStillWork(t *testing.T) {
 	before := engine.Config().SettleDelay
 	tm.typeKeys("\t\tjj ")
 	tm.waitUntil("the settle delay to change", func() bool { return engine.Config().SettleDelay != before })
+}
+
+// TestTUIPrefixesPaneReachableAndWired drives the real TUI through the
+// Prefixes pane end to end: tabbing to it, opening the manual-path input,
+// and committing a path that isn't a real Wine prefix. prefix.Describe runs
+// for real against that path, so a failure landing on screen proves the pane
+// is actually wired to the tea.Cmd plumbing, not just rendering static text.
+func TestTUIPrefixesPaneReachableAndWired(t *testing.T) {
+	wm := mock.NewWM()
+	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
+	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{}}
+
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
+	tm.waitFor("the window list", "Game — instance 1")
+
+	// Targets -> Keys -> Settings -> Prefixes.
+	tm.typeKeys("\t\t\t")
+	tm.waitFor("the Prefixes panel", "Prefixes")
+	tm.waitFor("the manual-path hint", "point at a prefix by path")
+	tm.waitFor("the pane's own footer hints", "u: uninstall")
+
+	tm.typeKeys("p")
+	tm.waitFor("the path input to open", "prefix:")
+	tm.typeKeys("/definitely/not/a/wine/prefix\r")
+
+	// Not a real prefix, so prefix.Describe must fail — proving the Enter
+	// keystroke actually reached prefix.Describe via a real tea.Cmd, not a
+	// static render.
+	tm.waitFor("the describe failure for a bogus path", "status:")
 }
 
 // rowFor returns the last rendered line containing want, i.e. that window's

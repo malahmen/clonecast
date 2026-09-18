@@ -6,14 +6,14 @@
 // row in the Settings pane, so switching delivery backend, lifting the origin
 // gate or retuning the settle delay never means restarting with other flags.
 //
-// Layout (lazygit style, four panels):
+// Layout (lazygit style, five panels):
 //
-//	┌ Targets ──────────┐┌ Keys ─────────┐┌ Settings ─────┐
-//	│ [x] M Game — 1 ●  ││ mode: explicit││ delivery agent│
-//	│ [x]   Game — 2 ●  ││ A B C         ││ gate      ON  │
-//	│ [x]   Firefox     ││               ││ listen …48800 │
-//	│        no agent   ││               ││ 2 agents      │
-//	└───────────────────┘└───────────────┘└───────────────┘
+//	┌ Targets ──────┐┌ Keys ───┐┌ Settings ┐┌ Prefixes ───────┐
+//	│ [x] M Game—1 ●││mode: exp││delivery  ││prefix: …/bottle │
+//	│ [x]   Game—2 ●││A B C    ││ agent    ││…/bottle   3 proc│
+//	│ [x]   Firefox ││         ││gate   ON ││agent: installed │
+//	│      no agent ││         ││2 agents  ││autostart: …exe  │
+//	└───────────────┘└─────────┘└──────────┘└─────────────────┘
 //	┌ Log ─────────────────────────────────────────────────┐
 //	│ 12:00:01 A down -> 2 target(s)                       │
 //	└──────────────────────────────────────────────────────┘
@@ -31,6 +31,12 @@
 // to say which windows delivery can actually reach — and a row that is ticked
 // without an agent says "no agent" in place, not once in the log where it
 // scrolls away.
+//
+// The Prefixes pane (see prefixpane.go) is where a window gets its agent in
+// the first place: it lists Wine prefixes with live processes, or a manually
+// entered path for one that is not currently running, and installs,
+// uninstalls or describes the in-bottle agent there — the TUI face of
+// `clonecast agent install/uninstall/status` (REFERENCE.md 7.11).
 package tui
 
 import (
@@ -84,6 +90,7 @@ const (
 	paneTargets pane = iota
 	paneKeys
 	paneSettings
+	panePrefixes
 	paneLog
 	paneCount
 )
@@ -144,6 +151,7 @@ type Model struct {
 	wm       broadcast.WindowManager
 	backends Backends
 	agents   Agents
+	prefixes PrefixPane
 
 	windows  []broadcast.Window
 	selected map[broadcast.WindowID]bool
@@ -170,7 +178,8 @@ type Model struct {
 // New builds the model. The engine must already be running. backends may be
 // nil, in which case the delivery backend is shown but cannot be switched;
 // agents may be nil, in which case the Targets list shows no agent markers.
-func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends, agents Agents) Model {
+// prefixCfg seeds the Prefixes pane's install defaults (see PrefixPaneConfig).
+func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends, agents Agents, prefixCfg PrefixPaneConfig) Model {
 	ti := textinput.New()
 	ti.CharLimit = 200
 	return Model{
@@ -178,6 +187,7 @@ func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends
 		wm:       wm,
 		backends: backends,
 		agents:   agents,
+		prefixes: NewPrefixPane(prefixCfg),
 		selected: map[broadcast.WindowID]bool{},
 		input:    ti,
 		logVP:    viewport.New(0, 0),
@@ -185,7 +195,7 @@ func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refreshWindows(), m.refreshMaster(), m.waitNotice(), tickRefresh(), tickMaster())
+	return tea.Batch(m.refreshWindows(), m.refreshMaster(), m.waitNotice(), tickRefresh(), tickMaster(), m.prefixes.Init())
 }
 
 func (m Model) refreshWindows() tea.Cmd {
@@ -283,9 +293,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendLog(msg.Text, msg.Err)
 		return m, m.waitNotice()
 
+	case prefixListMsg, prefixInstallMsg, prefixUninstallMsg, prefixStatusMsg:
+		// The Prefixes pane's own async results: routed here unconditionally
+		// (not gated on m.pane) so an install/uninstall/describe in flight
+		// still lands after the user tabs away from the pane.
+		var cmd tea.Cmd
+		m.prefixes, cmd = m.prefixes.Update(msg)
+		return m, cmd
+
 	case tea.KeyMsg:
 		if m.editing != editNone {
 			return m.updateEditing(msg)
+		}
+		if m.pane == panePrefixes && m.prefixes.Editing() {
+			// The pane is capturing its own manual-path input; don't let
+			// updateNormal's global shortcuts (q, tab, ...) steal keystrokes
+			// that might just be part of a path.
+			var cmd tea.Cmd
+			m.prefixes, cmd = m.prefixes.Update(msg)
+			return m, cmd
 		}
 		return m.updateNormal(msg)
 	}
@@ -365,6 +391,20 @@ func (m *Model) startEdit(f editField, value, placeholder string) tea.Cmd {
 }
 
 func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.pane == panePrefixes {
+		// Only the shortcuts every pane shares stay global here; everything
+		// else (r/j/k/i/u/p) is the Prefixes pane's own, so it goes straight
+		// to PrefixPane.Update instead of the switch below.
+		switch msg.String() {
+		case "q", "ctrl+c", "tab", "shift+tab", "b", "g":
+			// handled by the shared switch below
+		default:
+			var cmd tea.Cmd
+			m.prefixes, cmd = m.prefixes.Update(msg)
+			return m, cmd
+		}
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -581,13 +621,14 @@ func (m *Model) layout() {
 	m.logVP.Height = max(1, logH-2)
 }
 
-// widths splits the top row into targets | keys | settings.
-func (m Model) widths() (int, int, int) {
-	avail := max(48, m.width-4)
-	targetW := max(20, avail*2/5)
-	keysW := max(14, (avail-targetW)/2)
-	setW := max(16, avail-targetW-keysW)
-	return targetW, keysW, setW
+// widths splits the top row into targets | keys | settings | prefixes.
+func (m Model) widths() (int, int, int, int) {
+	avail := max(64, m.width-4)
+	targetW := max(18, avail*3/10)
+	keysW := max(12, avail*3/20)
+	prefW := max(20, avail*3/10)
+	setW := max(16, avail-targetW-keysW-prefW)
+	return targetW, keysW, setW, prefW
 }
 
 func (m Model) View() string {
@@ -595,12 +636,13 @@ func (m Model) View() string {
 		return "starting…"
 	}
 	topH := max(5, (m.height-4)/2)
-	targetW, keysW, setW := m.widths()
+	targetW, keysW, setW, prefW := m.widths()
 
 	targets := m.panel("Targets", m.viewTargets(targetW-2, topH-2), targetW, topH, m.pane == paneTargets)
 	keysP := m.panel("Keys", m.viewKeys(keysW-2), keysW, topH, m.pane == paneKeys)
 	setP := m.panel("Settings", m.viewSettings(setW-2), setW, topH, m.pane == paneSettings)
-	top := lipgloss.JoinHorizontal(lipgloss.Top, targets, keysP, setP)
+	prefP := m.panel("Prefixes", m.prefixes.View(prefW-2, topH-2), prefW, topH, m.pane == panePrefixes)
+	top := lipgloss.JoinHorizontal(lipgloss.Top, targets, keysP, setP, prefP)
 
 	logP := m.panel("Log", m.logVP.View(), m.width-2, m.logVP.Height+2, m.pane == paneLog)
 
@@ -657,6 +699,8 @@ func (m Model) footer() string {
 		return dimStyle.Render(" tab: pane  a: all/none  e: edit set  b: broadcast  g: gate  r: refresh  q: quit")
 	case paneSettings:
 		return dimStyle.Render(" tab: pane  j/k: move  space: change  e: edit  b: broadcast  g: gate  q: quit")
+	case panePrefixes:
+		return dimStyle.Render(" tab: pane  j/k: move  i: install  u: uninstall  p: path  r: rescan  b: broadcast  g: gate  q: quit")
 	case paneLog:
 		return dimStyle.Render(" tab: pane  j/k: scroll  b: broadcast  g: gate  q: quit")
 	}

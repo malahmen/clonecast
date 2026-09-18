@@ -6,6 +6,7 @@
 //	          [--listen 127.0.0.1:48800] [--xsend "Title=X Title,..."]
 //	          [--keys "a b c"|all] [--toggle SCROLLLOCK] [--settle 30ms]
 //	          [--gate-origin=false] [--log PATH]
+//	          [--agent-exe PATH] [--agent-title TITLE] [--agent-wine "CMD"]
 //
 // --backend picks the platform (default "linux" on Linux, "mock" elsewhere).
 // --deliver picks how broadcast keys reach targets: the in-bottle PostMessage
@@ -23,17 +24,26 @@
 // and is skipped by delivery. --gate-origin=false lifts the default rule that
 // the focused window must itself be a ticked target for anything to broadcast.
 //
-// Every flag below is also reachable from the TUI at runtime (Settings pane),
-// so flags are the starting values, not the only way to set them.
+// --agent-exe/--agent-title/--agent-wine seed the TUI's Prefixes pane, which
+// is the interactive face of `clonecast agent install/uninstall/status`
+// (REFERENCE.md 4.19): install/remove the in-bottle agent in a Wine prefix
+// (picked from the running-process list, or typed by path for an idle one)
+// without leaving the TUI.
+//
+// Every flag below is also reachable from the TUI at runtime (Settings pane
+// for the broadcast options, Prefixes pane for the agent-install ones), so
+// flags are the starting values, not the only way to set them.
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -82,6 +92,9 @@ func run() error {
 	settle := flag.Duration("settle", 30*time.Millisecond, "delay between focusing a target and injecting (dance backend)")
 	gateOrigin := flag.Bool("gate-origin", true, "only broadcast while the focused window is itself a ticked target")
 	logPath := flag.String("log", defaultLogPath(), "log file (stdout is the TUI)")
+	agentExe := flag.String("agent-exe", "", "built clonecast-agent.exe for the TUI's Prefixes pane to install (default: look next to this binary or in ./bin)")
+	agentTitle := flag.String("agent-title", "", `window title an agent installed from the TUI delivers to ("" = agent default, "World of Warcraft")`)
+	agentWine := flag.String("agent-wine", "", `wine command for the TUI's Prefixes pane to install into an already-booted prefix, e.g. "flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<prefix> com.usebottles.bottles"`)
 	flag.Parse()
 
 	if err := setupLog(*logPath); err != nil {
@@ -167,7 +180,13 @@ func run() error {
 	engineErr := make(chan error, 1)
 	go func() { engineErr <- engine.Run(ctx) }()
 
-	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents), tea.WithAltScreen())
+	prefixCfg := tui.PrefixPaneConfig{
+		ExePath: *agentExe,
+		Port:    portFromAddr(*listen),
+		Title:   *agentTitle,
+		WineCmd: *agentWine,
+	}
+	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents, prefixCfg), tea.WithAltScreen())
 	go func() {
 		if err := <-engineErr; err != nil && ctx.Err() == nil {
 			log.Error("engine stopped", "err", err)
@@ -192,6 +211,22 @@ func defaultDeliver(deliver, backend string) string {
 		return deliverDance
 	}
 	return deliverAgent
+}
+
+// portFromAddr pulls the port out of a "host:port" listen address, for
+// seeding the Prefixes pane's install default: an agent installed from the
+// TUI should dial the port clonecast is actually listening on, not a
+// hardcoded one. 0 (the agent's own default) if addr doesn't parse.
+func portFromAddr(addr string) int {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func defaultLogPath() string {
