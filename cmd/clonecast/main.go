@@ -44,6 +44,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -95,7 +96,18 @@ func run() error {
 	agentExe := flag.String("agent-exe", "", "built clonecast-agent.exe for the TUI's Prefixes pane to install (default: look next to this binary or in ./bin)")
 	agentTitle := flag.String("agent-title", "", `window title an agent installed from the TUI delivers to ("" = agent default, "World of Warcraft")`)
 	agentWine := flag.String("agent-wine", "", `wine command for the TUI's Prefixes pane to install into an already-booted prefix, e.g. "flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<prefix> com.usebottles.bottles"`)
+	kbdSpec := flag.String("keyboard", "", "comma-separated evdev paths to capture, e.g. /dev/input/event20 (default: every discovered keyboard)")
+	listKbd := flag.Bool("list-keyboards", false, "list the keyboards discovery would capture and whether each can be grabbed, then exit")
 	flag.Parse()
+
+	// Answered before anything is grabbed, because choosing a device is what
+	// this is for: discovery takes any device reporting KEY_A and KEY_ENTER,
+	// which on a real desk also matches a gaming mouse's macro interface, both
+	// nodes of one keyboard, and both the physical keyboard a remapper has
+	// grabbed AND the virtual one that remapper publishes.
+	if *listKbd {
+		return listKeyboards()
+	}
 
 	if err := setupLog(*logPath); err != nil {
 		return err
@@ -120,7 +132,7 @@ func run() error {
 	case "mock":
 		p = newMockPlatform()
 	case "linux":
-		p, err = newLinuxPlatform()
+		p, err = newLinuxPlatform(splitPaths(*kbdSpec)...)
 	default:
 		err = fmt.Errorf("unknown backend %q", *backend)
 	}
@@ -249,4 +261,16 @@ func setupLog(path string) error {
 	log.SetLevel(log.DebugLevel)
 	log.SetReportTimestamp(true)
 	return nil
+}
+
+// splitPaths turns a comma-separated --keyboard value into device paths,
+// dropping empties so a trailing comma is not a device named "".
+func splitPaths(spec string) []string {
+	var out []string
+	for _, p := range strings.Split(spec, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

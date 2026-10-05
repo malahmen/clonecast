@@ -9,16 +9,24 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/log"
+
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/platform/evdev"
 	"github.com/malahmen/clonecast/internal/platform/kwin"
 	"github.com/malahmen/clonecast/internal/platform/x11"
 )
 
-func newLinuxPlatform() (*platform, error) {
-	src, err := evdev.Open()
+func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
+	src, err := evdev.Open(kbdPaths...)
 	if err != nil {
 		return nil, fmt.Errorf("keyboard capture: %w", err)
+	}
+	// Devices that could not be grabbed are skipped rather than fatal, so say
+	// which ones: a keyboard silently not being captured looks exactly like
+	// clonecast ignoring your keypresses.
+	for _, s := range src.Skipped() {
+		log.Infof("keyboard capture: skipped %s", s)
 	}
 	inj, err := evdev.NewInjector(src.Devices()[0])
 	if err != nil {
@@ -149,4 +157,25 @@ func (t *titleCache) refresh() {
 	}
 	t.m = m
 	t.at = time.Now()
+}
+
+// listKeyboards prints what discovery selects and whether each device can be
+// grabbed, so --keyboard can name the right ones.
+func listKeyboards() error {
+	found, err := evdev.Discover()
+	if err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		fmt.Println("no keyboards found under /dev/input (are you in the input group?)")
+		return nil
+	}
+	for _, p := range found {
+		state := "free"
+		if err := evdev.CanGrab(p.Path); err != nil {
+			state = "BUSY (" + err.Error() + ")"
+		}
+		fmt.Printf("%-20s %-28s %s\n", p.Path, state, p.Name)
+	}
+	return nil
 }

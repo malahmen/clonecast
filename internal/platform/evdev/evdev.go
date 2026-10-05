@@ -33,11 +33,17 @@ const VirtualName = "clonecast virtual keyboard"
 
 // Source grabs physical keyboards and merges their key events.
 type Source struct {
-	devs []*ev.InputDevice
-	ch   chan keys.Event
-	wg   sync.WaitGroup
-	once sync.Once
+	devs    []*ev.InputDevice
+	skipped []string
+	ch      chan keys.Event
+	wg      sync.WaitGroup
+	once    sync.Once
 }
+
+// Skipped returns one line per device that could not be opened or grabbed, so
+// the caller can say which keyboards are NOT being captured and why. Empty
+// when everything asked for was grabbed.
+func (s *Source) Skipped() []string { return s.skipped }
 
 // Discover returns the paths of devices that look like keyboards. The
 // heuristic is: reports EV_KEY, and has both KEY_A and KEY_ENTER. That
@@ -75,6 +81,23 @@ func hasKey(d *ev.InputDevice, code ev.EvCode) bool {
 	return false
 }
 
+// CanGrab reports whether a device can be grabbed right now, without keeping
+// the grab. --list-keyboards uses it: a device another process holds
+// exclusively (keyd, input-remapper) cannot be captured, and knowing which
+// before starting is the difference between choosing a device and guessing.
+func CanGrab(path string) error {
+	d, err := ev.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.Grab(); err != nil {
+		return err
+	}
+	_ = d.Ungrab()
+	return nil
+}
+
 // Open grabs the given devices (or every discovered keyboard when paths is
 // empty) and starts reading.
 func Open(paths ...string) (*Source, error) {
@@ -92,20 +115,32 @@ func Open(paths ...string) (*Source, error) {
 	}
 
 	s := &Source{ch: make(chan keys.Event, 64)}
+	// A device that cannot be opened or grabbed is SKIPPED, not fatal, and the
+	// reason is collected for the caller to report. Another process holding an
+	// exclusive grab is normal rather than exceptional: keyd and
+	// input-remapper both work by grabbing a keyboard and re-emitting it, so
+	// the physical device is busy by design and the virtual one it publishes
+	// is the device to capture. Aborting on the first EBUSY meant clonecast
+	// could not start at all on such a machine, even though a perfectly good
+	// keyboard was available.
 	for _, p := range paths {
 		d, err := ev.Open(p)
 		if err != nil {
-			_ = s.Close()
-			return nil, fmt.Errorf("open %s: %w", p, err)
+			s.skipped = append(s.skipped, fmt.Sprintf("%s: open: %v", p, err))
+			continue
 		}
 		if err := d.Grab(); err != nil {
 			_ = d.Close()
-			_ = s.Close()
-			return nil, fmt.Errorf("grab %s: %w", p, err)
+			s.skipped = append(s.skipped, fmt.Sprintf("%s: grab: %v", p, err))
+			continue
 		}
 		s.devs = append(s.devs, d)
 		s.wg.Add(1)
 		go s.read(d)
+	}
+	if len(s.devs) == 0 {
+		_ = s.Close()
+		return nil, fmt.Errorf("no keyboard could be grabbed (%s)", strings.Join(s.skipped, "; "))
 	}
 	go func() {
 		s.wg.Wait()
