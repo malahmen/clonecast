@@ -175,7 +175,7 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 	case prefixInstallMsg:
 		p.busy = false
 		if msg.err != nil {
-			p.status, p.err = "install: "+firstLine(msg.err.Error()), true
+			p.status, p.err = "install: "+msg.err.Error(), true
 			return p, nil
 		}
 		p.err = false
@@ -185,7 +185,7 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 	case prefixUninstallMsg:
 		p.busy = false
 		if msg.err != nil {
-			p.status, p.err = "uninstall: "+firstLine(msg.err.Error()), true
+			p.status, p.err = "uninstall: "+msg.err.Error(), true
 			return p, nil
 		}
 		p.err = false
@@ -247,6 +247,21 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 			if t == "" || p.busy {
 				return p, nil
 			}
+			// Said before trying, not after failing. Install edits the
+			// prefix's system.reg, which a running wineserver holds in memory
+			// and rewrites on shutdown, so the edit would be silently lost —
+			// prefix.Install refuses for that reason. The row already knows
+			// the prefix is running, so there is no reason to make the
+			// operator discover it from an error.
+			//
+			// A wine command makes it work on a live prefix (it goes through
+			// `reg add` instead of the file), so only refuse without one.
+			if p.cfg.WineCmd == "" && p.runningTarget(t) {
+				p.status, p.err = "close the game in this prefix first, then i — "+
+					"its system.reg is held open while it runs, so the install would be discarded "+
+					"(or start clonecast with --agent-wine to register through wine instead)", true
+				return p, nil
+			}
 			p.busy = true
 			p.status, p.err = "installing into "+t+"…", false
 			return p, p.install(t)
@@ -261,6 +276,19 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 		}
 	}
 	return p, nil
+}
+
+// runningTarget reports whether the given prefix is one of the listed ones
+// that currently has live processes. A manually typed path that is not in the
+// list is not assumed to be running: prefix.Install still checks, so the worst
+// case is the error we used to show.
+func (p PrefixPane) runningTarget(path string) bool {
+	for _, pr := range p.procs {
+		if pr.Prefix == path {
+			return pr.Running()
+		}
+	}
+	return false
 }
 
 // refreshTargetIfChanged re-fetches status when the resolved target (list
@@ -303,7 +331,11 @@ func (p PrefixPane) View(w, h int) string {
 	if len(p.procs) == 0 {
 		b.WriteString(prefixPaneDim.Render("no Wine prefixes found (p: point at one by path)") + "\n")
 	}
-	rows := max(1, h-6)
+	// The status can be several lines — an install refusal explains what to do
+	// instead — so the list gives up the room rather than the message being
+	// cut to its first line, which is how the remedy got lost before.
+	statusLines := wrapTo(p.status, w)
+	rows := max(1, h-6-(len(statusLines)-1))
 	start := 0
 	if p.cursor >= rows {
 		start = p.cursor - rows + 1
@@ -330,11 +362,13 @@ func (p PrefixPane) View(w, h int) string {
 
 	b.WriteString(p.viewStatus(w))
 
-	st := p.status
-	if p.err {
-		st = prefixPaneErr.Render(st)
+	b.WriteString("\n")
+	for _, line := range statusLines {
+		if p.err {
+			line = prefixPaneErr.Render(line)
+		}
+		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n" + st + "\n")
 	b.WriteString(prefixPaneDim.Render(truncate("i: install  u: uninstall  p: path  r: rescan", w)))
 	return b.String()
 }
@@ -380,6 +414,37 @@ func shortPath(s string, n int) string {
 		return s
 	}
 	return "…" + s[len(s)-n+1:]
+}
+
+// wrapTo breaks a message into lines that fit a width, honouring the newlines
+// already in it. Returns one empty line for an empty message so the layout
+// does not jump as the status changes.
+func wrapTo(s string, w int) []string {
+	if w < 8 {
+		w = 8
+	}
+	if strings.TrimSpace(s) == "" {
+		return []string{""}
+	}
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		words := strings.Fields(para)
+		if len(words) == 0 {
+			out = append(out, "")
+			continue
+		}
+		line := words[0]
+		for _, word := range words[1:] {
+			if len(line)+1+len(word) > w {
+				out = append(out, line)
+				line = word
+				continue
+			}
+			line += " " + word
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 func firstLine(s string) string {

@@ -7,6 +7,7 @@ package tui
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -175,5 +176,85 @@ func TestPrefixPaneInstallErrorReported(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Fatal("a failed install should not queue a describe (nothing to re-check)")
+	}
+}
+
+// A booted prefix must be refused before an install is attempted, with the
+// remedy in the message — the error path only ever showed its first line, so
+// the two lines saying what to do were lost.
+func TestPrefixPaneRefusesRunningPrefixBeforeTrying(t *testing.T) {
+	p := NewPrefixPane(PrefixPaneConfig{})
+	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{
+		{Prefix: "/bottles/live", Processes: []prefix.Running{{PID: 1, Command: "WoW.exe"}}},
+		{Prefix: "/bottles/idle"},
+	}})
+
+	p, cmd := p.Update(keyRune('i'))
+	if cmd != nil {
+		t.Fatal("install on a running prefix returned a command, want a refusal with no work done")
+	}
+	if !p.err {
+		t.Fatal("refusal was not marked as an error")
+	}
+	if !strings.Contains(p.status, "close the game") {
+		t.Fatalf("status = %q, want it to say to close the game", p.status)
+	}
+	if p.busy {
+		t.Fatal("pane was left busy after a refusal")
+	}
+}
+
+// The idle row must still install, or the guard would block everything.
+func TestPrefixPaneInstallsIdlePrefix(t *testing.T) {
+	p := NewPrefixPane(PrefixPaneConfig{})
+	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{
+		{Prefix: "/bottles/idle"},
+		{Prefix: "/bottles/live", Processes: []prefix.Running{{PID: 1, Command: "WoW.exe"}}},
+	}})
+	p, cmd := p.Update(keyRune('i'))
+	if cmd == nil {
+		t.Fatal("install on an idle prefix returned no command")
+	}
+	if p.err {
+		t.Fatalf("install on an idle prefix set an error: %q", p.status)
+	}
+}
+
+// With a wine command the reg route works on a live prefix, so the guard must
+// not stand in the way.
+func TestPrefixPaneWineCmdAllowsRunningPrefix(t *testing.T) {
+	p := NewPrefixPane(PrefixPaneConfig{WineCmd: "wine"})
+	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{
+		{Prefix: "/bottles/live", Processes: []prefix.Running{{PID: 1, Command: "WoW.exe"}}},
+	}})
+	p, cmd := p.Update(keyRune('i'))
+	if cmd == nil {
+		t.Fatal("install on a running prefix with a wine command was refused, want it attempted")
+	}
+	if p.err {
+		t.Fatalf("unexpected error: %q", p.status)
+	}
+}
+
+func TestWrapTo(t *testing.T) {
+	if got := wrapTo("", 20); len(got) != 1 || got[0] != "" {
+		t.Fatalf("empty message = %q, want one empty line so the layout does not jump", got)
+	}
+	// Honours newlines already present, and wraps long paragraphs.
+	got := wrapTo("one two three\nfour", 9)
+	want := []string{"one two", "three", "four"}
+	if len(got) != len(want) {
+		t.Fatalf("wrapTo lines = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("wrapTo = %q, want %q", got, want)
+		}
+	}
+	// No line may exceed the width when the words themselves fit.
+	for _, l := range wrapTo("the prefix is running so its system reg is held open", 16) {
+		if len(l) > 16 {
+			t.Fatalf("line %q exceeds width 16", l)
+		}
 	}
 }
