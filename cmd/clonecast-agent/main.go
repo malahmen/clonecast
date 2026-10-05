@@ -124,7 +124,11 @@ func setupLog(path string) {
 		logf("log file %s: %v (continuing without one)", path, err)
 		return
 	}
-	out = io.MultiWriter(os.Stderr, f)
+	// NOT io.MultiWriter: it stops at the first writer that errors, and built
+	// with -H windowsgui there is no console, so every write would fail at
+	// stderr and never reach the file — the log would be silently empty, which
+	// is the one thing it exists to prevent.
+	out = tolerantTee{os.Stderr, f}
 }
 
 // defaultLogPath puts the log next to the agent binary, i.e. inside the prefix
@@ -187,43 +191,6 @@ func findByTitle(want string) uintptr {
 		return 0
 	}
 	return walk(desktop, 0)
-}
-
-// resolveHWND blocks until the game window appears. It never gives up: since
-// the agent is autostarted by the prefix itself (RunServices, see
-// `clonecast agent install`), it runs *before* the launcher starts the game,
-// and the wait is as long as the user takes to get to the character screen —
-// minutes, not the 60 s the hand-launched agent used to allow. The prefix owns
-// the agent's lifetime now, so "wait forever" costs nothing: the agent dies
-// with the wineserver.
-//
-// The poll starts fast (the game may already be up when a user installs and
-// relaunches) and slows to 5 s, so an idle agent is invisible in a busy
-// wineserver — the tree-walk is the only Win32 work it does while waiting.
-//
-// The wait happens before the first dial because the hello announces the
-// window: an agent with no window has nothing for clonecast to pair a target
-// with, and would only show up in the TUI as an agent for nothing.
-func resolveHWND(title string) uintptr {
-	// A stray PeekMessage so this thread has a message queue, matching what a
-	// normal GUI process does before touching window APIs.
-	var msg [12]uintptr
-	procPeekMessageW.Call(uintptr(unsafe.Pointer(&msg[0])), 0, 0, 0, 0)
-
-	wait := 500 * time.Millisecond
-	const maxWait = 5 * time.Second
-	for i := 0; ; i++ {
-		if h := findByTitle(title); h != 0 {
-			return h
-		}
-		if i == 20 || (i > 20 && i%60 == 0) { // ~10 s, then every ~5 min
-			logf("still waiting for a window titled %q ...", title)
-		}
-		time.Sleep(wait)
-		if wait < maxWait {
-			wait += 250 * time.Millisecond
-		}
-	}
 }
 
 // resolver caches the game window's HWND but re-resolves it when it goes
@@ -495,9 +462,35 @@ func main() {
 		return
 	}
 
-	logf("starting (pid %d), will dial clonecast at %s (port from %s), locating window %q ...", os.Getpid(), addr, from, *title)
-	hwnd := resolveHWND(*title)
-	logf("window found: hwnd=0x%x", hwnd)
+	logf("starting (pid %d), will dial clonecast at %s (port from %s); delivering to window %q", os.Getpid(), addr, from, *title)
 
-	connectLoop(addr, &resolver{title: *title, hwnd: hwnd}, *title)
+	// Register FIRST, resolve the window when a key actually has to be
+	// delivered. Registration only says "an agent exists, and this is the
+	// prefix it serves" — it needs no window. Blocking on the window meant an
+	// agent whose game used a different title never registered at all, so
+	// clonecast reported "no agent" for a prefix running a perfectly good one.
+	// resolver.current() already re-walks on demand and returns 0 while there
+	// is nothing to find, so starting from 0 is exactly what it expects.
+	connectLoop(addr, &resolver{title: *title}, *title)
+}
+
+// tolerantTee writes to every writer and reports success if ANY of them took
+// the bytes. io.MultiWriter is the wrong tool here: it returns on the first
+// error, so one dead writer (a GUI binary's absent stderr) suppresses the rest.
+type tolerantTee []io.Writer
+
+func (t tolerantTee) Write(p []byte) (int, error) {
+	wrote := false
+	for _, w := range t {
+		if w == nil {
+			continue
+		}
+		if _, err := w.Write(p); err == nil {
+			wrote = true
+		}
+	}
+	if !wrote {
+		return 0, io.ErrShortWrite
+	}
+	return len(p), nil
 }

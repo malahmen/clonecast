@@ -65,9 +65,16 @@ type (
 		err   error
 	}
 	prefixInstallMsg struct {
-		prefix string
-		res    *prefix.Result
-		err    error
+		// started records whether the agent was launched straight away, and
+		// startErr why it was not. The autostart entry is only read by
+		// wineboot, so on a launcher that runs the game directly it never
+		// fires: installing and then starting is what actually produces a
+		// running agent.
+		started  bool
+		startErr error
+		prefix   string
+		res      *prefix.Result
+		err      error
 	}
 	prefixUninstallMsg struct {
 		prefix string
@@ -141,7 +148,19 @@ func (p PrefixPane) install(path, wineCmd string) tea.Cmd {
 	}
 	return func() tea.Msg {
 		res, err := prefix.Install(cfg)
-		return prefixInstallMsg{prefix: path, res: res, err: err}
+		msg := prefixInstallMsg{prefix: path, res: res, err: err}
+		if err != nil || cfg.WineCmd == "" {
+			// No wine command means an idle prefix: there is no session to
+			// start the agent in, and booting one just to do it would be a
+			// surprise. It starts with the prefix instead.
+			return msg
+		}
+		if serr := prefix.StartAgent(cfg); serr != nil {
+			msg.startErr = serr
+		} else {
+			msg.started = true
+		}
+		return msg
 	}
 }
 
@@ -188,12 +207,19 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 			return p, nil
 		}
 		p.err = false
-		if p.installRunning {
-			p.status = fmt.Sprintf("installed (%s route) through the prefix's own wine — "+
-				"RESTART THE GAME to start the agent; it does not attach to an already-running prefix",
+		switch {
+		case msg.started:
+			p.status = fmt.Sprintf("installed (%s route) and agent started — it should register in a moment; "+
+				"no restart needed", msg.res.Route)
+		case msg.startErr != nil:
+			p.status = fmt.Sprintf("installed (%s route), but starting the agent failed: %v — "+
+				"restart the game and it will start with the prefix", msg.res.Route, msg.startErr)
+			p.err = true
+		default:
+			p.status = fmt.Sprintf("installed (%s route) — it starts when this prefix next boots "+
+				"(a launcher that runs the game directly does not process the autostart entry, "+
+				"so start the game through something that boots the prefix, or install again while it runs)",
 				msg.res.Route)
-		} else {
-			p.status = fmt.Sprintf("installed (%s route) — starts on this prefix's next boot", msg.res.Route)
 		}
 		return p, p.describe(msg.prefix)
 
