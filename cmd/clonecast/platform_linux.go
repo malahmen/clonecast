@@ -5,11 +5,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/charmbracelet/log"
+	"golang.org/x/sys/unix"
 
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/platform/evdev"
@@ -159,10 +161,41 @@ func (t *titleCache) refresh() {
 	t.at = time.Now()
 }
 
+// isTerminal reports whether a file is a terminal, so the picker only prompts
+// when somebody is there to answer.
+//
+// A TCGETS ioctl, not os.ModeCharDevice: /dev/null is a character device too,
+// so the mode bit says "terminal" for `clonecast </dev/null` and the picker
+// printed its list and then failed on EOF instead of giving the operator the
+// paths to pass. Only a real terminal has terminal attributes.
+func isTerminal(f *os.File) bool {
+	_, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+	return err == nil
+}
+
+// listCandidates is every device discovery selects, with whether it can be
+// grabbed right now. Shared by --list-keyboards and the picker, so the list
+// you choose from is the same list that gets grabbed.
+func listCandidates() ([]candidate, error) {
+	found, err := evdev.Discover()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]candidate, 0, len(found))
+	for _, p := range found {
+		state := "free"
+		if err := evdev.CanGrab(p.Path); err != nil {
+			state = "BUSY (" + err.Error() + ")"
+		}
+		out = append(out, candidate{Path: p.Path, State: state, Name: p.Name})
+	}
+	return out, nil
+}
+
 // listKeyboards prints what discovery selects and whether each device can be
 // grabbed, so --keyboard can name the right ones.
 func listKeyboards() error {
-	found, err := evdev.Discover()
+	found, err := listCandidates()
 	if err != nil {
 		return err
 	}
@@ -170,12 +203,8 @@ func listKeyboards() error {
 		fmt.Println("no keyboards found under /dev/input (are you in the input group?)")
 		return nil
 	}
-	for _, p := range found {
-		state := "free"
-		if err := evdev.CanGrab(p.Path); err != nil {
-			state = "BUSY (" + err.Error() + ")"
-		}
-		fmt.Printf("%-20s %-28s %s\n", p.Path, state, p.Name)
+	for _, c := range found {
+		fmt.Printf("%-20s %-28s %s\n", c.Path, c.State, c.Name)
 	}
 	return nil
 }

@@ -146,6 +146,12 @@ Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change).
 
 ## Choosing which keyboards to capture
 
+On the first run, if discovery finds more than one keyboard, clonecast lists
+them and asks which to capture, then remembers the answer in
+`~/.config/clonecast/clonecast.conf`. `--keyboard` overrides it for one run
+without changing the saved choice, and `--list-keyboards` prints the list on
+its own:
+
 ```sh
 clonecast --list-keyboards
 ```
@@ -177,6 +183,12 @@ A device that cannot be grabbed is skipped with a line in the log, not treated
 as fatal — being busy is normal on a remapper setup. clonecast only fails when
 *nothing* could be grabbed, and then says which devices it tried and why each
 failed.
+
+If several grabbed devices do report the same key, the duplicate is dropped:
+one physical keyboard often exposes two event nodes, and seeing each press
+twice toggles a tick on and straight back off, so `enter` appears to do nothing
+and the selected row flickers. Only a *different* device can suppress an event,
+so capturing a single device behaves exactly as if the check were not there.
 
 ## First smoke test on Bazzite
 

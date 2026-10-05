@@ -92,10 +92,13 @@ func (p PrefixPane) Init() tea.Cmd { return p.Refresh() }
 // input, so the parent model knows not to steal them for global shortcuts.
 func (p PrefixPane) Editing() bool { return p.editingPath }
 
-// Refresh rescans /proc for prefixes with live processes.
+// Refresh relists prefixes: the ones with live processes, plus the ones found
+// on disk. Process-only discovery could not see a prefix until its game was
+// running, which made installing the agent BEFORE starting the game — the
+// normal order — impossible without typing a path.
 func (p PrefixPane) Refresh() tea.Cmd {
 	return func() tea.Msg {
-		procs, err := prefix.Discover()
+		procs, err := prefix.DiscoverAll()
 		return prefixListMsg{procs: procs, err: err}
 	}
 }
@@ -160,7 +163,13 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 		if p.cursor >= len(p.procs) {
 			p.cursor = max(0, len(p.procs)-1)
 		}
-		p.status = fmt.Sprintf("%d running prefix(es)", len(p.procs))
+		live := 0
+		for _, pr := range p.procs {
+			if pr.Running() {
+				live++
+			}
+		}
+		p.status = fmt.Sprintf("%d prefix(es), %d running", len(p.procs), live)
 		return p, p.refreshTargetIfChanged()
 
 	case prefixInstallMsg:
@@ -292,17 +301,27 @@ func (p PrefixPane) View(w, h int) string {
 	}
 
 	if len(p.procs) == 0 {
-		b.WriteString(prefixPaneDim.Render("no running Wine prefixes (start the game, then r)") + "\n")
+		b.WriteString(prefixPaneDim.Render("no Wine prefixes found (p: point at one by path)") + "\n")
 	}
 	rows := max(1, h-6)
 	start := 0
 	if p.cursor >= rows {
 		start = p.cursor - rows + 1
 	}
+	var line string
 	for i := start; i < len(p.procs) && i < start+rows; i++ {
 		pr := p.procs[i]
-		line := fmt.Sprintf("%s  %s", shortPath(pr.Prefix, max(8, w-14)),
-			prefixPaneDim.Render(fmt.Sprintf("%d proc", len(pr.Processes))))
+		// The game's exe, not a process count: every booted prefix runs the
+		// same handful of Wine services, so "10 proc" is true of all of them
+		// and tells you nothing about which prefix you are looking at.
+		note := "not running"
+		if g := pr.Game(); g != "" {
+			note = g
+		} else if pr.Running() {
+			note = fmt.Sprintf("%d proc", len(pr.Processes))
+		}
+		line = fmt.Sprintf("%s  %s", shortPath(pr.Prefix, max(8, w-18)),
+			prefixPaneDim.Render(note))
 		if p.manual == "" && i == p.cursor {
 			line = prefixPaneSel.Render(line)
 		}

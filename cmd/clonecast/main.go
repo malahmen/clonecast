@@ -132,7 +132,13 @@ func run() error {
 	case "mock":
 		p = newMockPlatform()
 	case "linux":
-		p, err = newLinuxPlatform(splitPaths(*kbdSpec)...)
+		// Which keyboard to capture is settled BEFORE anything is grabbed:
+		// asking afterwards would mean grabbing first and guessing, which is
+		// what made every keypress arrive twice.
+		var kbd []string
+		if kbd, err = resolveKeyboards(*kbdSpec); err == nil {
+			p, err = newLinuxPlatform(kbd...)
+		}
 	default:
 		err = fmt.Errorf("unknown backend %q", *backend)
 	}

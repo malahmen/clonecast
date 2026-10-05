@@ -21,6 +21,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
+
+	"github.com/charmbracelet/log"
 
 	ev "github.com/holoplot/go-evdev"
 
@@ -32,12 +35,72 @@ import (
 const VirtualName = "clonecast virtual keyboard"
 
 // Source grabs physical keyboards and merges their key events.
+// dupWindow is how close together the same key-down may arrive from two
+// DIFFERENT devices before the second is treated as a duplicate rather than a
+// second press.
+//
+// One physical keyboard commonly exposes several event nodes that all report
+// the same keys — the ASUS Strix presents input0 and input1, a Razer mouse
+// presents three — so grabbing every discovered keyboard can see each press
+// twice. Twice is not harmless: a tick toggles on and straight back off, so
+// Enter appears to do nothing and the first target flickers.
+//
+// Deduplicating EVENTS rather than devices avoids having to guess which node
+// of a physical device carries typing; guessing wrong captures nothing, which
+// is worse than doubling. No human produces the same key-down twice in 5ms,
+// and kernel autorepeat is both slower and comes from the same device, which
+// this never touches.
+const dupWindow = 5 * time.Millisecond
+
 type Source struct {
 	devs    []*ev.InputDevice
 	skipped []string
 	ch      chan keys.Event
 	wg      sync.WaitGroup
 	once    sync.Once
+
+	dupMu   sync.Mutex
+	lastSrc map[dupKey]dupSeen
+	dupN    uint64
+	dupLog  sync.Once
+}
+
+type dupKey struct {
+	code  ev.EvCode
+	state keys.State
+}
+
+type dupSeen struct {
+	dev *ev.InputDevice
+	at  time.Time
+}
+
+// duplicate reports whether this event just arrived from a different device,
+// and records it either way. Only a different device can suppress: with one
+// device grabbed this can never drop anything, so the common case is
+// behaviour-identical to not having it.
+func (s *Source) duplicate(d *ev.InputDevice, k dupKey) bool {
+	now := time.Now()
+	s.dupMu.Lock()
+	defer s.dupMu.Unlock()
+	if prev, ok := s.lastSrc[k]; ok && prev.dev != d && now.Sub(prev.at) < dupWindow {
+		s.dupN++
+		s.dupLog.Do(func() {
+			log.Infof("evdev: ignoring duplicate key events — more than one grabbed device reports the same keys; --keyboard picks one")
+		})
+		// Not recorded: the surviving event stays the reference, so a third
+		// node reporting the same press is also suppressed.
+		return true
+	}
+	s.lastSrc[k] = dupSeen{dev: d, at: now}
+	return false
+}
+
+// Coalesced is how many duplicate events have been dropped.
+func (s *Source) Coalesced() uint64 {
+	s.dupMu.Lock()
+	defer s.dupMu.Unlock()
+	return s.dupN
 }
 
 // Skipped returns one line per device that could not be opened or grabbed, so
@@ -114,7 +177,7 @@ func Open(paths ...string) (*Source, error) {
 		return nil, errors.New("no keyboard found under /dev/input (are you in the input group?)")
 	}
 
-	s := &Source{ch: make(chan keys.Event, 64)}
+	s := &Source{ch: make(chan keys.Event, 64), lastSrc: make(map[dupKey]dupSeen)}
 	// A device that cannot be opened or grabbed is SKIPPED, not fatal, and the
 	// reason is collected for the caller to report. Another process holding an
 	// exclusive grab is normal rather than exceptional: keyd and
@@ -157,6 +220,10 @@ func (s *Source) read(d *ev.InputDevice) {
 			return // device closed or unplugged
 		}
 		if e.Type != ev.EV_KEY {
+			continue
+		}
+		k := dupKey{code: e.Code, state: keys.State(e.Value)}
+		if s.duplicate(d, k) {
 			continue
 		}
 		s.ch <- keys.Event{Code: e.Code, State: keys.State(e.Value)}
