@@ -7,6 +7,8 @@ package tui
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -179,10 +181,10 @@ func TestPrefixPaneInstallErrorReported(t *testing.T) {
 	}
 }
 
-// A booted prefix must be refused before an install is attempted, with the
-// remedy in the message — the error path only ever showed its first line, so
-// the two lines saying what to do were lost.
-func TestPrefixPaneRefusesRunningPrefixBeforeTrying(t *testing.T) {
+// A booted prefix whose wine command cannot be derived must be refused before
+// an install is attempted, with the remedy in the message — the error path only
+// ever showed its first line, so the lines saying what to do were lost.
+func TestPrefixPaneRefusesRunningPrefixWhenWineUnknown(t *testing.T) {
 	p := NewPrefixPane(PrefixPaneConfig{})
 	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{
 		{Prefix: "/bottles/live", Processes: []prefix.Running{{PID: 1, Command: "WoW.exe"}}},
@@ -196,8 +198,11 @@ func TestPrefixPaneRefusesRunningPrefixBeforeTrying(t *testing.T) {
 	if !p.err {
 		t.Fatal("refusal was not marked as an error")
 	}
-	if !strings.Contains(p.status, "close the game") {
+	if !strings.Contains(strings.ToLower(p.status), "close the game") {
 		t.Fatalf("status = %q, want it to say to close the game", p.status)
+	}
+	if !strings.Contains(p.status, "--agent-wine") {
+		t.Fatalf("status = %q, want it to offer --agent-wine as the alternative", p.status)
 	}
 	if p.busy {
 		t.Fatal("pane was left busy after a refusal")
@@ -256,5 +261,43 @@ func TestWrapTo(t *testing.T) {
 		if len(l) > 16 {
 			t.Fatalf("line %q exceeds width 16", l)
 		}
+	}
+}
+
+// A booted prefix whose own wineserver names a usable wine must be installed
+// into, not refused: editing system.reg is unsafe while it runs, but `reg add`
+// through that wine is not, so closing the game is no longer required.
+func TestPrefixPaneInstallsRunningPrefixViaDerivedWine(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "runner", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"wine", "wineserver"} {
+		if err := os.WriteFile(filepath.Join(bin, n), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := NewPrefixPane(PrefixPaneConfig{})
+	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{{
+		Prefix: "/bottles/live",
+		// The lib/wine/../../bin form Bottles actually launches, so the test
+		// covers the path cleaning too.
+		Processes: []prefix.Running{
+			{PID: 1, Command: `C:\windows\system32\services.exe`},
+			{PID: 2, Command: filepath.Join(dir, "runner", "lib", "wine", "..", "..", "bin", "wineserver")},
+		},
+	}}})
+
+	p, cmd := p.Update(keyRune('i'))
+	if cmd == nil {
+		t.Fatalf("install was refused, want it attempted through the derived wine: %q", p.status)
+	}
+	if p.err {
+		t.Fatalf("unexpected error: %q", p.status)
+	}
+	if !p.installRunning {
+		t.Fatal("installRunning not set, so the result would not mention restarting the game")
 	}
 }

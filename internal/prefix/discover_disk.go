@@ -155,3 +155,38 @@ func DiscoverAll() ([]Proc, error) {
 	})
 	return out, nil
 }
+
+// WineCmdFromProcesses derives the wine binary that belongs to a running
+// prefix, from the prefix's own wineserver process. Empty when it cannot be
+// worked out.
+//
+// This is what makes installing into a RUNNING prefix possible without asking
+// anyone to supply a wine command. Editing system.reg while a wineserver holds
+// it would be discarded on shutdown, so the only safe route on a live prefix is
+// `wine reg add` — and the wine that matches the prefix is sitting in its own
+// process list. Bottles launches wineserver by absolute path, e.g.
+//
+//	.../runners/soda-11.0-10/lib/wine/../../bin/wineserver
+//
+// which cleans to .../runners/soda-11.0-10/bin/wineserver; its sibling `wine`
+// is the binary wanted. Guessing a runner from the prefix name would break the
+// moment a prefix used a different one; reading it from the process cannot.
+func WineCmdFromProcesses(p Proc) string {
+	for _, r := range p.Processes {
+		cmd := strings.TrimSpace(r.Command)
+		if cmd == "" || !strings.HasPrefix(cmd, "/") {
+			continue // a Windows-side path (C:\...) names nothing on this side
+		}
+		clean := filepath.Clean(cmd)
+		if filepath.Base(clean) != "wineserver" {
+			continue
+		}
+		wine := filepath.Join(filepath.Dir(clean), "wine")
+		st, err := os.Stat(wine)
+		if err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+			continue // present but not runnable: not a usable answer
+		}
+		return wine
+	}
+	return ""
+}

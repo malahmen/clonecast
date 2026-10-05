@@ -202,6 +202,17 @@ Before trusting it with anything:
 
 If a target ignores the injected key, that application reads input in a way uinput cannot satisfy (rare). Note it in an issue.
 
+A running prefix no longer has to be closed first. Editing its `system.reg`
+while a wineserver holds it would be discarded on shutdown, so clonecast
+registers through the prefix's own wine instead — found in its process list,
+since Bottles launches `wineserver` by absolute path and `wine` is its sibling.
+The install then reports that the game must be **restarted** for the agent to
+start: an agent is launched by the prefix booting, and never attaches to a
+prefix already running.
+
+If that wine cannot be worked out, the install is refused up front rather than
+attempted and failed, and says to close the game or pass `--agent-wine`.
+
 Then the agent path, with a real game:
 
 1. `make agent`, then either `clonecast agent install --prefix <prefix>` for each game prefix (`clonecast agent list` finds the running ones), or the TUI's Prefixes pane (`tab` to it, `i` on the highlighted prefix).
