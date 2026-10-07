@@ -76,6 +76,8 @@ var (
 	procPostMessageW     = user32.NewProc("PostMessageW")
 	procPeekMessageW     = user32.NewProc("PeekMessageW")
 	procIsWindow         = user32.NewProc("IsWindow")
+	procIsWindowVisible  = user32.NewProc("IsWindowVisible")
+	procGetWindowRect    = user32.NewProc("GetWindowRect")
 
 	kernel32        = syscall.NewLazyDLL("kernel32.dll")
 	procCreateMutex = kernel32.NewProc("CreateMutexW")
@@ -107,6 +109,9 @@ const (
 // see what the agent did (and when: it should appear before the game window
 // exists).
 var out io.Writer = os.Stderr
+
+// noWindowOnce keeps the "no window" explanation to a single line.
+var noWindowOnce sync.Once
 
 func logf(format string, a ...any) {
 	fmt.Fprintf(out, "%s [clonecast-agent] "+format+"\n",
@@ -193,6 +198,69 @@ func findByTitle(want string) uintptr {
 	return walk(desktop, 0)
 }
 
+// findGameWindow picks this prefix's game window without being told a title.
+//
+// Addressing by title does not survive contact with multiboxing: every agent is
+// installed with the same default ("World of Warcraft"), so on three clients
+// two find nothing and the third posts into a window belonging to a different
+// box. A launcher that renames windows per instance makes it worse, not better,
+// because then NO agent's title matches. Observed exactly that: all three
+// agents receiving keys and logging "target window not found".
+//
+// The prefix is the right unit of addressing, and it needs no cooperation: each
+// Wine prefix has its own wineserver and therefore its own window list, so the
+// windows this agent can see are by construction its own prefix's. The game is
+// the largest visible top-level window among them. The agent itself has no
+// window (-H windowsgui, no console), so there is nothing of its own to exclude.
+func findGameWindow() uintptr {
+	desktop, _, _ := procGetDesktopWindow.Call()
+	var best uintptr
+	var bestArea int64
+	seen, considered := 0, 0
+
+	// Recursive, like findByTitle: a game window is not necessarily a direct
+	// child of the desktop — Wine nests it under its own desktop/explorer
+	// window depending on how the prefix was launched. A one-level sweep found
+	// nothing at all, which is why this exists in this shape.
+	var walk func(hwnd uintptr, depth int)
+	walk = func(hwnd uintptr, depth int) {
+		if depth > 4 {
+			return
+		}
+		child, _, _ := procGetWindow.Call(hwnd, gwCHILD)
+		for child != 0 {
+			seen++
+			var r struct{ Left, Top, Right, Bottom int32 }
+			visible, _, _ := procIsWindowVisible.Call(child)
+			if ok, _, _ := procGetWindowRect.Call(child, uintptr(unsafe.Pointer(&r))); ok != 0 && visible != 0 {
+				w, h := int64(r.Right-r.Left), int64(r.Bottom-r.Top)
+				// 100x100 keeps out the IME and helper popups Wine creates,
+				// the same floor the launcher's own window search uses.
+				if w >= 100 && h >= 100 {
+					considered++
+					if w*h > bestArea {
+						bestArea, best = w*h, child
+					}
+				}
+			}
+			walk(child, depth+1)
+			child, _, _ = procGetWindow.Call(child, gwHWNDNEXT)
+		}
+	}
+	walk(desktop, 0)
+
+	if best == 0 {
+		// Said once rather than on every dropped key: without it a failure here
+		// is indistinguishable from the window genuinely being gone, which cost
+		// a lot of guessing.
+		noWindowOnce.Do(func() {
+			logf("no game window found in this prefix: walked %d window(s), %d of a usable size. "+
+				"Keys will be dropped until one appears.", seen, considered)
+		})
+	}
+	return best
+}
+
 // resolver caches the game window's HWND but re-resolves it when it goes
 // stale. WoW recreates its top-level window across state changes (login ->
 // char-select -> world, loading screens), so a once-cached HWND becomes a dead
@@ -209,8 +277,17 @@ func (r *resolver) valid(h uintptr) bool {
 	if h == 0 {
 		return false
 	}
-	ok, _, _ := procIsWindow.Call(h)
-	return ok != 0 && getWindowText(h) == r.title
+	if ok, _, _ := procIsWindow.Call(h); ok == 0 {
+		return false
+	}
+	if r.title == "" {
+		// Addressing by prefix: any live, visible window of a usable size is
+		// still the one we found. Re-walking on every key would be wasteful,
+		// and WoW keeps one top-level window per state.
+		visible, _, _ := procIsWindowVisible.Call(h)
+		return visible != 0
+	}
+	return getWindowText(h) == r.title
 }
 
 // current returns a live HWND for the target window, re-walking if the cached
@@ -221,7 +298,17 @@ func (r *resolver) current() uintptr {
 	if r.valid(r.hwnd) {
 		return r.hwnd
 	}
-	r.hwnd = findByTitle(r.title)
+	if r.title == "" {
+		r.hwnd = findGameWindow()
+	} else {
+		// An explicit title still wins, for a prefix with more than one
+		// window where the operator knows which. Falling back to the
+		// prefix-wide search means a wrong or stale title degrades to
+		// "deliver to this prefix's game" instead of to nothing at all.
+		if r.hwnd = findByTitle(r.title); r.hwnd == 0 {
+			r.hwnd = findGameWindow()
+		}
+	}
 	return r.hwnd
 }
 
@@ -438,7 +525,10 @@ func main() {
 
 	port := flag.Int("port", defaultPort, "clonecast's listening port to dial (see also CLONECAST_PORT and HKCU\\Software\\clonecast\\Port)")
 	host := flag.String("host", defaultHost, "clonecast's host; loopback is the host's loopback even from a Flatpak sandbox that shares the network")
-	title := flag.String("title", "World of Warcraft", "exact window title to deliver keys to")
+	// Empty by default: deliver to this PREFIX's game window, whatever it is
+	// called. A shared default title cannot work for several clients at once —
+	// see findGameWindow.
+	title := flag.String("title", "", `exact window title to deliver to; empty (the default) means this prefix's own game window`)
 	logPath := flag.String("log", defaultLogPath(), "log file (there is no console under RunServices autostart); empty to disable")
 	flag.Parse()
 
