@@ -178,7 +178,7 @@ func TestTUITickingIsEnough(t *testing.T) {
 	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
 	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{"w3": true}}
 
-	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}, nil))
 	tm.waitFor("the window list", "Game — instance 1")
 
 	// The header and the Settings pane both surface the registry: how many
@@ -226,7 +226,7 @@ func TestTUIKeysStillWork(t *testing.T) {
 	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
 	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{"w3": true}}
 
-	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}, nil))
 	tm.waitFor("the window list", "Game — instance 2")
 
 	// `a` on the Targets pane ticks every window.
@@ -265,7 +265,7 @@ func TestTUIPrefixesPaneReachableAndWired(t *testing.T) {
 	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
 	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{}}
 
-	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}, nil))
 	tm.waitFor("the window list", "Game — instance 1")
 
 	// Targets -> Keys -> Settings -> Prefixes.

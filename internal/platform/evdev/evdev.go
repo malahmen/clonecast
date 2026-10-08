@@ -54,6 +54,7 @@ const dupWindow = 5 * time.Millisecond
 
 type Source struct {
 	devs    []*ev.InputDevice
+	paths   []string
 	skipped []string
 	ch      chan keys.Event
 	wg      sync.WaitGroup
@@ -198,6 +199,7 @@ func Open(paths ...string) (*Source, error) {
 			continue
 		}
 		s.devs = append(s.devs, d)
+		s.paths = append(s.paths, p)
 		s.wg.Add(1)
 		go s.read(d)
 	}
@@ -228,6 +230,14 @@ func (s *Source) read(d *ev.InputDevice) {
 		}
 		s.ch <- keys.Event{Code: e.Code, State: keys.State(e.Value)}
 	}
+}
+
+// Paths returns the devices actually grabbed, which is not necessarily what was
+// asked for: one that was busy or missing is skipped (see Skipped).
+func (s *Source) Paths() []string {
+	out := make([]string, len(s.paths))
+	copy(out, s.paths)
+	return out
 }
 
 // Devices returns the grabbed devices, mainly so the Injector can clone one.

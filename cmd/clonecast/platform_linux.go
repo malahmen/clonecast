@@ -17,10 +17,14 @@ import (
 	"github.com/malahmen/clonecast/internal/platform/evdev"
 	"github.com/malahmen/clonecast/internal/platform/kwin"
 	"github.com/malahmen/clonecast/internal/platform/x11"
+	"github.com/malahmen/clonecast/internal/tui"
 )
 
 func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
-	src, err := evdev.Open(kbdPaths...)
+	// Switchable rather than Open: which keyboard to capture has to be
+	// changeable while running, because discovery cannot tell one node of a
+	// keyboard from another and only typing on it can.
+	src, err := evdev.OpenSwitchable(kbdPaths...)
 	if err != nil {
 		return nil, fmt.Errorf("keyboard capture: %w", err)
 	}
@@ -46,9 +50,10 @@ func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 		return nil, fmt.Errorf("kwin: %w", err)
 	}
 	return &platform{
-		src: src,
-		inj: inj,
-		wm:  wm,
+		src:    src,
+		inj:    inj,
+		wm:     wm,
+		devCtl: deviceController{src: src},
 		close: func() {
 			_ = wm.Close()
 			_ = inj.Close()
@@ -207,4 +212,38 @@ func listKeyboards() error {
 		fmt.Printf("%-20s %-28s %s\n", c.Path, c.State, c.Name)
 	}
 	return nil
+}
+
+// deviceController backs the TUI's Keyboards pane: the device list, what is
+// captured, switching it, and remembering the choice.
+type deviceController struct{ src *evdev.Switchable }
+
+func (d deviceController) Devices() ([]tui.Device, error) {
+	cands, err := listCandidates()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]tui.Device, 0, len(cands))
+	for _, c := range cands {
+		busy := ""
+		if c.State != "free" {
+			busy = c.State
+		}
+		out = append(out, tui.Device{Path: c.Path, Name: c.Name, Busy: busy})
+	}
+	return out, nil
+}
+
+func (d deviceController) Captured() []string { return d.src.Paths() }
+
+// Capture re-grabs. The Injector is deliberately NOT rebuilt: it created its own
+// uinput device by cloning a template at startup and does not depend on that
+// template staying open, so passthrough survives a switch untouched. Rebuilding
+// it would make the compositor re-detect a new input device mid-session, which
+// costs the first keystrokes after every change (the 500ms sleep above exists
+// for exactly that reason at startup).
+func (d deviceController) Capture(paths []string) error { return d.src.Switch(paths...) }
+
+func (d deviceController) Save(paths []string) error {
+	return configSet(kbdKey, strings.Join(paths, ","))
 }

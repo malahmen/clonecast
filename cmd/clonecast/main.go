@@ -63,6 +63,9 @@ type platform struct {
 	inj   broadcast.Injector
 	wm    broadcast.WindowManager
 	close func()
+	// devCtl backs the Keyboards pane. nil on the mock backend, which has no
+	// evdev devices to offer — the pane then says so rather than pretending.
+	devCtl tui.DeviceController
 }
 
 func main() {
@@ -204,7 +207,7 @@ func run() error {
 		Title:   *agentTitle,
 		WineCmd: *agentWine,
 	}
-	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents, prefixCfg), tea.WithAltScreen())
+	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents, prefixCfg, p.devCtl), tea.WithAltScreen())
 	go func() {
 		if err := <-engineErr; err != nil && ctx.Err() == nil {
 			log.Error("engine stopped", "err", err)

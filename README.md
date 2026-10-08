@@ -169,7 +169,28 @@ event nodes of one keyboard, and — if you run a remapper — both the physical
 keyboard it has grabbed and the virtual one it publishes. Grabbing both of
 those doubles every keystroke.
 
-`--keyboard` names the devices explicitly:
+**The Keyboards pane** (bottom row, `tab` to it) lists every keyboard, marks
+which are being captured with `[x]`, shows which are held by another process,
+and changes the capture while clonecast runs:
+
+```
+[x] /dev/input/event6    ASUS Strix Tactic Pro
+[ ] /dev/input/event19   Lofree — BUSY (device or resource busy)
+[x] /dev/input/event20   keyd virtual keyboard
+```
+
+`space` captures or releases the highlighted device, `s` saves the current
+selection as the default for next time, `r` rescans. At least one device always
+stays captured: an empty set means "discover everything" further down, which is
+what this exists to avoid.
+
+Re-grabbing releases the old devices before taking the new ones, because the
+sets usually overlap, and restores the previous capture if the new one fails —
+a mistyped device must not leave the engine with no keyboard. Passthrough is
+untouched by a switch: the virtual keyboard was cloned once at startup and does
+not depend on which device is currently grabbed.
+
+`--keyboard` names the devices explicitly, for a run or a script:
 
 ```sh
 clonecast --keyboard /dev/input/event20,/dev/input/event6

@@ -91,6 +91,7 @@ const (
 	paneKeys
 	paneSettings
 	panePrefixes
+	paneDevices
 	paneLog
 	paneCount
 )
@@ -152,6 +153,7 @@ type Model struct {
 	backends Backends
 	agents   Agents
 	prefixes PrefixPane
+	devices  DevicePane
 
 	windows  []broadcast.Window
 	selected map[broadcast.WindowID]bool
@@ -179,7 +181,7 @@ type Model struct {
 // nil, in which case the delivery backend is shown but cannot be switched;
 // agents may be nil, in which case the Targets list shows no agent markers.
 // prefixCfg seeds the Prefixes pane's install defaults (see PrefixPaneConfig).
-func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends, agents Agents, prefixCfg PrefixPaneConfig) Model {
+func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends, agents Agents, prefixCfg PrefixPaneConfig, devCtl DeviceController) Model {
 	ti := textinput.New()
 	ti.CharLimit = 200
 	return Model{
@@ -188,6 +190,7 @@ func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends
 		backends: backends,
 		agents:   agents,
 		prefixes: NewPrefixPane(prefixCfg),
+		devices:  NewDevicePane(devCtl),
 		selected: map[broadcast.WindowID]bool{},
 		input:    ti,
 		logVP:    viewport.New(0, 0),
@@ -195,7 +198,7 @@ func New(engine *broadcast.Engine, wm broadcast.WindowManager, backends Backends
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refreshWindows(), m.refreshMaster(), m.waitNotice(), tickRefresh(), tickMaster(), m.prefixes.Init())
+	return tea.Batch(m.refreshWindows(), m.refreshMaster(), m.waitNotice(), tickRefresh(), tickMaster(), m.prefixes.Init(), m.devices.Refresh())
 }
 
 func (m Model) refreshWindows() tea.Cmd {
@@ -401,6 +404,16 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 			var cmd tea.Cmd
 			m.prefixes, cmd = m.prefixes.Update(msg)
+			return m, cmd
+		}
+	}
+	if m.pane == paneDevices {
+		// Same split as the Prefixes pane: space/s/r/j/k belong to this pane.
+		switch msg.String() {
+		case "q", "ctrl+c", "tab", "shift+tab", "b", "g":
+		default:
+			var cmd tea.Cmd
+			m.devices, cmd = m.devices.Update(msg)
 			return m, cmd
 		}
 	}
@@ -617,11 +630,18 @@ func (m *Model) layout() {
 	// two rows of panels: top row split in three, bottom row is the log
 	topH := max(5, (m.height-4)/2)
 	logH := max(3, m.height-topH-4)
-	m.logVP.Width = max(10, m.width-4)
+	// The log now shares its row with the Keyboards panel, so it gets what is
+	// left rather than the full width.
+	_, logW := m.bottomWidths()
+	m.logVP.Width = max(10, logW-2)
 	m.logVP.Height = max(1, logH-2)
 }
 
 // widths splits the top row into targets | keys | settings | prefixes.
+//
+// The Keyboards pane is NOT here: a fifth panel on this row made every one of
+// them too narrow to read, and truncated the strings the pty tests wait for.
+// It shares the bottom row with the log instead, where it has width to spare.
 func (m Model) widths() (int, int, int, int) {
 	avail := max(64, m.width-4)
 	targetW := max(18, avail*3/10)
@@ -631,12 +651,20 @@ func (m Model) widths() (int, int, int, int) {
 	return targetW, keysW, setW, prefW
 }
 
+// bottomWidths splits the bottom row into keyboards | log.
+func (m Model) bottomWidths() (int, int) {
+	avail := max(40, m.width-2)
+	devW := max(28, avail*1/3)
+	return devW, avail - devW
+}
+
 func (m Model) View() string {
 	if m.width == 0 {
 		return "starting…"
 	}
 	topH := max(5, (m.height-4)/2)
 	targetW, keysW, setW, prefW := m.widths()
+	devW, logW := m.bottomWidths()
 
 	targets := m.panel("Targets", m.viewTargets(targetW-2, topH-2), targetW, topH, m.pane == paneTargets)
 	keysP := m.panel("Keys", m.viewKeys(keysW-2), keysW, topH, m.pane == paneKeys)
@@ -644,9 +672,11 @@ func (m Model) View() string {
 	prefP := m.panel("Prefixes", m.prefixes.View(prefW-2, topH-2), prefW, topH, m.pane == panePrefixes)
 	top := lipgloss.JoinHorizontal(lipgloss.Top, targets, keysP, setP, prefP)
 
-	logP := m.panel("Log", m.logVP.View(), m.width-2, m.logVP.Height+2, m.pane == paneLog)
+	devP := m.panel("Keyboards", m.devices.View(devW-2, m.logVP.Height), devW, m.logVP.Height+2, m.pane == paneDevices)
+	logP := m.panel("Log", m.logVP.View(), logW, m.logVP.Height+2, m.pane == paneLog)
+	bottom := lipgloss.JoinHorizontal(lipgloss.Top, devP, logP)
 
-	return lipgloss.JoinVertical(lipgloss.Left, m.header(), top, logP, m.footer())
+	return lipgloss.JoinVertical(lipgloss.Left, m.header(), top, bottom, m.footer())
 }
 
 func (m Model) header() string {
@@ -701,6 +731,8 @@ func (m Model) footer() string {
 		return dimStyle.Render(" tab: pane  j/k: move  space: change  e: edit  b: broadcast  g: gate  q: quit")
 	case panePrefixes:
 		return dimStyle.Render(" tab: pane  j/k: move  i: install  u: uninstall  p: path  r: rescan  b: broadcast  g: gate  q: quit")
+	case paneDevices:
+		return dimStyle.Render(" tab: pane  j/k: move  space: capture/release  s: save default  r: rescan  q: quit")
 	case paneLog:
 		return dimStyle.Render(" tab: pane  j/k: scroll  b: broadcast  g: gate  q: quit")
 	}
