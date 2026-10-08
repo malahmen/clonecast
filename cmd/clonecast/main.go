@@ -44,6 +44,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -62,6 +63,9 @@ type platform struct {
 	inj   broadcast.Injector
 	wm    broadcast.WindowManager
 	close func()
+	// devCtl backs the Keyboards pane. nil on the mock backend, which has no
+	// evdev devices to offer — the pane then says so rather than pretending.
+	devCtl tui.DeviceController
 }
 
 func main() {
@@ -95,7 +99,18 @@ func run() error {
 	agentExe := flag.String("agent-exe", "", "built clonecast-agent.exe for the TUI's Prefixes pane to install (default: look next to this binary or in ./bin)")
 	agentTitle := flag.String("agent-title", "", `window title an agent installed from the TUI delivers to ("" = agent default, "World of Warcraft")`)
 	agentWine := flag.String("agent-wine", "", `wine command for the TUI's Prefixes pane to install into an already-booted prefix, e.g. "flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<prefix> com.usebottles.bottles"`)
+	kbdSpec := flag.String("keyboard", "", "comma-separated evdev paths to capture, e.g. /dev/input/event20 (default: every discovered keyboard)")
+	listKbd := flag.Bool("list-keyboards", false, "list the keyboards discovery would capture and whether each can be grabbed, then exit")
 	flag.Parse()
+
+	// Answered before anything is grabbed, because choosing a device is what
+	// this is for: discovery takes any device reporting KEY_A and KEY_ENTER,
+	// which on a real desk also matches a gaming mouse's macro interface, both
+	// nodes of one keyboard, and both the physical keyboard a remapper has
+	// grabbed AND the virtual one that remapper publishes.
+	if *listKbd {
+		return listKeyboards()
+	}
 
 	if err := setupLog(*logPath); err != nil {
 		return err
@@ -120,7 +135,13 @@ func run() error {
 	case "mock":
 		p = newMockPlatform()
 	case "linux":
-		p, err = newLinuxPlatform()
+		// Which keyboard to capture is settled BEFORE anything is grabbed:
+		// asking afterwards would mean grabbing first and guessing, which is
+		// what made every keypress arrive twice.
+		var kbd []string
+		if kbd, err = resolveKeyboards(*kbdSpec); err == nil {
+			p, err = newLinuxPlatform(kbd...)
+		}
 	default:
 		err = fmt.Errorf("unknown backend %q", *backend)
 	}
@@ -186,7 +207,7 @@ func run() error {
 		Title:   *agentTitle,
 		WineCmd: *agentWine,
 	}
-	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents, prefixCfg), tea.WithAltScreen())
+	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents, prefixCfg, p.devCtl), tea.WithAltScreen())
 	go func() {
 		if err := <-engineErr; err != nil && ctx.Err() == nil {
 			log.Error("engine stopped", "err", err)
@@ -249,4 +270,16 @@ func setupLog(path string) error {
 	log.SetLevel(log.DebugLevel)
 	log.SetReportTimestamp(true)
 	return nil
+}
+
+// splitPaths turns a comma-separated --keyboard value into device paths,
+// dropping empties so a trailing comma is not a device named "".
+func splitPaths(spec string) []string {
+	var out []string
+	for _, p := range strings.Split(spec, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

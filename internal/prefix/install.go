@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -453,4 +455,51 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// StartAgent launches the agent inside a prefix now, instead of waiting for
+// something to process the autostart entry.
+//
+// The registry value is only read by wineboot, which runs when a prefix is
+// created or updated — NOT when an application is launched into an
+// already-initialised prefix. A launcher that runs `wine Game.exe` directly
+// therefore never starts the agent, however correct the registry entry is, and
+// "installed — starts on the next boot" is then quietly untrue. Observed
+// exactly that: three prefixes with the value present, the games restarted, and
+// no agent process anywhere.
+//
+// Detached on purpose (its own process group, no inherited stdio): the agent
+// outlives the clonecast run that installed it, which is what the autostart was
+// for. It writes its own log inside the prefix.
+func StartAgent(cfg Config) error {
+	if strings.TrimSpace(cfg.WineCmd) == "" {
+		return errors.New("starting the agent needs a wine command for this prefix")
+	}
+	exe := InstallDirWin + `\` + ExeName
+	if _, err := os.Stat(ExeDest(cfg.Prefix)); err != nil {
+		return fmt.Errorf("agent is not installed in this prefix: %w", err)
+	}
+
+	var b strings.Builder
+	b.WriteString(cfg.WineCmd)
+	b.WriteByte(' ')
+	b.WriteString(shellQuote(exe))
+	if cfg.Port > 0 {
+		b.WriteString(" -port " + strconv.Itoa(cfg.Port))
+	}
+	if cfg.Title != "" {
+		b.WriteString(" -title " + shellQuote(cfg.Title))
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", b.String())
+	cmd.Env = append(os.Environ(), "WINEPREFIX="+CleanPrefix(cfg.Prefix))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting the agent: %w", err)
+	}
+	// Reaped in the background so this never becomes a zombie, and never
+	// waited on: the agent is meant to keep running.
+	go func() { _ = cmd.Wait() }()
+	return nil
 }

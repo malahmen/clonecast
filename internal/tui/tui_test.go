@@ -178,7 +178,7 @@ func TestTUITickingIsEnough(t *testing.T) {
 	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
 	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{"w3": true}}
 
-	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}, nil))
 	tm.waitFor("the window list", "Game — instance 1")
 
 	// The header and the Settings pane both surface the registry: how many
@@ -226,7 +226,7 @@ func TestTUIKeysStillWork(t *testing.T) {
 	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
 	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{"w3": true}}
 
-	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}, nil))
 	tm.waitFor("the window list", "Game — instance 2")
 
 	// `a` on the Targets pane ticks every window.
@@ -265,7 +265,7 @@ func TestTUIPrefixesPaneReachableAndWired(t *testing.T) {
 	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
 	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{}}
 
-	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}))
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}, nil))
 	tm.waitFor("the window list", "Game — instance 1")
 
 	// Targets -> Keys -> Settings -> Prefixes.
@@ -298,4 +298,37 @@ func rowFor(t *testing.T, screen, want string) string {
 		t.Fatalf("no row for %q on screen:\n%s", want, lastFrame(screen))
 	}
 	return got
+}
+
+// The Keyboards pane must actually receive its own async list. Pane-level tests
+// call DevicePane.Update directly and so cannot catch a missing route in
+// Model.Update — which is exactly the bug that shipped: the pane listed no
+// keyboards however many were discovered.
+func TestTUIKeyboardsPaneReceivesItsDeviceList(t *testing.T) {
+	wm := mock.NewWM()
+	engine := broadcast.New(mock.NewSource(time.Hour), &mock.Injector{}, wm, broadcast.DefaultConfig())
+	agents := &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{}}
+
+	ctl := &fakeDevCtl{
+		devices: []Device{
+			{Path: "/dev/input/event6", Name: "ASUS Strix"},
+			// Short name on purpose: this test is about the pane receiving its
+			// list and being focusable, not about the column budget.
+			{Path: "/dev/input/event20", Name: "keyd", Busy: "BUSY (device or resource busy)"},
+		},
+		captured: []string{"/dev/input/event6"},
+	}
+
+	tm := startTUI(t, New(engine, wm, nil, agents, PrefixPaneConfig{}, ctl))
+	tm.waitFor("the window list", "Game — instance 1")
+
+	// Targets -> Keys -> Settings -> Prefixes -> Keyboards.
+	tm.typeKeys("\t\t\t\t")
+	tm.waitFor("the Keyboards panel", "Keyboards")
+	tm.waitFor("a discovered device", "event6")
+	tm.waitFor("the captured marker", "[x]")
+	tm.waitFor("a device held elsewhere", "(busy)")
+	// The footer is what proves the pane is actually focused, rather than
+	// merely rendered as one of the panels.
+	tm.waitFor("the pane's own footer hints", "space: capture")
 }

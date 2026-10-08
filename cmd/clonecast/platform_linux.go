@@ -5,20 +5,34 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/charmbracelet/log"
+	"golang.org/x/sys/unix"
 
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/platform/evdev"
 	"github.com/malahmen/clonecast/internal/platform/kwin"
 	"github.com/malahmen/clonecast/internal/platform/x11"
+	"github.com/malahmen/clonecast/internal/tui"
 )
 
-func newLinuxPlatform() (*platform, error) {
-	src, err := evdev.Open()
+func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
+	// Switchable rather than Open: which keyboard to capture has to be
+	// changeable while running, because discovery cannot tell one node of a
+	// keyboard from another and only typing on it can.
+	src, err := evdev.OpenSwitchable(kbdPaths...)
 	if err != nil {
 		return nil, fmt.Errorf("keyboard capture: %w", err)
+	}
+	// Devices that could not be grabbed are skipped rather than fatal, so say
+	// which ones: a keyboard silently not being captured looks exactly like
+	// clonecast ignoring your keypresses.
+	for _, s := range src.Skipped() {
+		log.Infof("keyboard capture: skipped %s", s)
 	}
 	inj, err := evdev.NewInjector(src.Devices()[0])
 	if err != nil {
@@ -36,9 +50,10 @@ func newLinuxPlatform() (*platform, error) {
 		return nil, fmt.Errorf("kwin: %w", err)
 	}
 	return &platform{
-		src: src,
-		inj: inj,
-		wm:  wm,
+		src:    src,
+		inj:    inj,
+		wm:     wm,
+		devCtl: deviceController{src: src},
 		close: func() {
 			_ = wm.Close()
 			_ = inj.Close()
@@ -149,4 +164,86 @@ func (t *titleCache) refresh() {
 	}
 	t.m = m
 	t.at = time.Now()
+}
+
+// isTerminal reports whether a file is a terminal, so the picker only prompts
+// when somebody is there to answer.
+//
+// A TCGETS ioctl, not os.ModeCharDevice: /dev/null is a character device too,
+// so the mode bit says "terminal" for `clonecast </dev/null` and the picker
+// printed its list and then failed on EOF instead of giving the operator the
+// paths to pass. Only a real terminal has terminal attributes.
+func isTerminal(f *os.File) bool {
+	_, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+	return err == nil
+}
+
+// listCandidates is every device discovery selects, with whether it can be
+// grabbed right now. Shared by --list-keyboards and the picker, so the list
+// you choose from is the same list that gets grabbed.
+func listCandidates() ([]candidate, error) {
+	found, err := evdev.Discover()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]candidate, 0, len(found))
+	for _, p := range found {
+		state := "free"
+		if err := evdev.CanGrab(p.Path); err != nil {
+			state = "BUSY (" + err.Error() + ")"
+		}
+		out = append(out, candidate{Path: p.Path, State: state, Name: p.Name})
+	}
+	return out, nil
+}
+
+// listKeyboards prints what discovery selects and whether each device can be
+// grabbed, so --keyboard can name the right ones.
+func listKeyboards() error {
+	found, err := listCandidates()
+	if err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		fmt.Println("no keyboards found under /dev/input (are you in the input group?)")
+		return nil
+	}
+	for _, c := range found {
+		fmt.Printf("%-20s %-28s %s\n", c.Path, c.State, c.Name)
+	}
+	return nil
+}
+
+// deviceController backs the TUI's Keyboards pane: the device list, what is
+// captured, switching it, and remembering the choice.
+type deviceController struct{ src *evdev.Switchable }
+
+func (d deviceController) Devices() ([]tui.Device, error) {
+	cands, err := listCandidates()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]tui.Device, 0, len(cands))
+	for _, c := range cands {
+		busy := ""
+		if c.State != "free" {
+			busy = c.State
+		}
+		out = append(out, tui.Device{Path: c.Path, Name: c.Name, Busy: busy})
+	}
+	return out, nil
+}
+
+func (d deviceController) Captured() []string { return d.src.Paths() }
+
+// Capture re-grabs. The Injector is deliberately NOT rebuilt: it created its own
+// uinput device by cloning a template at startup and does not depend on that
+// template staying open, so passthrough survives a switch untouched. Rebuilding
+// it would make the compositor re-detect a new input device mid-session, which
+// costs the first keystrokes after every change (the 500ms sleep above exists
+// for exactly that reason at startup).
+func (d deviceController) Capture(paths []string) error { return d.src.Switch(paths...) }
+
+func (d deviceController) Save(paths []string) error {
+	return configSet(kbdKey, strings.Join(paths, ","))
 }

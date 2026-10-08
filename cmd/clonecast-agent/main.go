@@ -76,6 +76,8 @@ var (
 	procPostMessageW     = user32.NewProc("PostMessageW")
 	procPeekMessageW     = user32.NewProc("PeekMessageW")
 	procIsWindow         = user32.NewProc("IsWindow")
+	procIsWindowVisible  = user32.NewProc("IsWindowVisible")
+	procGetWindowRect    = user32.NewProc("GetWindowRect")
 
 	kernel32        = syscall.NewLazyDLL("kernel32.dll")
 	procCreateMutex = kernel32.NewProc("CreateMutexW")
@@ -108,6 +110,9 @@ const (
 // exists).
 var out io.Writer = os.Stderr
 
+// noWindowOnce keeps the "no window" explanation to a single line.
+var noWindowOnce sync.Once
+
 func logf(format string, a ...any) {
 	fmt.Fprintf(out, "%s [clonecast-agent] "+format+"\n",
 		append([]any{time.Now().Format("15:04:05.000")}, a...)...)
@@ -124,7 +129,11 @@ func setupLog(path string) {
 		logf("log file %s: %v (continuing without one)", path, err)
 		return
 	}
-	out = io.MultiWriter(os.Stderr, f)
+	// NOT io.MultiWriter: it stops at the first writer that errors, and built
+	// with -H windowsgui there is no console, so every write would fail at
+	// stderr and never reach the file — the log would be silently empty, which
+	// is the one thing it exists to prevent.
+	out = tolerantTee{os.Stderr, f}
 }
 
 // defaultLogPath puts the log next to the agent binary, i.e. inside the prefix
@@ -189,41 +198,67 @@ func findByTitle(want string) uintptr {
 	return walk(desktop, 0)
 }
 
-// resolveHWND blocks until the game window appears. It never gives up: since
-// the agent is autostarted by the prefix itself (RunServices, see
-// `clonecast agent install`), it runs *before* the launcher starts the game,
-// and the wait is as long as the user takes to get to the character screen —
-// minutes, not the 60 s the hand-launched agent used to allow. The prefix owns
-// the agent's lifetime now, so "wait forever" costs nothing: the agent dies
-// with the wineserver.
+// findGameWindow picks this prefix's game window without being told a title.
 //
-// The poll starts fast (the game may already be up when a user installs and
-// relaunches) and slows to 5 s, so an idle agent is invisible in a busy
-// wineserver — the tree-walk is the only Win32 work it does while waiting.
+// Addressing by title does not survive contact with multiboxing: every agent is
+// installed with the same default ("World of Warcraft"), so on three clients
+// two find nothing and the third posts into a window belonging to a different
+// box. A launcher that renames windows per instance makes it worse, not better,
+// because then NO agent's title matches. Observed exactly that: all three
+// agents receiving keys and logging "target window not found".
 //
-// The wait happens before the first dial because the hello announces the
-// window: an agent with no window has nothing for clonecast to pair a target
-// with, and would only show up in the TUI as an agent for nothing.
-func resolveHWND(title string) uintptr {
-	// A stray PeekMessage so this thread has a message queue, matching what a
-	// normal GUI process does before touching window APIs.
-	var msg [12]uintptr
-	procPeekMessageW.Call(uintptr(unsafe.Pointer(&msg[0])), 0, 0, 0, 0)
+// The prefix is the right unit of addressing, and it needs no cooperation: each
+// Wine prefix has its own wineserver and therefore its own window list, so the
+// windows this agent can see are by construction its own prefix's. The game is
+// the largest visible top-level window among them. The agent itself has no
+// window (-H windowsgui, no console), so there is nothing of its own to exclude.
+func findGameWindow() uintptr {
+	desktop, _, _ := procGetDesktopWindow.Call()
+	var best uintptr
+	var bestArea int64
+	seen, considered := 0, 0
 
-	wait := 500 * time.Millisecond
-	const maxWait = 5 * time.Second
-	for i := 0; ; i++ {
-		if h := findByTitle(title); h != 0 {
-			return h
+	// Recursive, like findByTitle: a game window is not necessarily a direct
+	// child of the desktop — Wine nests it under its own desktop/explorer
+	// window depending on how the prefix was launched. A one-level sweep found
+	// nothing at all, which is why this exists in this shape.
+	var walk func(hwnd uintptr, depth int)
+	walk = func(hwnd uintptr, depth int) {
+		if depth > 4 {
+			return
 		}
-		if i == 20 || (i > 20 && i%60 == 0) { // ~10 s, then every ~5 min
-			logf("still waiting for a window titled %q ...", title)
-		}
-		time.Sleep(wait)
-		if wait < maxWait {
-			wait += 250 * time.Millisecond
+		child, _, _ := procGetWindow.Call(hwnd, gwCHILD)
+		for child != 0 {
+			seen++
+			var r struct{ Left, Top, Right, Bottom int32 }
+			visible, _, _ := procIsWindowVisible.Call(child)
+			if ok, _, _ := procGetWindowRect.Call(child, uintptr(unsafe.Pointer(&r))); ok != 0 && visible != 0 {
+				w, h := int64(r.Right-r.Left), int64(r.Bottom-r.Top)
+				// 100x100 keeps out the IME and helper popups Wine creates,
+				// the same floor the launcher's own window search uses.
+				if w >= 100 && h >= 100 {
+					considered++
+					if w*h > bestArea {
+						bestArea, best = w*h, child
+					}
+				}
+			}
+			walk(child, depth+1)
+			child, _, _ = procGetWindow.Call(child, gwHWNDNEXT)
 		}
 	}
+	walk(desktop, 0)
+
+	if best == 0 {
+		// Said once rather than on every dropped key: without it a failure here
+		// is indistinguishable from the window genuinely being gone, which cost
+		// a lot of guessing.
+		noWindowOnce.Do(func() {
+			logf("no game window found in this prefix: walked %d window(s), %d of a usable size. "+
+				"Keys will be dropped until one appears.", seen, considered)
+		})
+	}
+	return best
 }
 
 // resolver caches the game window's HWND but re-resolves it when it goes
@@ -242,8 +277,17 @@ func (r *resolver) valid(h uintptr) bool {
 	if h == 0 {
 		return false
 	}
-	ok, _, _ := procIsWindow.Call(h)
-	return ok != 0 && getWindowText(h) == r.title
+	if ok, _, _ := procIsWindow.Call(h); ok == 0 {
+		return false
+	}
+	if r.title == "" {
+		// Addressing by prefix: any live, visible window of a usable size is
+		// still the one we found. Re-walking on every key would be wasteful,
+		// and WoW keeps one top-level window per state.
+		visible, _, _ := procIsWindowVisible.Call(h)
+		return visible != 0
+	}
+	return getWindowText(h) == r.title
 }
 
 // current returns a live HWND for the target window, re-walking if the cached
@@ -254,7 +298,17 @@ func (r *resolver) current() uintptr {
 	if r.valid(r.hwnd) {
 		return r.hwnd
 	}
-	r.hwnd = findByTitle(r.title)
+	if r.title == "" {
+		r.hwnd = findGameWindow()
+	} else {
+		// An explicit title still wins, for a prefix with more than one
+		// window where the operator knows which. Falling back to the
+		// prefix-wide search means a wrong or stale title degrades to
+		// "deliver to this prefix's game" instead of to nothing at all.
+		if r.hwnd = findByTitle(r.title); r.hwnd == 0 {
+			r.hwnd = findGameWindow()
+		}
+	}
 	return r.hwnd
 }
 
@@ -471,7 +525,10 @@ func main() {
 
 	port := flag.Int("port", defaultPort, "clonecast's listening port to dial (see also CLONECAST_PORT and HKCU\\Software\\clonecast\\Port)")
 	host := flag.String("host", defaultHost, "clonecast's host; loopback is the host's loopback even from a Flatpak sandbox that shares the network")
-	title := flag.String("title", "World of Warcraft", "exact window title to deliver keys to")
+	// Empty by default: deliver to this PREFIX's game window, whatever it is
+	// called. A shared default title cannot work for several clients at once —
+	// see findGameWindow.
+	title := flag.String("title", "", `exact window title to deliver to; empty (the default) means this prefix's own game window`)
 	logPath := flag.String("log", defaultLogPath(), "log file (there is no console under RunServices autostart); empty to disable")
 	flag.Parse()
 
@@ -495,9 +552,35 @@ func main() {
 		return
 	}
 
-	logf("starting (pid %d), will dial clonecast at %s (port from %s), locating window %q ...", os.Getpid(), addr, from, *title)
-	hwnd := resolveHWND(*title)
-	logf("window found: hwnd=0x%x", hwnd)
+	logf("starting (pid %d), will dial clonecast at %s (port from %s); delivering to window %q", os.Getpid(), addr, from, *title)
 
-	connectLoop(addr, &resolver{title: *title, hwnd: hwnd}, *title)
+	// Register FIRST, resolve the window when a key actually has to be
+	// delivered. Registration only says "an agent exists, and this is the
+	// prefix it serves" — it needs no window. Blocking on the window meant an
+	// agent whose game used a different title never registered at all, so
+	// clonecast reported "no agent" for a prefix running a perfectly good one.
+	// resolver.current() already re-walks on demand and returns 0 while there
+	// is nothing to find, so starting from 0 is exactly what it expects.
+	connectLoop(addr, &resolver{title: *title}, *title)
+}
+
+// tolerantTee writes to every writer and reports success if ANY of them took
+// the bytes. io.MultiWriter is the wrong tool here: it returns on the first
+// error, so one dead writer (a GUI binary's absent stderr) suppresses the rest.
+type tolerantTee []io.Writer
+
+func (t tolerantTee) Write(p []byte) (int, error) {
+	wrote := false
+	for _, w := range t {
+		if w == nil {
+			continue
+		}
+		if _, err := w.Write(p); err == nil {
+			wrote = true
+		}
+	}
+	if !wrote {
+		return 0, io.ErrShortWrite
+	}
+	return len(p), nil
 }

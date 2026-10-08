@@ -39,12 +39,15 @@ type PrefixPaneConfig struct {
 // agent in one — the list selection or a manually entered path, whichever
 // was set last.
 type PrefixPane struct {
-	cfg    PrefixPaneConfig
-	procs  []prefix.Proc
-	cursor int
-	status string
-	err    bool
-	busy   bool
+	cfg   PrefixPaneConfig
+	procs []prefix.Proc
+	// installRunning records whether the install in flight targeted a booted
+	// prefix, so the result can say that a restart is what starts the agent.
+	installRunning bool
+	cursor         int
+	status         string
+	err            bool
+	busy           bool
 
 	manual      string // manually entered prefix path; "" defers to the list
 	editingPath bool
@@ -62,9 +65,16 @@ type (
 		err   error
 	}
 	prefixInstallMsg struct {
-		prefix string
-		res    *prefix.Result
-		err    error
+		// started records whether the agent was launched straight away, and
+		// startErr why it was not. The autostart entry is only read by
+		// wineboot, so on a launcher that runs the game directly it never
+		// fires: installing and then starting is what actually produces a
+		// running agent.
+		started  bool
+		startErr error
+		prefix   string
+		res      *prefix.Result
+		err      error
 	}
 	prefixUninstallMsg struct {
 		prefix string
@@ -92,10 +102,13 @@ func (p PrefixPane) Init() tea.Cmd { return p.Refresh() }
 // input, so the parent model knows not to steal them for global shortcuts.
 func (p PrefixPane) Editing() bool { return p.editingPath }
 
-// Refresh rescans /proc for prefixes with live processes.
+// Refresh relists prefixes: the ones with live processes, plus the ones found
+// on disk. Process-only discovery could not see a prefix until its game was
+// running, which made installing the agent BEFORE starting the game — the
+// normal order — impossible without typing a path.
 func (p PrefixPane) Refresh() tea.Cmd {
 	return func() tea.Msg {
-		procs, err := prefix.Discover()
+		procs, err := prefix.DiscoverAll()
 		return prefixListMsg{procs: procs, err: err}
 	}
 }
@@ -119,17 +132,35 @@ func (p PrefixPane) Target() string {
 	return p.listSelected()
 }
 
-func (p PrefixPane) install(path string) tea.Cmd {
+// install runs the install for one prefix. wineCmd overrides the configured
+// one so a RUNNING prefix can be installed into through its own wine, derived
+// from its processes, instead of being refused.
+func (p PrefixPane) install(path, wineCmd string) tea.Cmd {
+	if wineCmd == "" {
+		wineCmd = p.cfg.WineCmd
+	}
 	cfg := prefix.Config{
 		Prefix:  path,
 		ExePath: p.cfg.ExePath,
 		Port:    p.cfg.Port,
 		Title:   p.cfg.Title,
-		WineCmd: p.cfg.WineCmd,
+		WineCmd: wineCmd,
 	}
 	return func() tea.Msg {
 		res, err := prefix.Install(cfg)
-		return prefixInstallMsg{prefix: path, res: res, err: err}
+		msg := prefixInstallMsg{prefix: path, res: res, err: err}
+		if err != nil || cfg.WineCmd == "" {
+			// No wine command means an idle prefix: there is no session to
+			// start the agent in, and booting one just to do it would be a
+			// surprise. It starts with the prefix instead.
+			return msg
+		}
+		if serr := prefix.StartAgent(cfg); serr != nil {
+			msg.startErr = serr
+		} else {
+			msg.started = true
+		}
+		return msg
 	}
 }
 
@@ -160,23 +191,42 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 		if p.cursor >= len(p.procs) {
 			p.cursor = max(0, len(p.procs)-1)
 		}
-		p.status = fmt.Sprintf("%d running prefix(es)", len(p.procs))
+		live := 0
+		for _, pr := range p.procs {
+			if pr.Running() {
+				live++
+			}
+		}
+		p.status = fmt.Sprintf("%d prefix(es), %d running", len(p.procs), live)
 		return p, p.refreshTargetIfChanged()
 
 	case prefixInstallMsg:
 		p.busy = false
 		if msg.err != nil {
-			p.status, p.err = "install: "+firstLine(msg.err.Error()), true
+			p.status, p.err = "install: "+msg.err.Error(), true
 			return p, nil
 		}
 		p.err = false
-		p.status = fmt.Sprintf("installed (%s route) — starts on this prefix's next boot", msg.res.Route)
+		switch {
+		case msg.started:
+			p.status = fmt.Sprintf("installed (%s route) and agent started — it should register in a moment; "+
+				"no restart needed", msg.res.Route)
+		case msg.startErr != nil:
+			p.status = fmt.Sprintf("installed (%s route), but starting the agent failed: %v — "+
+				"restart the game and it will start with the prefix", msg.res.Route, msg.startErr)
+			p.err = true
+		default:
+			p.status = fmt.Sprintf("installed (%s route) — it starts when this prefix next boots "+
+				"(a launcher that runs the game directly does not process the autostart entry, "+
+				"so start the game through something that boots the prefix, or install again while it runs)",
+				msg.res.Route)
+		}
 		return p, p.describe(msg.prefix)
 
 	case prefixUninstallMsg:
 		p.busy = false
 		if msg.err != nil {
-			p.status, p.err = "uninstall: "+firstLine(msg.err.Error()), true
+			p.status, p.err = "uninstall: "+msg.err.Error(), true
 			return p, nil
 		}
 		p.err = false
@@ -238,9 +288,26 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 			if t == "" || p.busy {
 				return p, nil
 			}
+			// A running prefix cannot have its system.reg edited — a live
+			// wineserver holds it and rewrites it on shutdown, so the change
+			// would be silently discarded — but it CAN be registered through
+			// its own wine. That wine is derivable from the prefix's own
+			// processes, so a running prefix no longer has to be closed first.
+			wineCmd := ""
+			running := p.runningTarget(t)
+			if running && p.cfg.WineCmd == "" {
+				wineCmd = prefix.WineCmdFromProcesses(p.procFor(t))
+				if wineCmd == "" {
+					p.status, p.err = "this prefix is running and its wine command could not be worked out "+
+						"from its processes, so the registry cannot be written safely. Close the game and "+
+						"press i again, or start clonecast with --agent-wine.", true
+					return p, nil
+				}
+			}
 			p.busy = true
+			p.installRunning = running
 			p.status, p.err = "installing into "+t+"…", false
-			return p, p.install(t)
+			return p, p.install(t, wineCmd)
 		case "u":
 			t := p.Target()
 			if t == "" || p.busy {
@@ -252,6 +319,31 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 		}
 	}
 	return p, nil
+}
+
+// procFor is the listed entry for a prefix, so its processes can be inspected.
+// A zero Proc for an unlisted path: WineCmdFromProcesses then finds nothing,
+// which is the right answer for a prefix we know nothing about.
+func (p PrefixPane) procFor(path string) prefix.Proc {
+	for _, pr := range p.procs {
+		if pr.Prefix == path {
+			return pr
+		}
+	}
+	return prefix.Proc{}
+}
+
+// runningTarget reports whether the given prefix is one of the listed ones
+// that currently has live processes. A manually typed path that is not in the
+// list is not assumed to be running: prefix.Install still checks, so the worst
+// case is the error we used to show.
+func (p PrefixPane) runningTarget(path string) bool {
+	for _, pr := range p.procs {
+		if pr.Prefix == path {
+			return pr.Running()
+		}
+	}
+	return false
 }
 
 // refreshTargetIfChanged re-fetches status when the resolved target (list
@@ -292,17 +384,31 @@ func (p PrefixPane) View(w, h int) string {
 	}
 
 	if len(p.procs) == 0 {
-		b.WriteString(prefixPaneDim.Render("no running Wine prefixes (start the game, then r)") + "\n")
+		b.WriteString(prefixPaneDim.Render("no Wine prefixes found (p: point at one by path)") + "\n")
 	}
-	rows := max(1, h-6)
+	// The status can be several lines — an install refusal explains what to do
+	// instead — so the list gives up the room rather than the message being
+	// cut to its first line, which is how the remedy got lost before.
+	statusLines := wrapTo(p.status, w)
+	rows := max(1, h-6-(len(statusLines)-1))
 	start := 0
 	if p.cursor >= rows {
 		start = p.cursor - rows + 1
 	}
+	var line string
 	for i := start; i < len(p.procs) && i < start+rows; i++ {
 		pr := p.procs[i]
-		line := fmt.Sprintf("%s  %s", shortPath(pr.Prefix, max(8, w-14)),
-			prefixPaneDim.Render(fmt.Sprintf("%d proc", len(pr.Processes))))
+		// The game's exe, not a process count: every booted prefix runs the
+		// same handful of Wine services, so "10 proc" is true of all of them
+		// and tells you nothing about which prefix you are looking at.
+		note := "not running"
+		if g := pr.Game(); g != "" {
+			note = g
+		} else if pr.Running() {
+			note = fmt.Sprintf("%d proc", len(pr.Processes))
+		}
+		line = fmt.Sprintf("%s  %s", shortPath(pr.Prefix, max(8, w-18)),
+			prefixPaneDim.Render(note))
 		if p.manual == "" && i == p.cursor {
 			line = prefixPaneSel.Render(line)
 		}
@@ -311,11 +417,13 @@ func (p PrefixPane) View(w, h int) string {
 
 	b.WriteString(p.viewStatus(w))
 
-	st := p.status
-	if p.err {
-		st = prefixPaneErr.Render(st)
+	b.WriteString("\n")
+	for _, line := range statusLines {
+		if p.err {
+			line = prefixPaneErr.Render(line)
+		}
+		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n" + st + "\n")
 	b.WriteString(prefixPaneDim.Render(truncate("i: install  u: uninstall  p: path  r: rescan", w)))
 	return b.String()
 }
@@ -361,6 +469,37 @@ func shortPath(s string, n int) string {
 		return s
 	}
 	return "…" + s[len(s)-n+1:]
+}
+
+// wrapTo breaks a message into lines that fit a width, honouring the newlines
+// already in it. Returns one empty line for an empty message so the layout
+// does not jump as the status changes.
+func wrapTo(s string, w int) []string {
+	if w < 8 {
+		w = 8
+	}
+	if strings.TrimSpace(s) == "" {
+		return []string{""}
+	}
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		words := strings.Fields(para)
+		if len(words) == 0 {
+			out = append(out, "")
+			continue
+		}
+		line := words[0]
+		for _, word := range words[1:] {
+			if len(line)+1+len(word) > w {
+				out = append(out, line)
+				line = word
+				continue
+			}
+			line += " " + word
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 func firstLine(s string) string {

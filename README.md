@@ -144,6 +144,73 @@ The toggle hotkey (`SCROLLLOCK` by default) works from any window and is never d
 
 Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change).
 
+## Choosing which keyboards to capture
+
+On the first run, if discovery finds more than one keyboard, clonecast lists
+them and asks which to capture, then remembers the answer in
+`~/.config/clonecast/clonecast.conf`. `--keyboard` overrides it for one run
+without changing the saved choice, and `--list-keyboards` prints the list on
+its own:
+
+```sh
+clonecast --list-keyboards
+```
+
+```
+/dev/input/event19   BUSY (device or resource busy)  EDGE84@Lofree
+/dev/input/event20   free                            keyd virtual keyboard
+/dev/input/event3    free                            Razer Razer Basilisk V3
+/dev/input/event6    free                            ASUS ASUS Strix Tactic Pro Gaming Keyboard
+```
+
+Discovery takes any device reporting `KEY_A` and `KEY_ENTER`, which is a blunt
+test. On a real desk it also matches a gaming mouse's macro interface, both
+event nodes of one keyboard, and — if you run a remapper — both the physical
+keyboard it has grabbed and the virtual one it publishes. Grabbing both of
+those doubles every keystroke.
+
+**The Keyboards pane** (bottom row, `tab` to it) lists every keyboard, marks
+which are being captured with `[x]`, shows which are held by another process,
+and changes the capture while clonecast runs:
+
+```
+[x] /dev/input/event6    ASUS Strix Tactic Pro
+[ ] /dev/input/event19   Lofree — BUSY (device or resource busy)
+[x] /dev/input/event20   keyd virtual keyboard
+```
+
+`space` captures or releases the highlighted device, `s` saves the current
+selection as the default for next time, `r` rescans. At least one device always
+stays captured: an empty set means "discover everything" further down, which is
+what this exists to avoid.
+
+Re-grabbing releases the old devices before taking the new ones, because the
+sets usually overlap, and restores the previous capture if the new one fails —
+a mistyped device must not leave the engine with no keyboard. Passthrough is
+untouched by a switch: the virtual keyboard was cloned once at startup and does
+not depend on which device is currently grabbed.
+
+`--keyboard` names the devices explicitly, for a run or a script:
+
+```sh
+clonecast --keyboard /dev/input/event20,/dev/input/event6
+```
+
+**With keyd or input-remapper**, capture the *virtual* device the remapper
+publishes, not the physical one it has grabbed: the physical device shows as
+`BUSY` and its keys only reach you in remapped form anyway.
+
+A device that cannot be grabbed is skipped with a line in the log, not treated
+as fatal — being busy is normal on a remapper setup. clonecast only fails when
+*nothing* could be grabbed, and then says which devices it tried and why each
+failed.
+
+If several grabbed devices do report the same key, the duplicate is dropped:
+one physical keyboard often exposes two event nodes, and seeing each press
+twice toggles a tick on and straight back off, so `enter` appears to do nothing
+and the selected row flickers. Only a *different* device can suppress an event,
+so capturing a single device behaves exactly as if the check were not there.
+
 ## First smoke test on Bazzite
 
 Before trusting it with anything:
@@ -155,6 +222,17 @@ Before trusting it with anything:
 5. Check `~/.cache/clonecast/clonecast.log` for errors. If keys arrive in the wrong window, raise `--settle`.
 
 If a target ignores the injected key, that application reads input in a way uinput cannot satisfy (rare). Note it in an issue.
+
+A running prefix no longer has to be closed first. Editing its `system.reg`
+while a wineserver holds it would be discarded on shutdown, so clonecast
+registers through the prefix's own wine instead — found in its process list,
+since Bottles launches `wineserver` by absolute path and `wine` is its sibling.
+The install then reports that the game must be **restarted** for the agent to
+start: an agent is launched by the prefix booting, and never attaches to a
+prefix already running.
+
+If that wine cannot be worked out, the install is refused up front rather than
+attempted and failed, and says to close the game or pass `--agent-wine`.
 
 Then the agent path, with a real game:
 
