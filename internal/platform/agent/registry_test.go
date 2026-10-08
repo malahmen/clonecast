@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -333,4 +334,105 @@ func TestRegistryKeepaliveKeepsAgent(t *testing.T) {
 	if reg.Count() != 1 || !reg.Paired("w1") {
 		t.Fatalf("keepalives cost the agent its registration (count=%d)", reg.Count())
 	}
+}
+
+// TestRegistryHelloRaceOnReannounce: an agent re-announces whenever WoW
+// recreates its top-level window (REFERENCE.md 4.14) — every login and every
+// loading screen — while the pairing pass and the TUI's snapshot are reading
+// what it announced. Run with -race this reported a write/read data race:
+// the write took r.mu and the readers (Agents, Label, both pairing passes)
+// did not.
+//
+// Nothing here asserts a value: -race is the assertion. It fails the test by
+// itself when the field is unsynchronised.
+func TestRegistryHelloRaceOnReannounce(t *testing.T) {
+	wins := []broadcast.Window{{ID: "w1", Title: "Game"}}
+	reg, _ := startRegistry(t, wins, t.TempDir())
+	c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game"})
+	waitFor(t, "the agent", func() bool { return reg.Count() == 1 })
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// The agent, re-announcing as fast as the socket takes it.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			h := agentwire.Hello{
+				Version: agentwire.Version,
+				Title:   "Game",
+				Prefix:  fmt.Sprintf("/bottles/b%d", i%3),
+				PID:     i,
+				HWND:    uint64(i),
+			}
+			if err := h.Write(c.conn); err != nil {
+				return
+			}
+		}
+	}()
+
+	// clonecast, reading it: the TUI's snapshot, the log label, and the
+	// pairing pass the repair loop runs.
+	for _, read := range []func(){
+		func() { _ = reg.Agents() },
+		func() { _ = reg.Paired("w1") },
+		func() {
+			if a := reg.agentFor("w1"); a != nil {
+				_ = a.Label()
+			}
+		},
+	} {
+		wg.Add(1)
+		go func(fn func()) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				fn()
+			}
+		}(read)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+// TestAgentHelloIsReadAsOneValue: Hello() must hand back a snapshot, so a
+// caller comparing two of its fields cannot see half of one announcement and
+// half of the next — a pairing decision about an agent that never existed.
+func TestAgentHelloIsReadAsOneValue(t *testing.T) {
+	a := &Agent{ID: 1}
+	if got := a.Hello(); got.Title != "" || got.Prefix != "" {
+		t.Fatalf("a never-announced agent should read as a zero Hello, got %+v", got)
+	}
+	first := agentwire.Hello{Version: agentwire.Version, Title: "A", Prefix: "/bottles/a", PID: 1}
+	a.setHello(first)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20000; i++ {
+			a.setHello(agentwire.Hello{Version: agentwire.Version, Title: "B", Prefix: "/bottles/b", PID: 2})
+			a.setHello(first)
+		}
+	}()
+	for i := 0; i < 20000; i++ {
+		h := a.Hello()
+		// Every stored value is internally consistent; a torn read would
+		// pair one announcement's title with another's prefix.
+		if (h.Title == "A") != (h.Prefix == "/bottles/a") {
+			t.Fatalf("torn Hello: %+v", h)
+		}
+	}
+	<-done
 }

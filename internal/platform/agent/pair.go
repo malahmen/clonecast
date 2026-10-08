@@ -133,10 +133,13 @@ func (p *pairing) recompute(ctx context.Context, agents []*Agent) {
 			continue
 		}
 		for _, a := range agents {
-			if used[a.ID] || a.Hello.Prefix == "" {
+			// One read, reused: an agent re-announces at every loading
+			// screen, so two reads can disagree.
+			h := a.Hello()
+			if used[a.ID] || h.Prefix == "" {
 				continue
 			}
-			if prefix.SamePrefix(a.Hello.Prefix, in.Prefix) {
+			if prefix.SamePrefix(h.Prefix, in.Prefix) {
 				pairs[w.ID], used[a.ID] = a.ID, true
 				how[a.ID] = fmt.Sprintf("prefix (pid %d -> %s)", in.PID, in.Prefix)
 				break
@@ -157,10 +160,11 @@ func (p *pairing) recompute(ctx context.Context, agents []*Agent) {
 		}
 		in := info[w.ID]
 		for _, a := range agents {
-			if used[a.ID] || a.Hello.Title != w.Title {
+			h := a.Hello()
+			if used[a.ID] || h.Title != w.Title {
 				continue
 			}
-			if in.Prefix != "" && a.Hello.Prefix != "" && !prefix.SamePrefix(a.Hello.Prefix, in.Prefix) {
+			if in.Prefix != "" && h.Prefix != "" && !prefix.SamePrefix(h.Prefix, in.Prefix) {
 				continue
 			}
 			pairs[w.ID], used[a.ID] = a.ID, true
@@ -175,7 +179,7 @@ func (p *pairing) recompute(ctx context.Context, agents []*Agent) {
 	// when something is wrong and is noise otherwise.
 	var lines []string
 	for _, a := range agents {
-		msg := "unpaired: no window matches " + a.Hello.Describe()
+		msg := "unpaired: no window matches " + a.Hello().Describe()
 		if h, ok := how[a.ID]; ok {
 			msg = "paired by " + h
 		}

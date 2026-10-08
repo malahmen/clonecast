@@ -16,7 +16,9 @@ import (
 func agentsFor(hellos ...agentwire.Hello) []*Agent {
 	out := make([]*Agent, len(hellos))
 	for i, h := range hellos {
-		out[i] = &Agent{ID: int64(i + 1), Hello: h}
+		a := &Agent{ID: int64(i + 1)}
+		a.setHello(h)
+		out[i] = a
 	}
 	return out
 }

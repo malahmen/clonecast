@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/malahmen/clonecast/internal/agentwire"
@@ -27,24 +28,48 @@ const repairInterval = 2 * time.Second
 
 // Agent is one connected in-bottle agent.
 type Agent struct {
-	ID     int64           // registry-local identity, stable for the connection
-	Hello  agentwire.Hello // what it announced (updated if it re-announces)
-	Remote string          // its address, for the log
+	ID     int64  // registry-local identity, stable for the connection
+	Remote string // its address, for the log
 	Since  time.Time
+
+	// What it announced, through an atomic pointer rather than a plain field.
+	// An agent RE-announces whenever WoW recreates its top-level window
+	// (REFERENCE.md 4.14), i.e. at every login and loading screen, and that
+	// write was taken under r.mu while Agents(), Label() and the pairing
+	// passes all read it without r.mu — a real data race, reported by -race.
+	// An atomic pointer is used instead of widening r.mu because the readers
+	// are on the delivery path, where taking the registry lock to read one
+	// struct would put the pairing pass in front of every key.
+	hello atomic.Pointer[agentwire.Hello]
 
 	conn net.Conn
 	mu   sync.Mutex // serialises writes; the read loop runs concurrently
 }
 
+// Hello is what this agent announced. Always read it once and work from the
+// copy: a re-announce can land between two reads, and a comparison made from
+// two different Hellos is a pairing decision about an agent that never
+// existed.
+func (a *Agent) Hello() agentwire.Hello {
+	if h := a.hello.Load(); h != nil {
+		return *h
+	}
+	return agentwire.Hello{}
+}
+
+// setHello replaces it. The value is copied, so the caller may reuse its own.
+func (a *Agent) setHello(h agentwire.Hello) { a.hello.Store(&h) }
+
 // Label is a short human identity for logs: the prefix's last path element if
 // it announced one (bottle names are the useful part), else its window title,
 // else its address.
 func (a *Agent) Label() string {
+	h := a.Hello()
 	switch {
-	case a.Hello.Prefix != "":
-		return filepath.Base(a.Hello.Prefix)
-	case a.Hello.Title != "":
-		return a.Hello.Title
+	case h.Prefix != "":
+		return filepath.Base(h.Prefix)
+	case h.Title != "":
+		return h.Title
 	}
 	return a.Remote
 }
@@ -196,9 +221,10 @@ func (r *Registry) Agents() []Info {
 	out := make([]Info, len(list))
 	for i, a := range list {
 		w, _ := r.pair.windowFor(a.ID)
+		h := a.Hello()
 		out[i] = Info{
-			ID: a.ID, Prefix: a.Hello.Prefix, Title: a.Hello.Title,
-			PID: a.Hello.PID, HWND: a.Hello.HWND, Remote: a.Remote,
+			ID: a.ID, Prefix: h.Prefix, Title: h.Title,
+			PID: h.PID, HWND: h.HWND, Remote: a.Remote,
 			Since: a.Since, Window: w,
 		}
 	}
@@ -340,9 +366,7 @@ func (r *Registry) serve(c net.Conn) {
 		if m.Kind == agentwire.KindHello {
 			// The agent re-resolved its window (WoW recreates its top-level
 			// window across login/loading, REFERENCE.md 4.14).
-			r.mu.Lock()
-			a.Hello = m.Hello
-			r.mu.Unlock()
+			a.setHello(m.Hello)
 			r.nudge()
 		}
 	}
@@ -351,7 +375,8 @@ func (r *Registry) serve(c net.Conn) {
 func (r *Registry) add(c net.Conn, h agentwire.Hello) *Agent {
 	r.mu.Lock()
 	r.nextID++
-	a := &Agent{ID: r.nextID, Hello: h, Remote: c.RemoteAddr().String(), Since: time.Now(), conn: c}
+	a := &Agent{ID: r.nextID, Remote: c.RemoteAddr().String(), Since: time.Now(), conn: c}
+	a.setHello(h)
 	r.agents[a.ID] = a
 	n := len(r.agents)
 	r.mu.Unlock()

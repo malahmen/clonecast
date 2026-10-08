@@ -30,7 +30,14 @@ import (
 // values the `agent install` flags carry.
 type PrefixPaneConfig struct {
 	ExePath string // built clonecast-agent.exe ("" = look next to the binary)
-	Port    int    // clonecast port the installed agent dials (0 = agent default)
+	// Port resolves the clonecast port the installed agent will dial, and is
+	// called at INSTALL time. It used to be a plain int taken from --listen at
+	// startup, which went stale the moment the listener moved: rebinding in
+	// the TUI, or the registry rebinding itself, left `agent install` writing
+	// an autostart entry that dials a port nothing answers on — and the agent
+	// then redials that port forever, looking like a broken install.
+	// nil, or a 0 result, means the agent's own default.
+	Port    func() int
 	Title   string // target window title ("" = agent default)
 	WineCmd string // wine command for prefixes that are already booted
 }
@@ -122,6 +129,14 @@ func (p PrefixPane) listSelected() string {
 	return p.procs[p.cursor].Prefix
 }
 
+// port is the clonecast port to write into the install, resolved now.
+func (p PrefixPane) port() int {
+	if p.cfg.Port == nil {
+		return 0
+	}
+	return p.cfg.Port()
+}
+
 // Target is the prefix install/uninstall/status act on: a manually entered
 // path takes precedence, so pointing at an idle prefix (nothing in the
 // running list) still works.
@@ -142,7 +157,7 @@ func (p PrefixPane) install(path, wineCmd string) tea.Cmd {
 	cfg := prefix.Config{
 		Prefix:  path,
 		ExePath: p.cfg.ExePath,
-		Port:    p.cfg.Port,
+		Port:    p.port(),
 		Title:   p.cfg.Title,
 		WineCmd: wineCmd,
 	}

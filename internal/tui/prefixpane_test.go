@@ -301,3 +301,31 @@ func TestPrefixPaneInstallsRunningPrefixViaDerivedWine(t *testing.T) {
 		t.Fatal("installRunning not set, so the result would not mention restarting the game")
 	}
 }
+
+// TestPrefixPanePortIsResolvedPerInstall: the port written into an install
+// comes from the listener as it is NOW. It used to be an int captured from
+// --listen at startup, so after rebinding in the TUI, `agent install` wrote an
+// autostart entry pointing at the old port — and the agent then redialled a
+// port nothing answers on, which looks like a broken install rather than a
+// stale setting.
+func TestPrefixPanePortIsResolvedPerInstall(t *testing.T) {
+	live := 48800
+	p := NewPrefixPane(PrefixPaneConfig{Port: func() int { return live }})
+
+	if got := p.port(); got != 48800 {
+		t.Fatalf("port() = %d, want 48800", got)
+	}
+	live = 49999 // the listener moved, as the Settings pane can make it
+	if got := p.port(); got != 49999 {
+		t.Fatalf("port() = %d after a rebind, want 49999 — the port was captured, not resolved", got)
+	}
+}
+
+// A pane with no Port resolver installs with the agent's own default rather
+// than port 0, which is what every existing test constructs.
+func TestPrefixPanePortDefaultsToZeroWhenUnset(t *testing.T) {
+	p := NewPrefixPane(PrefixPaneConfig{})
+	if got := p.port(); got != 0 {
+		t.Fatalf("port() = %d with no resolver, want 0 (agent default)", got)
+	}
+}
