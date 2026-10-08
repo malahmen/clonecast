@@ -203,7 +203,9 @@ func run() error {
 
 	prefixCfg := tui.PrefixPaneConfig{
 		ExePath: *agentExe,
-		Port:    portFromAddr(*listen),
+		// Asked at install time, not read from *listen here: the TUI can
+		// rebind the listener, after which a port captured now is wrong.
+		Port:    func() int { return portFromAddr(agents.Addr()) },
 		Title:   *agentTitle,
 		WineCmd: *agentWine,
 	}
