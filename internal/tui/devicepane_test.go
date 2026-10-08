@@ -51,16 +51,23 @@ func TestDevicePaneShowsWhatExistsAndWhatIsCaptured(t *testing.T) {
 	p, _ = p.Update(deviceListMsg{devices: ctl.devices})
 
 	view := p.View(70, 12)
-	for _, want := range []string{"event6", "event19", "event20", "keyd virtual keyboard", "BUSY"} {
+	for _, want := range []string{"event6", "event19", "event20", "(busy)"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("view is missing %q:\n%s", want, view)
 		}
 	}
-	if !strings.Contains(view, "[x] /dev/input/event6") {
+	// Rows use the short device name; the panel shares a row with the log and
+	// cannot afford "/dev/input/" on every line.
+	if !strings.Contains(view, "[x] event6") {
 		t.Fatalf("the captured device is not ticked:\n%s", view)
 	}
-	if !strings.Contains(view, "[ ] /dev/input/event20") {
+	if !strings.Contains(view, "[ ] event20") {
 		t.Fatalf("an uncaptured device is not shown unticked:\n%s", view)
+	}
+	// The full path of the highlighted device still has to be visible
+	// somewhere, since that is what --keyboard and the config take.
+	if !strings.Contains(view, "/dev/input/event6") {
+		t.Fatalf("the highlighted device's full path is missing:\n%s", view)
 	}
 }
 

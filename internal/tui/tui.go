@@ -304,6 +304,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.prefixes, cmd = m.prefixes.Update(msg)
 		return m, cmd
 
+	case deviceListMsg, deviceCaptureMsg, deviceSaveMsg:
+		// Likewise for the Keyboards pane. Without this the pane's own
+		// Refresh produced a list that never reached it, so it showed no
+		// keyboards at all however many were found — and pane-level tests do
+		// not catch it, because they call DevicePane.Update directly.
+		var cmd tea.Cmd
+		m.devices, cmd = m.devices.Update(msg)
+		return m, cmd
+
 	case tea.KeyMsg:
 		if m.editing != editNone {
 			return m.updateEditing(msg)

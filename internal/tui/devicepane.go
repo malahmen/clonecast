@@ -205,7 +205,16 @@ func (p DevicePane) View(w, h int) string {
 	}
 
 	statusLines := wrapTo(p.status, w)
-	rows := max(1, h-5-(len(statusLines)-1))
+	detailLines := 1
+	if p.cursor >= 0 && p.cursor < len(p.devices) {
+		d := p.devices[p.cursor]
+		detail := d.Path
+		if d.Busy != "" {
+			detail += " — " + d.Busy
+		}
+		detailLines = len(wrapTo(detail, w))
+	}
+	rows := max(1, h-5-(len(statusLines)-1)-detailLines)
 	start := 0
 	if p.cursor >= rows {
 		start = p.cursor - rows + 1
@@ -216,14 +225,16 @@ func (p DevicePane) View(w, h int) string {
 		if p.captured[d.Path] {
 			mark = "[x]"
 		}
+		// "event20" rather than "/dev/input/event20", and "busy" rather than
+		// the whole reason: this panel shares a row, so a long line is simply
+		// truncated and the important part — that the device is held
+		// elsewhere — is the part that falls off the end. The full reason goes
+		// in the status line for the highlighted device instead.
 		note := d.Name
 		if d.Busy != "" {
-			// A device another process holds exclusively (keyd,
-			// input-remapper) cannot be captured, and saying so here is the
-			// difference between choosing and guessing.
-			note = d.Name + " — " + d.Busy
+			note = d.Name + " (busy)"
 		}
-		line := fmt.Sprintf("%s %-20s %s", mark, d.Path, note)
+		line := fmt.Sprintf("%s %-9s %s", mark, strings.TrimPrefix(d.Path, "/dev/input/"), note)
 		line = truncate(line, w)
 		if i == p.cursor {
 			line = prefixPaneSel.Render(line)
@@ -231,6 +242,20 @@ func (p DevicePane) View(w, h int) string {
 			line = prefixPaneDim.Render(line)
 		}
 		b.WriteString(line + "\n")
+	}
+
+	// The highlighted device's full state, which the rows cannot afford to
+	// show: a device held by keyd or input-remapper cannot be captured, and
+	// the reason is what makes that actionable rather than mysterious.
+	if p.cursor >= 0 && p.cursor < len(p.devices) {
+		d := p.devices[p.cursor]
+		detail := d.Path
+		if d.Busy != "" {
+			detail += " — " + d.Busy
+		}
+		for _, l := range wrapTo(detail, w) {
+			b.WriteString(prefixPaneDim.Render(l) + "\n")
+		}
 	}
 
 	b.WriteString("\n")
