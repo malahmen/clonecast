@@ -216,3 +216,88 @@ func contains(lines []string, sub string) bool {
 	}
 	return false
 }
+
+// TestPairingPicksTheTitledWindowInASharedPrefix: one prefix can hold several
+// windows — the game, the Battle.net launcher, a crash dialog — and all of
+// them map to the same WINEPREFIX. The first prefix match used to win, so the
+// agent could be handed to the launcher while the game went unpaired, and
+// broadcasting then typed into a window nobody was playing.
+func TestPairingPicksTheTitledWindowInASharedPrefix(t *testing.T) {
+	bottle := t.TempDir()
+	root := fakeProc(t, map[int][]string{
+		7100: {"WINEPREFIX=" + bottle}, // the launcher
+		7200: {"WINEPREFIX=" + bottle}, // the game
+	})
+	// The launcher is listed FIRST, which is what made this fail.
+	wins := []broadcast.Window{
+		{ID: "launcher", Title: "Battle.net", PID: 7100},
+		{ID: "game", Title: "World of Warcraft", PID: 7200},
+	}
+	p := newTestPairing(t, func() ([]broadcast.Window, error) { return wins, nil }, root, nil)
+	agents := agentsFor(agentwire.Hello{Prefix: bottle, Title: "World of Warcraft"})
+	p.recompute(context.Background(), agents)
+
+	if id, ok := p.agentFor("game"); !ok || id != 1 {
+		t.Errorf("the game paired with agent %d (ok=%v), want agent 1", id, ok)
+	}
+	if id, ok := p.agentFor("launcher"); ok {
+		t.Errorf("the launcher took agent %d; it has no agent of its own", id)
+	}
+}
+
+// The title is a preference, not a requirement: an agent's announced title
+// goes stale whenever WoW recreates its window, and dark-portal renames
+// windows, so a mismatch must not cost a pairing the prefix already proves.
+func TestPairingFallsBackToPrefixWhenNoTitleMatches(t *testing.T) {
+	bottle := t.TempDir()
+	root := fakeProc(t, map[int][]string{8100: {"WINEPREFIX=" + bottle}})
+	wins := []broadcast.Window{{ID: "w1", Title: "Renamed By dark-portal", PID: 8100}}
+	p := newTestPairing(t, func() ([]broadcast.Window, error) { return wins, nil }, root, nil)
+	agents := agentsFor(agentwire.Hello{Prefix: bottle, Title: "World of Warcraft"})
+	p.recompute(context.Background(), agents)
+
+	if id, ok := p.agentFor("w1"); !ok || id != 1 {
+		t.Errorf("w1 paired with agent %d (ok=%v), want agent 1 on the prefix alone", id, ok)
+	}
+}
+
+// A window with no caption at all still pairs on the prefix.
+func TestPairingHandlesAnUntitledWindow(t *testing.T) {
+	bottle := t.TempDir()
+	root := fakeProc(t, map[int][]string{8200: {"WINEPREFIX=" + bottle}})
+	wins := []broadcast.Window{{ID: "w1", Title: "", PID: 8200}}
+	p := newTestPairing(t, func() ([]broadcast.Window, error) { return wins, nil }, root, nil)
+	agents := agentsFor(agentwire.Hello{Prefix: bottle, Title: "World of Warcraft"})
+	p.recompute(context.Background(), agents)
+
+	if id, ok := p.agentFor("w1"); !ok || id != 1 {
+		t.Errorf("an untitled window paired with agent %d (ok=%v), want agent 1", id, ok)
+	}
+}
+
+// Two agents in one prefix, two windows: each must take the window whose
+// caption it announced, whatever order the windows arrive in.
+func TestPairingMatchesEachAgentToItsOwnTitle(t *testing.T) {
+	bottle := t.TempDir()
+	root := fakeProc(t, map[int][]string{
+		9100: {"WINEPREFIX=" + bottle},
+		9200: {"WINEPREFIX=" + bottle},
+	})
+	wins := []broadcast.Window{
+		{ID: "second", Title: "Marx", PID: 9100},
+		{ID: "first", Title: "Malahmen", PID: 9200},
+	}
+	p := newTestPairing(t, func() ([]broadcast.Window, error) { return wins, nil }, root, nil)
+	agents := agentsFor(
+		agentwire.Hello{Prefix: bottle, Title: "Malahmen"},
+		agentwire.Hello{Prefix: bottle, Title: "Marx"},
+	)
+	p.recompute(context.Background(), agents)
+
+	if id, ok := p.agentFor("first"); !ok || id != 1 {
+		t.Errorf("the Malahmen window paired with agent %d (ok=%v), want agent 1", id, ok)
+	}
+	if id, ok := p.agentFor("second"); !ok || id != 2 {
+		t.Errorf("the Marx window paired with agent %d (ok=%v), want agent 2", id, ok)
+	}
+}

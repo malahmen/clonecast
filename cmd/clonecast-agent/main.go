@@ -66,6 +66,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 
 	"github.com/malahmen/clonecast/internal/agentwire"
+	"github.com/malahmen/clonecast/internal/redial"
 )
 
 var (
@@ -490,27 +491,35 @@ func session(c net.Conn, res *resolver, title string) {
 // running yet (the normal case: the agent starts at prefix boot), may be
 // restarted, or may be started only when the user sits down to play.
 func connectLoop(addr string, res *resolver, title string) {
-	const (
-		minBackoff = 500 * time.Millisecond
-		maxBackoff = 30 * time.Second
-	)
-	backoff := minBackoff
+	backoff := redial.Min
 	complained := false
 	for {
 		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err != nil {
 			if !complained {
-				logf("cannot reach clonecast on %s yet (%v); retrying, up to every %s", addr, err, maxBackoff)
+				logf("cannot reach clonecast on %s yet (%v); retrying, up to every %s", addr, err, redial.Max)
 				complained = true // once per outage, not once per retry
 			}
 			time.Sleep(backoff)
-			if backoff < maxBackoff {
-				backoff *= 2
-			}
+			backoff = redial.Grow(backoff)
 			continue
 		}
-		backoff, complained = minBackoff, false
+		// Timed, because the backoff used to be reset here — before the
+		// session had run — so a connection that died immediately redialled
+		// with no sleep. See nextBackoff.
+		start := time.Now()
 		session(c, res, title)
+		wait, reset := redial.Next(time.Since(start), backoff)
+		if reset {
+			backoff, complained = redial.Min, false
+			continue
+		}
+		if !complained {
+			logf("connection to %s ended after %s; backing off up to %s", addr, time.Since(start).Round(time.Millisecond), redial.Max)
+			complained = true
+		}
+		time.Sleep(wait)
+		backoff = redial.Grow(wait)
 	}
 }
 

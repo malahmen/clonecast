@@ -127,25 +127,58 @@ func (p *pairing) recompute(ctx context.Context, agents []*Agent) {
 
 	// Pass 1, the real join: the agent's announced WINEPREFIX against the
 	// prefix the window's host pid runs in.
-	for _, w := range wins {
-		in := info[w.ID]
-		if in.Prefix == "" {
-			continue
-		}
-		for _, a := range agents {
-			// One read, reused: an agent re-announces at every loading
-			// screen, so two reads can disagree.
-			h := a.Hello()
-			if used[a.ID] || h.Prefix == "" {
+	//
+	// Twice over the windows, preferring a title match, because ONE PREFIX CAN
+	// HAVE SEVERAL WINDOWS — the game, the Battle.net launcher, a crash
+	// dialog. The first prefix match won, so the agent could be handed to the
+	// launcher and the game left unpaired: broadcasting then types into a
+	// window nobody is playing. The title is what tells them apart, and the
+	// agent announces the title of the window it actually found.
+	//
+	// Both sub-passes run over every window before the next begins. Doing it
+	// per window instead would let a title-less match on an early window take
+	// the agent that a later window matches exactly.
+	pairPrefix := func(requireTitle bool) {
+		for _, w := range wins {
+			if _, done := pairs[w.ID]; done {
 				continue
 			}
-			if prefix.SamePrefix(h.Prefix, in.Prefix) {
+			in := info[w.ID]
+			if in.Prefix == "" {
+				continue
+			}
+			if requireTitle && w.Title == "" {
+				continue
+			}
+			for _, a := range agents {
+				// One read, reused: an agent re-announces at every loading
+				// screen, so two reads can disagree.
+				h := a.Hello()
+				if used[a.ID] || h.Prefix == "" {
+					continue
+				}
+				if !prefix.SamePrefix(h.Prefix, in.Prefix) {
+					continue
+				}
+				if requireTitle && h.Title != w.Title {
+					continue
+				}
 				pairs[w.ID], used[a.ID] = a.ID, true
-				how[a.ID] = fmt.Sprintf("prefix (pid %d -> %s)", in.PID, in.Prefix)
+				if requireTitle {
+					how[a.ID] = fmt.Sprintf("prefix + title (pid %d -> %s, %q)", in.PID, in.Prefix, w.Title)
+				} else {
+					how[a.ID] = fmt.Sprintf("prefix (pid %d -> %s)", in.PID, in.Prefix)
+				}
 				break
 			}
 		}
 	}
+	pairPrefix(true)
+	// Then prefix alone, for the windows left over: an agent's announced
+	// title goes stale whenever WoW recreates its window, and dark-portal
+	// renames windows, so a title mismatch must not cost a pairing that the
+	// prefix already establishes.
+	pairPrefix(false)
 
 	// Pass 2, the fallback (REFERENCE.md 4.17): match the agent's announced
 	// window title against the KWin caption. This is what clonecast did for
