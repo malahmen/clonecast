@@ -532,3 +532,199 @@ func (b *blockingDeliverer) Deliver(_ context.Context, req Delivery) (int, error
 	<-b.release
 	return len(req.Targets), nil
 }
+
+// --- held keys (REFERENCE.md: stuck keys) ------------------------------------
+//
+// Every reason not to broadcast a key applies equally to its Up, and dropping
+// an Up does not skip a keystroke — it leaves the key held down in the game.
+// Autorun on, a spell key stuck, a character running into a wall.
+
+// runLive starts the engine and lets the test change settings between
+// keystrokes, which is the whole shape of these failures.
+func runLive(t *testing.T, e *Engine, src *fakeSource, body func(send func(keys.Event))) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = e.Run(ctx); close(done) }()
+	body(func(ev keys.Event) {
+		src.ch <- ev
+		time.Sleep(40 * time.Millisecond) // let the worker finish this one
+	})
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	<-done
+}
+
+func logHas(got []string, want string) bool {
+	for _, s := range got {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func assertHas(t *testing.T, got []string, want string) {
+	t.Helper()
+	if !logHas(got, want) {
+		t.Fatalf("missing %q in %v", want, got)
+	}
+}
+
+func assertLacks(t *testing.T, got []string, unwanted string) {
+	t.Helper()
+	if logHas(got, unwanted) {
+		t.Fatalf("unexpected %q in %v", unwanted, got)
+	}
+}
+
+func heldEngine(t *testing.T, rec *recorder, src *fakeSource, targets ...WindowID) (*Engine, keys.Code) {
+	t.Helper()
+	e := newEngine(rec, src)
+	e.SetTargets(targets)
+	a, _ := keys.Parse("a")
+	e.SetFilter(keys.Of(a))
+	e.SetEnabled(true)
+	return e, a
+}
+
+// Turning broadcast off between the Down and the Up was the simplest way to
+// strand a key: the Up arrived at a disabled engine and went nowhere.
+func TestDisablingBroadcastReleasesHeldKeys(t *testing.T) {
+	rec := &recorder{active: "origin"}
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e, a := heldEngine(t, rec, src, "t1", "origin")
+
+	runLive(t, e, src, func(send func(keys.Event)) {
+		send(keys.Event{Code: a, State: keys.Down})
+		assertHas(t, rec.snapshot(), "emit@t1:A/down")
+		e.SetEnabled(false)
+		time.Sleep(40 * time.Millisecond)
+		send(keys.Event{Code: a, State: keys.Up})
+	})
+	assertHas(t, rec.snapshot(), "emit@t1:A/up")
+}
+
+// The same for the allowlist: a key dropped from it mid-press would never see
+// its Up broadcast.
+func TestFilterChangeReleasesHeldKeys(t *testing.T) {
+	rec := &recorder{active: "origin"}
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e, a := heldEngine(t, rec, src, "t1", "origin")
+
+	runLive(t, e, src, func(send func(keys.Event)) {
+		send(keys.Event{Code: a, State: keys.Down})
+		b, _ := keys.Parse("b")
+		e.SetFilter(keys.Of(b)) // 'a' is no longer broadcast at all
+		time.Sleep(40 * time.Millisecond)
+	})
+	assertHas(t, rec.snapshot(), "emit@t1:A/up")
+}
+
+// The origin gate closing is not a reason to leave a key down. The gate asks
+// whether to START broadcasting from this window.
+func TestGateClosingStillReleasesHeldKeys(t *testing.T) {
+	rec := &recorder{active: "origin"}
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e, a := heldEngine(t, rec, src, "t1", "origin")
+	if !e.GateOrigin() {
+		t.Fatal("this test needs the origin gate on")
+	}
+
+	runLive(t, e, src, func(send func(keys.Event)) {
+		send(keys.Event{Code: a, State: keys.Down})
+		assertHas(t, rec.snapshot(), "emit@t1:A/down")
+		// Focus moves to something that is not a target: the gate shuts.
+		rec.mu.Lock()
+		rec.active = "a-browser"
+		rec.mu.Unlock()
+		send(keys.Event{Code: a, State: keys.Up})
+	})
+	assertHas(t, rec.snapshot(), "emit@t1:A/up")
+}
+
+// A release goes to the windows that were sent the Down, not to whatever is
+// ticked now — the windows that left the list are exactly the ones nothing
+// else would ever release.
+func TestTargetChangeReleasesTheOldTargets(t *testing.T) {
+	rec := &recorder{active: "origin"}
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e, a := heldEngine(t, rec, src, "t1", "origin")
+
+	runLive(t, e, src, func(send func(keys.Event)) {
+		send(keys.Event{Code: a, State: keys.Down})
+		assertHas(t, rec.snapshot(), "emit@t1:A/down")
+		e.SetTargets([]WindowID{"t2", "origin"})
+		time.Sleep(40 * time.Millisecond)
+	})
+	got := rec.snapshot()
+	assertHas(t, got, "emit@t1:A/up")   // the holder
+	assertLacks(t, got, "emit@t2:A/up") // never had it down
+}
+
+// An ordinary Down/Up leaves nothing held, so a stray second Up is not
+// broadcast — the bypass must not become a permanent hole in the filter.
+func TestAReleasedKeyIsNoLongerHeld(t *testing.T) {
+	rec := &recorder{active: "origin"}
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e, a := heldEngine(t, rec, src, "t1", "origin")
+
+	runLive(t, e, src, func(send func(keys.Event)) {
+		send(keys.Event{Code: a, State: keys.Down})
+		send(keys.Event{Code: a, State: keys.Up})
+		if n := len(e.heldTargets(a)); n != 0 {
+			t.Fatalf("%d target(s) still holding A after its Up", n)
+		}
+		e.SetEnabled(false)
+		b, _ := keys.Parse("b")
+		e.SetFilter(keys.Of(b))
+		time.Sleep(40 * time.Millisecond)
+		// A second Up with nothing held: passthrough only.
+		send(keys.Event{Code: a, State: keys.Up})
+	})
+	// Exactly one broadcast Up to t1, from the real release.
+	n := 0
+	for _, s := range rec.snapshot() {
+		if s == "emit@t1:A/up" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("broadcast %d Ups to t1, want exactly 1 (log: %v)", n, rec.snapshot())
+	}
+}
+
+// A full queue drops the newest event rather than blocking passthrough — but
+// not when that event is the Up of a held key. Driven directly rather than by
+// timing: the queue is filled, the key marked held, and one slot freed.
+func TestFullQueueDoesNotDropARelease(t *testing.T) {
+	rec := &recorder{active: "origin"}
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e, a := heldEngine(t, rec, src, "t1", "origin")
+
+	for len(e.queue) < cap(e.queue) { // full, with no worker running
+		e.queue <- keys.Event{Code: a, State: keys.Repeat}
+	}
+	e.noteDelivered(keys.Event{Code: a, State: keys.Down}, []WindowID{"t1"})
+
+	done := make(chan struct{})
+	go func() { e.handle(keys.Event{Code: a, State: keys.Up}); close(done) }()
+
+	time.Sleep(30 * time.Millisecond) // the release is waiting for room
+	<-e.queue                         // make one slot
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handle never enqueued the release")
+	}
+
+	var ups int
+	for len(e.queue) > 0 {
+		if ev := <-e.queue; ev.State == keys.Up {
+			ups++
+		}
+	}
+	if ups != 1 {
+		t.Fatalf("queued %d Ups, want 1 — the release was dropped", ups)
+	}
+}

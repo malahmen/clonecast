@@ -189,6 +189,26 @@ type Engine struct {
 	// (single worker goroutine), so they need no lock.
 	gateBlocked  WindowID
 	activeBroken bool
+
+	// held is which keys each target currently has DOWN because this engine
+	// broadcast a Down to it and has not yet broadcast the matching Up.
+	//
+	// It exists because every reason to not broadcast a key applies equally
+	// to the Up, and dropping an Up does not skip a keystroke — it leaves the
+	// key held down in the game until something else releases it. Turning
+	// broadcast off mid-keypress, a filter change, the origin gate closing
+	// because focus moved, or a full queue were all enough: autorun on, a
+	// spell key stuck, a character running into a wall.
+	//
+	// Per target, not per code, because the targets can change between the
+	// Down and the Up: the windows that must be released are the ones that
+	// were sent the Down, not whatever is ticked now.
+	//
+	// heldMu is never held across a delivery (deliveries take focusMu, and
+	// broadcast already holds focusMu when it records): snapshot, unlock,
+	// then deliver.
+	heldMu sync.Mutex
+	held   map[WindowID]map[keys.Code]bool
 }
 
 // New wires an engine. The filter starts empty (nothing broadcast) and
@@ -201,6 +221,7 @@ func New(src Source, inj Injector, wm WindowManager, cfg Config) *Engine {
 		cfg:     cfg,
 		notices: make(chan Notice, 64),
 		queue:   make(chan keys.Event, 16),
+		held:    map[WindowID]map[keys.Code]bool{},
 	}
 	// Built-in backend: the focus dance, reading SettleDelay live from cfg.
 	// cmd/clonecast swaps in the agent backend for real runs (REFERENCE.md
@@ -215,6 +236,9 @@ func New(src Source, inj Injector, wm WindowManager, cfg Config) *Engine {
 // offer the backend as a runtime setting. The caller keeps ownership of both
 // deliverers (the engine closes neither).
 func (e *Engine) SetDeliverer(d Deliverer) {
+	// Queued before the swap so the releases are at least ahead of any later
+	// key in the queue. See releaseHeld on why this is best effort.
+	e.releaseHeld("backend change")
 	e.delivMu.Lock()
 	e.deliverer = d
 	e.delivMu.Unlock()
@@ -287,6 +311,10 @@ func (e *Engine) Notify(text string, isErr bool) { e.notify(text, isErr) }
 
 // SetTargets replaces the target list. Order is the delivery order.
 func (e *Engine) SetTargets(ids []WindowID) {
+	// Before the change, while the held set still describes the windows that
+	// were sent those Downs. A window removed from the list is one nothing
+	// else would ever release.
+	e.releaseHeld("target change")
 	e.mu.Lock()
 	e.targets = append([]WindowID(nil), ids...)
 	e.mu.Unlock()
@@ -301,6 +329,8 @@ func (e *Engine) Targets() []WindowID {
 
 // SetFilter replaces the allowlist.
 func (e *Engine) SetFilter(s keys.Set) {
+	// A key dropped from the allowlist mid-press would never see its Up.
+	e.releaseHeld("filter change")
 	e.mu.Lock()
 	e.filter = s
 	e.mu.Unlock()
@@ -316,6 +346,12 @@ func (e *Engine) Filter() keys.Set {
 // SetEnabled turns broadcasting on or off. Passthrough to the focused window
 // keeps working either way.
 func (e *Engine) SetEnabled(on bool) {
+	if !on {
+		// Turning broadcast off between a Down and its Up was the simplest
+		// way to strand a key: the Up arrived to a disabled engine and went
+		// nowhere.
+		e.releaseHeld("broadcast off")
+	}
 	e.mu.Lock()
 	e.enabled = on
 	e.mu.Unlock()
@@ -348,6 +384,12 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 }
 
+// releaseEnqueueWait is how long handle will wait for queue room for the Up
+// of a held key. Long enough to outlast a dance or an agent round trip,
+// short enough that a wedged worker cannot block passthrough: a key stuck
+// down is bad, and an unresponsive keyboard is worse.
+const releaseEnqueueWait = 250 * time.Millisecond
+
 func (e *Engine) handle(ev keys.Event) {
 	toggle := e.Config().ToggleKey
 	if toggle != 0 && ev.Code == toggle {
@@ -369,7 +411,11 @@ func (e *Engine) handle(ev keys.Event) {
 	enabled, filter := e.enabled, e.filter
 	e.mu.RUnlock()
 
-	if !enabled || ev.State == keys.Repeat || !filter.Allows(ev.Code) {
+	// A release of a key a target is holding bypasses every check below. The
+	// checks decide whether to START broadcasting a key; none of them is a
+	// reason to leave one held down.
+	release := e.isRelease(ev)
+	if !release && (!enabled || ev.State == keys.Repeat || !filter.Allows(ev.Code)) {
 		return
 	}
 
@@ -379,7 +425,17 @@ func (e *Engine) handle(ev keys.Event) {
 	select {
 	case e.queue <- ev:
 	default:
-		e.notify(fmt.Sprintf("broadcast queue full, dropped %v", ev), true)
+		if !release {
+			e.notify(fmt.Sprintf("broadcast queue full, dropped %v", ev), true)
+			return
+		}
+		// Dropping this would leave the key held. Wait for room — bounded,
+		// so a wedged worker still cannot block passthrough forever.
+		select {
+		case e.queue <- ev:
+		case <-time.After(releaseEnqueueWait):
+			e.notify(fmt.Sprintf("queue full for %s after %s — the key may be left held on its targets", ev, releaseEnqueueWait), true)
+		}
 	}
 }
 
@@ -430,15 +486,35 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 	opCtx, cancel := context.WithTimeout(ctx, cfg.OpTimeout)
 	defer cancel()
 
+	// A release goes to the windows that were sent the Down, whatever is
+	// ticked now: the targets may have changed, and the ones that left the
+	// list are precisely the ones nothing else will ever release.
+	release := e.isRelease(ev)
+	if release {
+		targets = e.heldTargets(ev.Code)
+		if len(targets) == 0 {
+			return
+		}
+	}
+
 	origin, ok := e.origin(opCtx, targets, cfg)
 	if !ok {
-		return
+		if !release {
+			return
+		}
+		// The gate closed, or the focused window cannot be read. Neither is a
+		// reason to leave a key down, so the release goes out with no origin
+		// to skip. The focused window may then get a second Up through
+		// delivery as well as passthrough; releasing an already-released key
+		// is a no-op, and a stuck key is not.
+		origin = ""
 	}
 
 	delivered, err := d.Deliver(opCtx, Delivery{Event: ev, Targets: targets, Origin: origin, Notify: e.notify})
 	if err != nil {
 		return // deliverer already reported the failure via notify
 	}
+	e.noteDelivered(ev, targets)
 	e.notify(fmt.Sprintf("%v -> %d target(s)", ev, delivered), false)
 }
 
@@ -474,6 +550,89 @@ func (e *Engine) origin(ctx context.Context, targets []WindowID, cfg Config) (Wi
 	}
 	e.gateBlocked = ""
 	return origin, true
+}
+
+// noteDelivered records the effect a delivered event had on the held set.
+//
+// Recorded for every target of the delivery, because Deliver reports a COUNT
+// and not which targets succeeded. The error is therefore towards releasing a
+// key no one holds, which is a no-op, rather than leaving one held.
+func (e *Engine) noteDelivered(ev keys.Event, targets []WindowID) {
+	e.heldMu.Lock()
+	defer e.heldMu.Unlock()
+	for _, id := range targets {
+		switch ev.State {
+		case keys.Down:
+			if e.held[id] == nil {
+				e.held[id] = map[keys.Code]bool{}
+			}
+			e.held[id][ev.Code] = true
+		case keys.Up:
+			if m := e.held[id]; m != nil {
+				delete(m, ev.Code)
+				if len(m) == 0 {
+					delete(e.held, id)
+				}
+			}
+		}
+	}
+}
+
+// heldTargets lists the targets holding one code down.
+func (e *Engine) heldTargets(c keys.Code) []WindowID {
+	e.heldMu.Lock()
+	defer e.heldMu.Unlock()
+	var out []WindowID
+	for id, m := range e.held {
+		if m[c] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// isRelease reports whether this event is the Up of a key some target is
+// holding down — the one event the engine must deliver regardless of every
+// other rule.
+func (e *Engine) isRelease(ev keys.Event) bool {
+	if ev.State != keys.Up {
+		return false
+	}
+	return len(e.heldTargets(ev.Code)) > 0
+}
+
+// releaseHeld queues an Up for every key any target is holding.
+//
+// Queued rather than delivered here: Deliverer.Deliver is documented as being
+// called from one worker goroutine, and this runs on whichever goroutine
+// changed the setting — the UI's. The worker then takes them through the
+// normal path, where isRelease waives the usual checks.
+//
+// Best effort by nature: it releases through whichever backend is current
+// when the worker gets to them, so a backend swap may release through the new
+// one. A release that reaches the window by a different route is still a
+// release.
+func (e *Engine) releaseHeld(why string) {
+	e.heldMu.Lock()
+	codes := map[keys.Code]bool{}
+	for _, m := range e.held {
+		for c := range m {
+			codes[c] = true
+		}
+	}
+	e.heldMu.Unlock()
+	if len(codes) == 0 {
+		return
+	}
+	n := 0
+	for c := range codes {
+		select {
+		case e.queue <- keys.Event{Code: c, State: keys.Up}:
+			n++
+		default:
+		}
+	}
+	e.notify(fmt.Sprintf("%s: releasing %d held key(s)", why, n), false)
 }
 
 func contains(ids []WindowID, id WindowID) bool {
