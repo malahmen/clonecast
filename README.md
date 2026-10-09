@@ -1,5 +1,7 @@
 # clonecast
 
+[![ci](https://github.com/malahmen/clonecast/actions/workflows/ci.yml/badge.svg)](https://github.com/malahmen/clonecast/actions/workflows/ci.yml)
+
 Broadcast your keyboard to several windows at once, from a lazygit-style terminal UI.
 
 Pick which running windows receive the keys, and which keys are broadcast: everything, or an explicit set such as `A B C F1`.
@@ -257,22 +259,43 @@ Layout:
 
 ```
 cmd/clonecast/           entrypoint, flags, backend selection (build tags)
+cmd/clonecast-agent/      the in-prefix agent; cross-compiled to windows/386
+cmd/kwindiag/            KWin scripting probe, for when window listing misbehaves
+cmd/e2ediag/             end-to-end delivery probe
 internal/keys/           key codes, names, and the allowlist (Set)
 internal/agentwire/      the clonecast <-> agent protocol: hello, keepalive, key frames (tested)
 internal/broadcast/      the engine: passthrough + focus-juggle delivery (tested)
+internal/redial/         the agent's reconnect backoff — reset by a session, not a dial (tested)
 internal/platform/agent/ the agent registry: agents connect here and are paired to windows (tested)
 internal/prefix/         Wine prefix discovery and `clonecast agent install` (tested)
-internal/platform/evdev/ Linux capture (grab) and injection (uinput clone)
-internal/platform/kwin/  Linux window listing/activation via KWin scripting over DBus
+internal/platform/evdev/ Linux capture (grab) and injection (uinput clone) (tested)
+internal/platform/kwin/  Linux window listing/activation via KWin scripting over DBus (tested)
 internal/platform/mock/  fake backend for development
+internal/platform/x11/   X11 helpers
 internal/tui/            Bubble Tea front end, incl. the Prefixes pane (tested)
 scripts/                 setup-bazzite.sh
 ```
 
+### Tests and CI
+
+**116 test functions** across 19 `_test.go` files, in ten packages. No
+display, no uinput, no DBus: window lists and key events are fabricated, and
+the TUI's end-to-end checks drive a pty.
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to
+`main`, every pull request, and on demand:
+
+| Step | Why |
+| --- | --- |
+| `gofmt` | formatting is checked, not assumed |
+| `go vet ./...` | |
+| `go test -race ./...` | the engine hands keys between a UI goroutine and one delivery worker, and holds two locks in a fixed order — `-race` is the only thing that keeps that honest |
+| `GOOS=windows GOARCH=386 go build ./cmd/clonecast-agent/` | the agent runs **inside** the Wine prefix, so a change that breaks its cross-compile breaks delivery, and nothing on a Linux runner would otherwise notice |
+
 ## Known limitations
 
 - **Modifiers are not tracked.** If `LEFTSHIFT` is not in your key set, targets get `a` when you type `A`. Add the modifier to the set, or use `all`.
-- **Held keys** reach targets as a single Down and a later Up, with the focus dance in between. Each target's own auto-repeat kicks in, but timing across targets is loose.
+- **Held keys** reach targets as a single Down and a later Up, with the focus dance in between. Each target's own auto-repeat kicks in, but timing across targets is loose. What is *not* a problem any more is losing the Up: a release is delivered regardless of the enabled, filter and gate checks, and toggling broadcast, changing the filter or changing the target list releases whatever is held first (REFERENCE.md 4.20). A dropped Down skips a keystroke; a dropped Up leaves the key held down **inside the game** — autorun engaged, a spell key stuck — with nothing in the log looking wrong.
 - **The terminal running clonecast** is a window like any other. Do not tick it as a target: with the origin gate on (the default) typing in it broadcasts nothing, which is the point, but ticking it would make it a real target.
 - **Wayland native only via KWin.** Any window KWin can list works, including XWayland ones. GNOME, Sway, Hyprland and gamescope are out of scope for now.
 - While broadcasting is on, the log records which broadcast keys were pressed. Turn it off before typing passwords.
