@@ -1,0 +1,43 @@
+name: ci
+
+# The suite is hermetic: no X11, no D-Bus, no Wine, no network. The KWin tests
+# exercise the reply plumbing without a session bus, the TUI tests drive a pty,
+# and the agent tests use loopback sockets.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        # -l lists files that differ from gofmt's output; any output is a failure.
+        run: |
+          out=$(gofmt -l ./cmd ./internal)
+          if [ -n "$out" ]; then echo "not gofmt'd:"; echo "$out"; exit 1; fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        # -race because three of the defects this suite was written for were
+        # data races or orderings, not wrong values.
+        run: go test -race ./...
+
+      - name: the agent still cross-compiles
+        # cmd/clonecast-agent is //go:build windows and is never built by the
+        # test run, so a break there would otherwise surface only at `make agent`.
+        run: GOOS=windows GOARCH=386 go build -o /dev/null ./cmd/clonecast-agent/
