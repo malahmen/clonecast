@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,10 +47,14 @@ const (
 
 // WM talks to KWin. Create with New, release with Close.
 type WM struct {
-	conn    *dbus.Conn
-	seq     atomic.Int64
-	mu      sync.Mutex
-	pending chan string
+	conn *dbus.Conn
+	seq  atomic.Int64
+	mu   sync.Mutex
+	// pending carries replies from KWin scripts, each tagged with the
+	// sequence number of the call it belongs to. Buffered rather than
+	// unbuffered so a late reply from a timed-out call cannot crowd out the
+	// one the current call is waiting for.
+	pending chan kwinReply
 	tmpDir  string
 
 	// haveXdotool caches whether `xdotool` is on PATH, checked once at New.
@@ -57,13 +62,34 @@ type WM struct {
 	haveXdotool bool
 }
 
+// kwinReply is one script's answer, with the call it answers.
+type kwinReply struct {
+	seq     int64
+	payload string
+}
+
 // callback is the object exported on the session bus for the KWin script to
 // hand results back. Method names must be exported and end with *dbus.Error.
 type callback struct{ wm *WM }
 
-func (c *callback) Result(payload string) *dbus.Error {
+// Result takes the sequence number as well as the payload.
+//
+// Without it, replies could be MISATTRIBUTED. One callback object is shared by
+// every script, `run` drained stale replies just before loading the next one,
+// and a script whose call had already timed out could then reply into that
+// window — so the next call read the previous call's answer. For Active() that
+// means a wrong origin, and a wrong origin means the key is delivered to the
+// window the user is actually playing on top of passthrough: a doubled
+// keystroke, which REFERENCE.md 4.15 exists to prevent and which a game does
+// not let you undo.
+func (c *callback) Result(seq string, payload string) *dbus.Error {
+	n, err := strconv.ParseInt(seq, 10, 64)
+	if err != nil {
+		// Unattributable, so dropped rather than guessed at.
+		return nil
+	}
 	select {
-	case c.wm.pending <- payload:
+	case c.wm.pending <- kwinReply{seq: n, payload: payload}:
 	default:
 	}
 	return nil
@@ -84,7 +110,7 @@ func New() (*WM, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("%s already owned: is another clonecast running?", busName)
 	}
-	wm := &WM{conn: conn, pending: make(chan string, 1)}
+	wm := &WM{conn: conn, pending: make(chan kwinReply, 8)}
 	if err := conn.Export(&callback{wm}, objPath, ifce); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("export callback: %w", err)
@@ -326,17 +352,26 @@ func (w *WM) run(ctx context.Context, body string) (string, error) {
 	plugin := fmt.Sprintf("clonecast-%d-%d", os.Getpid(), n)
 	path := filepath.Join(w.tmpDir, plugin+".js")
 
-	src := fmt.Sprintf(`function reply(s) { callDBus(%q, %q, %q, "Result", String(s)); }
-%s`, busName, objPath, ifce, strings.TrimSpace(body))
+	// The sequence number is baked into the script, so its reply identifies
+	// itself. Both arguments are strings: callDBus maps a JS number to a
+	// D-Bus type that need not match the exported signature, and the payload
+	// was already being stringified for the same reason.
+	src := fmt.Sprintf(`function reply(s) { callDBus(%q, %q, %q, "Result", String(%d), String(s)); }
+%s`, busName, objPath, ifce, n, strings.TrimSpace(body))
 	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
 		return "", err
 	}
 	defer os.Remove(path)
 
-	// drain a stale reply, if any
-	select {
-	case <-w.pending:
-	default:
+	// Drain anything earlier calls left behind. Not load-bearing any more —
+	// the sequence number is — but it keeps the buffer from filling with
+	// replies nothing will ever match.
+	for draining := true; draining; {
+		select {
+		case <-w.pending:
+		default:
+			draining = false
+		}
 	}
 
 	scripting := w.conn.Object(kwinService, scriptingPath)
@@ -355,10 +390,21 @@ func (w *WM) run(ctx context.Context, body string) (string, error) {
 		return "", fmt.Errorf("kwin run: %w", err)
 	}
 
-	select {
-	case out := <-w.pending:
-		return out, nil
-	case <-ctx.Done():
-		return "", fmt.Errorf("kwin script did not reply: %w", ctx.Err())
+	return w.awaitReply(ctx, n)
+}
+
+// awaitReply waits for the reply belonging to call n, discarding any that
+// belong to an earlier one.
+func (w *WM) awaitReply(ctx context.Context, n int64) (string, error) {
+	for {
+		select {
+		case r := <-w.pending:
+			if r.seq != n {
+				continue // a late reply from a call that already gave up
+			}
+			return r.payload, nil
+		case <-ctx.Done():
+			return "", fmt.Errorf("kwin script did not reply: %w", ctx.Err())
+		}
 	}
 }

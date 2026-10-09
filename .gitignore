@@ -1,3 +1,5 @@
 /bin/
 *.log
 .DS_Store
+# a bare `go build ./cmd/clonecast-agent` drops one here, not in bin/
+*.exe
