@@ -302,4 +302,4 @@ the TUI's end-to-end checks drive a pty.
 
 ## License
 
-Not chosen yet. See the open decisions in [REFERENCE.md](REFERENCE.md).
+[MIT](LICENSE) © 2026 malahmen.
