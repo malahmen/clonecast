@@ -60,6 +60,10 @@ type WM struct {
 	// haveXdotool caches whether `xdotool` is on PATH, checked once at New.
 	// See Activate's doc for what it's used for and why it's optional.
 	haveXdotool bool
+
+	// xfocus corrects Active with the X input focus; nil means KWin alone.
+	// See Active.
+	xfocus InputFocus
 }
 
 // kwinReply is one script's answer, with the call it answers.
@@ -171,13 +175,91 @@ func (w *WM) List(ctx context.Context) ([]broadcast.Window, error) {
 	return wins, nil
 }
 
-// Active returns the focused window's ID, or "" when nothing is focused.
+// InputFocus reports, as host pids, which X client XWayland is delivering
+// keyboard input to and which pids own X clients at all. Implemented by
+// x11.Focus; see SetInputFocus.
+type InputFocus interface {
+	Snapshot() (focusPID int, xPIDs map[int]bool, err error)
+}
+
+// SetInputFocus lets Active correct KWin's answer with the X input focus.
+// Without it Active is KWin's activeWindow alone.
+func (w *WM) SetInputFocus(f InputFocus) { w.xfocus = f }
+
+// Active returns the window keyboard input is going to — the master — or ""
+// when nothing is focused.
+//
+// That is KWin's activeWindow, except in one case (REFERENCE.md 4.22): KWin's
+// active window is an XWayland client and the X input focus belongs to a
+// DIFFERENT window's process. Switching between Wine clients with the mouse
+// was measured leaving KWin up to 2.5 s behind the X focus, and XWayland sends
+// keys to the X focus — so trusting KWin there made the engine skip a client
+// that was not receiving the keys and broadcast to the one that was, which
+// then got every key twice. A native Wayland window KWin reports as active
+// (the terminal running clonecast) is never overridden: the X focus can be
+// left on a game while the user types elsewhere, and the origin gate must
+// still see the terminal.
 func (w *WM) Active(ctx context.Context) (broadcast.WindowID, error) {
+	if w.xfocus == nil {
+		out, err := w.run(ctx, `
+			const a = workspace.activeWindow;
+			reply(a ? String(a.internalId) : "");
+		`)
+		return broadcast.WindowID(out), err
+	}
 	out, err := w.run(ctx, `
 		const a = workspace.activeWindow;
-		reply(a ? String(a.internalId) : "");
+		reply(JSON.stringify({
+			active: a ? {id: String(a.internalId), pid: a.pid} : null,
+			windows: workspace.windowList()
+				.filter(w => w.normalWindow)
+				.map(w => ({id: String(w.internalId), pid: w.pid})),
+		}));
 	`)
-	return broadcast.WindowID(out), err
+	if err != nil {
+		return "", err
+	}
+	var st activeState
+	if err := json.Unmarshal([]byte(out), &st); err != nil {
+		return "", fmt.Errorf("decode active window: %w", err)
+	}
+	focusPID, xPIDs, xerr := w.xfocus.Snapshot()
+	if xerr != nil {
+		// The X side is a correction, not the source: without it, KWin's
+		// answer is what clonecast always used.
+		focusPID, xPIDs = 0, nil
+	}
+	return pickActive(st, focusPID, xPIDs), nil
+}
+
+type pidWindow struct {
+	ID  string `json:"id"`
+	PID int    `json:"pid"`
+}
+
+type activeState struct {
+	Active  *pidWindow  `json:"active"`
+	Windows []pidWindow `json:"windows"`
+}
+
+// pickActive is Active's decision, kept free of D-Bus and X so it can be
+// tested on its own.
+func pickActive(st activeState, focusPID int, xPIDs map[int]bool) broadcast.WindowID {
+	if st.Active == nil {
+		return ""
+	}
+	kwinSays := broadcast.WindowID(st.Active.ID)
+	if focusPID <= 0 || st.Active.PID == focusPID || !xPIDs[st.Active.PID] {
+		return kwinSays
+	}
+	for _, win := range st.Windows {
+		if win.PID == focusPID {
+			return broadcast.WindowID(win.ID)
+		}
+	}
+	// The focus belongs to an X client with no normal window (XWayland's own,
+	// a tooltip): nothing better to offer than KWin's answer.
+	return kwinSays
 }
 
 // captionOf looks up a window by internalId and returns its caption,
