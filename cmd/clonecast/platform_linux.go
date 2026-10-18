@@ -49,12 +49,23 @@ func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 		_ = src.Close()
 		return nil, fmt.Errorf("kwin: %w", err)
 	}
+	// The master is KWin's active window, corrected by the X input focus
+	// when the two disagree between XWayland clients (REFERENCE.md 4.22).
+	// Optional: without an X server the master is KWin's answer alone.
+	closeFocus := func() {}
+	if f, err := x11.NewFocus(); err == nil {
+		wm.SetInputFocus(f)
+		closeFocus = func() { _ = f.Close() }
+	} else {
+		log.Infof("master: X input focus unavailable (%v); following KWin's active window only", err)
+	}
 	return &platform{
 		src:    src,
 		inj:    inj,
 		wm:     wm,
 		devCtl: deviceController{src: src},
 		close: func() {
+			closeFocus()
 			_ = wm.Close()
 			_ = inj.Close()
 			_ = src.Close()
