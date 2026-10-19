@@ -30,6 +30,13 @@ func listCandidates() ([]candidate, error) {
 	return nil, errors.New("keyboard discovery is only available on Linux")
 }
 
+// keypressTimeout and waitForKeyPress: the keypress picker is evdev, Linux only.
+const keypressTimeout = 0
+
+func waitForKeyPress(_ []candidate) (int, error) {
+	return -1, errors.New("picking a keyboard by keypress is only available on Linux")
+}
+
 // listKeyboards: evdev only builds on Linux.
 func listKeyboards() error {
 	return errors.New("--list-keyboards is only available on Linux")

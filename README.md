@@ -148,11 +148,22 @@ Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change).
 
 ## Choosing which keyboards to capture
 
-On the first run, if discovery finds more than one keyboard, clonecast lists
-them and asks which to capture, then remembers the answer in
-`~/.config/clonecast/clonecast.conf`. `--keyboard` overrides it for one run
-without changing the saved choice, and `--list-keyboards` prints the list on
-its own:
+On the first run, if discovery finds more than one keyboard, clonecast asks you
+to **press Shift on the keyboard you type on** and captures the device that key
+came from. One keyboard often exposes two event nodes that both claim the same
+keys, and only one of them carries the typing, so choosing from a list could
+pick the silent one and capture nothing (found on an ASUS Strix, whose
+`event10` node is the wrong one). With no key in 20 seconds, or nothing free to
+listen on, you get a numbered list instead.
+
+The answer is remembered in `~/.config/clonecast/clonecast.conf` by a name that
+stays the same across reboots: the device's `/dev/input/by-id/...` link when
+udev gives it one, otherwise `name:` and its device name (keyd's virtual
+keyboard, most Bluetooth keyboards). A `/dev/input/eventN` number is not saved:
+the numbers are handed out in probe order and change. A choice saved as a
+number by an older clonecast is not trusted either; clonecast says so and asks
+once more. `--keyboard` overrides the saved choice for one run, and
+`--list-keyboards` prints the list on its own:
 
 ```sh
 clonecast --list-keyboards
@@ -182,7 +193,7 @@ and changes the capture while clonecast runs:
 ```
 
 `space` captures or releases the highlighted device, `s` saves the current
-selection as the default for next time, `r` rescans. At least one device always
+selection as the default for next time (by the same stable name), `r` rescans. At least one device always
 stays captured: an empty set means "discover everything" further down, which is
 what this exists to avoid.
 
@@ -192,10 +203,12 @@ a mistyped device must not leave the engine with no keyboard. Passthrough is
 untouched by a switch: the virtual keyboard was cloned once at startup and does
 not depend on which device is currently grabbed.
 
-`--keyboard` names the devices explicitly, for a run or a script:
+`--keyboard` names the devices explicitly, for a run or a script, by path,
+by-id link or saved name:
 
 ```sh
-clonecast --keyboard /dev/input/event20,/dev/input/event6
+clonecast --keyboard /dev/input/by-id/usb-ASUS_ASUS_Strix_Tactic_Pro_Gaming_Keyboard-event-kbd
+clonecast --keyboard "name:keyd virtual keyboard"
 ```
 
 **With keyd or input-remapper**, capture the *virtual* device the remapper

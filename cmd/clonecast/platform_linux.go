@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -197,15 +198,57 @@ func listCandidates() ([]candidate, error) {
 	if err != nil {
 		return nil, err
 	}
+	byID := byIDLinks()
 	out := make([]candidate, 0, len(found))
 	for _, p := range found {
 		state := "free"
 		if err := evdev.CanGrab(p.Path); err != nil {
 			state = "BUSY (" + err.Error() + ")"
 		}
-		out = append(out, candidate{Path: p.Path, State: state, Name: p.Name})
+		id := byID[p.Path]
+		if id == "" {
+			id = "name:" + p.Name
+		}
+		out = append(out, candidate{Path: p.Path, State: state, Name: p.Name, ID: id})
 	}
 	return out, nil
+}
+
+// byIDLinks maps each device node to its /dev/input/by-id link — udev's
+// stable name, built from the device's bus, model and interface, so the two
+// nodes of one keyboard get different ones. Devices udev gives no such link
+// (keyd's virtual keyboard, most Bluetooth ones) are absent.
+func byIDLinks() map[string]string {
+	const dir = "/dev/input/by-id"
+	out := map[string]string{}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, e := range ents {
+		link := filepath.Join(dir, e.Name())
+		if target, err := filepath.EvalSymlinks(link); err == nil {
+			out[target] = link
+		}
+	}
+	return out
+}
+
+// keypressTimeout is how long the picker listens before offering a list.
+const keypressTimeout = 20 * time.Second
+
+// waitForKeyPress is the picker's "press a key on it", over the free
+// candidates. It then discards whatever the keypress typed into this
+// terminal, so a printable key cannot reach the TUI as its first input.
+func waitForKeyPress(free []candidate) (int, error) {
+	paths := make([]string, len(free))
+	for i, c := range free {
+		paths[i] = c.Path
+	}
+	i, err := evdev.WaitForKeyPress(paths, keypressTimeout)
+	time.Sleep(150 * time.Millisecond) // let the key's own characters arrive, then drop them
+	_ = unix.IoctlSetInt(int(os.Stdin.Fd()), unix.TCFLSH, unix.TCIFLUSH)
+	return i, err
 }
 
 // listKeyboards prints what discovery selects and whether each device can be
@@ -255,6 +298,11 @@ func (d deviceController) Captured() []string { return d.src.Paths() }
 // for exactly that reason at startup).
 func (d deviceController) Capture(paths []string) error { return d.src.Switch(paths...) }
 
+// Save remembers the choice by ID, as the startup picker does.
 func (d deviceController) Save(paths []string) error {
-	return configSet(kbdKey, strings.Join(paths, ","))
+	cands, err := listCandidates()
+	if err != nil {
+		return err
+	}
+	return saveKeyboards(cands, paths)
 }
