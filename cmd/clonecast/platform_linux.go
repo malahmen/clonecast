@@ -60,12 +60,24 @@ func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 	} else {
 		log.Infof("master: X input focus unavailable (%v); following KWin's active window only", err)
 	}
+	// A click must move the keyboard too, not just KWin's idea of the active
+	// window (REFERENCE.md 4.24). Optional, like the X focus above.
+	closeClick := func() {}
+	var setNotify func(func(string, bool))
+	if cf, err := x11.NewClickFocus(); err == nil {
+		closeClick = func() { _ = cf.Close() }
+		setNotify = func(n func(string, bool)) { cf.SetNotify(func(s string) { n(s, false) }) }
+	} else {
+		log.Infof("click focus unavailable (%v); a click may need repeating to move the keyboard", err)
+	}
 	return &platform{
-		src:    src,
-		inj:    inj,
-		wm:     wm,
-		devCtl: deviceController{src: src},
+		src:       src,
+		inj:       inj,
+		wm:        wm,
+		devCtl:    deviceController{src: src},
+		setNotify: setNotify,
 		close: func() {
+			closeClick()
 			closeFocus()
 			_ = wm.Close()
 			_ = inj.Close()

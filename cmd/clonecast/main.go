@@ -66,6 +66,9 @@ type platform struct {
 	// devCtl backs the Keyboards pane. nil on the mock backend, which has no
 	// evdev devices to offer — the pane then says so rather than pretending.
 	devCtl tui.DeviceController
+	// setNotify, when set, routes the platform's own notices to the engine's
+	// Log pane and log file. nil when the platform has none.
+	setNotify func(func(text string, isErr bool))
 }
 
 func main() {
@@ -160,6 +163,9 @@ func run() error {
 			log.Info(n.Text)
 		}
 	})
+	if p.setNotify != nil {
+		p.setNotify(engine.Notify)
+	}
 
 	// The agent registry listens for the whole run, whatever backend is
 	// selected: agents connect when their prefix boots, which may be long

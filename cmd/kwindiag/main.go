@@ -44,6 +44,14 @@
 //	    idea of what has focus, not from what X11 is actually delivering
 //	    input to.
 //
+//	kwindiag watch [seconds]
+//	    Read-only. Samples KWin's active window and the X input focus about
+//	    ten times a second and prints a line whenever either changes, with
+//	    the window each one names. KWin and X are joined by pid, as
+//	    clonecast's master decision is (REFERENCE.md 4.22), so a line where
+//	    the two disagree is a moment clonecast overrides KWin. seconds
+//	    defaults to 60.
+//
 // Requires a KWin Scripting session (i.e. running inside the real Plasma
 // session, not the mock backend) — same requirement as clonecast itself.
 package main
@@ -58,6 +66,8 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+
+	"github.com/malahmen/clonecast/internal/platform/x11"
 )
 
 const (
@@ -99,6 +109,8 @@ func main() {
 		cmdBounce(kw, os.Args[2:])
 	case "dance":
 		cmdDance(kw, os.Args[2:])
+	case "watch":
+		cmdWatch(kw, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -110,6 +122,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  kwindiag list")
 	fmt.Fprintln(os.Stderr, "  kwindiag bounce <id1> <id2> [rounds] [settleMs]")
 	fmt.Fprintln(os.Stderr, "  kwindiag dance <origin> <target> [rounds] [settleMs]")
+	fmt.Fprintln(os.Stderr, "  kwindiag watch [seconds]")
 }
 
 func fatalf(format string, args ...any) {
@@ -388,4 +401,63 @@ func cmdDance(kw *kwinClient, args []string) {
 	}
 
 	fmt.Printf("\n%d/%d rounds never moved real X11 focus at all despite KWin activity.\n", stuck, rounds)
+}
+
+// cmdWatch prints KWin's active window and the X input focus whenever either
+// changes, until the time is up. It never activates anything.
+func cmdWatch(kw *kwinClient, args []string) {
+	secs := 60
+	if len(args) > 0 {
+		if _, err := fmt.Sscan(args[0], &secs); err != nil || secs <= 0 {
+			fatalf("seconds: %q is not a positive number", args[0])
+		}
+	}
+	xf, err := x11.NewFocus()
+	if err != nil {
+		fatalf("x11: %v", err)
+	}
+	defer func() { _ = xf.Close() }()
+
+	name := func(wins []wire, pid int) string {
+		for _, w := range wins {
+			if w.PID == pid {
+				return fmt.Sprintf("%q (pid %d)", w.Title, pid)
+			}
+		}
+		return fmt.Sprintf("pid %d (no window)", pid)
+	}
+	fmt.Printf("watching for %ds; click between the clients now\n", secs)
+	t0 := time.Now()
+	last := ""
+	for time.Since(t0) < time.Duration(secs)*time.Second {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		wins, err := kw.list(ctx)
+		cancel()
+		line := ""
+		if err != nil {
+			line = "kwin: " + err.Error()
+		} else {
+			kwinPID := 0
+			for _, w := range wins {
+				if w.Active {
+					kwinPID = w.PID
+				}
+			}
+			focusPID, _, xerr := xf.Snapshot()
+			xs := name(wins, focusPID)
+			if xerr != nil {
+				xs = "error: " + xerr.Error()
+			}
+			mark := "  "
+			if xerr == nil && kwinPID != focusPID {
+				mark = "!="
+			}
+			line = fmt.Sprintf("%s kwin %s   x focus %s", mark, name(wins, kwinPID), xs)
+		}
+		if line != last {
+			fmt.Printf("%6.2fs %s\n", time.Since(t0).Seconds(), line)
+			last = line
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
