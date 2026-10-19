@@ -151,6 +151,15 @@ func run() error {
 	defer p.close()
 
 	engine := broadcast.New(p.src, p.inj, p.wm, cfg)
+	// Notices are what the README sends people to the log file for: agent
+	// registrations, pairing, the origin gate, delivery failures.
+	engine.SetNoticeSink(func(n broadcast.Notice) {
+		if n.Err {
+			log.Warn(n.Text)
+		} else {
+			log.Info(n.Text)
+		}
+	})
 
 	// The agent registry listens for the whole run, whatever backend is
 	// selected: agents connect when their prefix boots, which may be long
@@ -171,8 +180,7 @@ func run() error {
 		if *backend != "mock" {
 			return err
 		}
-		log.Warn("agent registry", "err", err)
-		engine.Notify(err.Error(), true)
+		engine.Notify("agent registry: "+err.Error(), true)
 	}
 	if *keySpec != "" {
 		set, err := keys.ParseSet(*keySpec)
@@ -195,8 +203,7 @@ func run() error {
 	if warn != "" {
 		// Not fatal: an agent registers on its own schedule, so this is a
 		// state the run can grow out of without a restart.
-		engine.Notify(warn, true)
-		log.Warn(warn)
+		engine.Notify(warn, true) // to the log file too, through the sink
 	}
 	engineErr := make(chan error, 1)
 	go func() { engineErr <- engine.Run(ctx) }()

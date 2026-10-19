@@ -144,7 +144,7 @@ The Prefixes panel is where that agent gets there in the first place: install, u
 
 The toggle hotkey (`SCROLLLOCK` by default) works from any window and is never delivered anywhere.
 
-Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change).
+Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change): agent registrations and how each was paired, the origin gate, broadcast on/off and delivery errors — everything the Log pane shows except the per-key `A down -> 2 target(s)` lines, which are kept off disk (see "Security and privacy" in REFERENCE.md 8).
 
 ## Choosing which keyboards to capture
 

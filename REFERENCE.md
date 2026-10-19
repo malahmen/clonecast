@@ -303,6 +303,6 @@ Build constraints discovered 2026-09-09:
 
 ## 8. Security and privacy notes
 
-- Grabbing the keyboard means clonecast sees every keystroke, including passwords. Passthrough is not logged. Broadcast events are logged as key names (e.g. `A down -> 2 target(s)`) while broadcasting is on. Turn broadcasting off before typing secrets.
+- Grabbing the keyboard means clonecast sees every keystroke, including passwords. Passthrough is not logged. Broadcast events are shown as key names (e.g. `A down -> 2 target(s)`) in the TUI's Log pane while broadcasting is on, and never written to the log file, which gets every other notice (2026-10-18). Turn broadcasting off before typing secrets.
 - The DBus name `org.malahmen.clonecast` is claimed exclusively; a second instance fails to start rather than fighting over callbacks.
 - KWin scripts are written to a private temp dir (`0600`) and removed after each run.

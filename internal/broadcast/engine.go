@@ -170,6 +170,9 @@ type Engine struct {
 	enabled bool
 
 	notices chan Notice
+	// noticeSink, when set, also receives every notice except the per-key
+	// delivery line (see SetNoticeSink). Set once, before Run.
+	noticeSink func(Notice)
 
 	// focusMu is held by a dance for its entire duration — from before it
 	// reads the origin window through the final restore — and by
@@ -515,7 +518,7 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 		return // deliverer already reported the failure via notify
 	}
 	e.noteDelivered(ev, targets)
-	e.notify(fmt.Sprintf("%v -> %d target(s)", ev, delivered), false)
+	e.notifyKey(fmt.Sprintf("%v -> %d target(s)", ev, delivered))
 }
 
 // origin resolves the master window for this broadcast and applies the origin
@@ -654,11 +657,32 @@ func (e *Engine) passthroughEmit(ev keys.Event) error {
 }
 
 func (e *Engine) notify(text string, isErr bool) {
+	n := Notice{Time: time.Now(), Text: text, Err: isErr}
+	if e.noticeSink != nil {
+		e.noticeSink(n)
+	}
 	select {
-	case e.notices <- Notice{Time: time.Now(), Text: text, Err: isErr}:
+	case e.notices <- n:
 	default:
 	}
 }
+
+// notifyKey is notify for the line each broadcast key produces: the UI only,
+// never the sink. Written to the log file it would be a record on disk of
+// every key broadcast, which REFERENCE.md 8 promises not to keep.
+func (e *Engine) notifyKey(text string) {
+	select {
+	case e.notices <- Notice{Time: time.Now(), Text: text}:
+	default:
+	}
+}
+
+// SetNoticeSink also hands every notice — agent registrations, pairing,
+// gate and delivery errors — to sink, which clonecast uses to put them in its
+// log file. They used to reach only the TUI's Log pane, so the file the README
+// sends people to held nothing but startup warnings. Per-key lines are left
+// out (see notifyKey). Call before Run; sink must not block.
+func (e *Engine) SetNoticeSink(sink func(Notice)) { e.noticeSink = sink }
 
 func sleep(ctx context.Context, d time.Duration) {
 	if d <= 0 {
