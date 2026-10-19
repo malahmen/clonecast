@@ -54,3 +54,15 @@ func TestPickActive(t *testing.T) {
 		})
 	}
 }
+
+// Kamino item 110: one process with two normal windows (a game and its
+// dialog). The X focus pid matches both and cannot say which has the focus,
+// so the first match is no answer: KWin's is kept. Listed with the dialog
+// first, which the old loop returned.
+func TestPickActiveSeveralWindowsInTheFocusedProcess(t *testing.T) {
+	dialog := pidWindow{ID: "{almerinda-dialog}", PID: almerinda.PID}
+	st := activeState{Active: &malahmen, Windows: []pidWindow{dialog, malahmen, marx, almerinda, konsole}}
+	if got := pickActive(st, almerinda.PID, xPIDs); got != "{malahmen}" {
+		t.Fatalf("pickActive = %q, want KWin's {malahmen}", got)
+	}
+}

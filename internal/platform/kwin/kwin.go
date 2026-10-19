@@ -252,14 +252,23 @@ func pickActive(st activeState, focusPID int, xPIDs map[int]bool) broadcast.Wind
 	if focusPID <= 0 || st.Active.PID == focusPID || !xPIDs[st.Active.PID] {
 		return kwinSays
 	}
+	var match broadcast.WindowID
+	n := 0
 	for _, win := range st.Windows {
 		if win.PID == focusPID {
-			return broadcast.WindowID(win.ID)
+			match = broadcast.WindowID(win.ID)
+			n++
 		}
 	}
-	// The focus belongs to an X client with no normal window (XWayland's own,
-	// a tooltip): nothing better to offer than KWin's answer.
-	return kwinSays
+	// Exactly one window must match. With none, the focus belongs to an X
+	// client with no normal window (XWayland's own, a tooltip). With several,
+	// one process owns more than one window (a game and its dialog) and the
+	// pid cannot say which has the focus: guessing the first could name the
+	// dialog (Kamino item 110). Either way KWin's answer is the better one.
+	if n != 1 {
+		return kwinSays
+	}
+	return match
 }
 
 // captionOf looks up a window by internalId and returns its caption,
