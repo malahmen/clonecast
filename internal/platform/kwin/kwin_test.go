@@ -102,3 +102,66 @@ func TestAStaleReplyDoesNotCrowdOutTheRealOne(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, "real")
 	}
 }
+
+// Kamino item 14: Active is answered from what the persistent script pushed,
+// with no D-Bus call (this WM has no connection: one would panic).
+func TestActiveIsAnsweredFromThePushedState(t *testing.T) {
+	w := newTestWM()
+	cb := &callback{w}
+	if err := cb.Result(watchSeq, `{"active":{"id":"{marx}","pid":1891544},"windows":[{"id":"{marx}","pid":1891544},{"id":"{malahmen}","pid":1890200}]}`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := w.Active(context.Background())
+	if err != nil || got != "{marx}" {
+		t.Fatalf("Active = %q, %v; want {marx}", got, err)
+	}
+
+	// With the X focus correction, from the same cache.
+	w.SetInputFocus(fakeFocus{pid: 1890200, x: map[int]bool{1891544: true, 1890200: true}})
+	if got, _ := w.Active(context.Background()); got != "{malahmen}" {
+		t.Errorf("Active with the X focus on malahmen = %q", got)
+	}
+
+	if err := cb.Result(watchSeq, `{"active":null,"windows":[]}`); err != nil {
+		t.Fatal(err)
+	}
+	w.SetInputFocus(nil)
+	if got, err := w.Active(context.Background()); err != nil || got != "" {
+		t.Errorf("nothing active: Active = %q, %v", got, err)
+	}
+}
+
+func TestABadPushOrAKWinRestartEmptiesTheCache(t *testing.T) {
+	w := newTestWM()
+	cb := &callback{w}
+	_ = cb.Result(watchSeq, `{"active":{"id":"{marx}","pid":1}}`)
+	if _, ok := w.watch.state(); !ok {
+		t.Fatal("a good push left no state")
+	}
+	w.watch.invalidate()
+	if _, ok := w.watch.state(); ok {
+		t.Error("the cache survived KWin going away")
+	}
+	_ = cb.Result(watchSeq, `not json`)
+	if _, ok := w.watch.state(); ok {
+		t.Error("a payload that does not decode was taken")
+	}
+}
+
+// A push must not be read as a one-shot script's reply.
+func TestAPushIsNotAReply(t *testing.T) {
+	w := newTestWM()
+	_ = (&callback{w}).Result(watchSeq, `{"active":null,"windows":[]}`)
+	select {
+	case r := <-w.pending:
+		t.Fatalf("the push reached the replies: %+v", r)
+	default:
+	}
+}
+
+type fakeFocus struct {
+	pid int
+	x   map[int]bool
+}
+
+func (f fakeFocus) Snapshot() (int, map[int]bool, error) { return f.pid, f.x, nil }

@@ -308,6 +308,19 @@ func (e *Engine) SetGateOrigin(on bool) {
 	e.notify("origin gate "+onOff(on), false)
 }
 
+// SetMasterByAgent switches Config.MasterByAgent while running. Turning it off
+// releases what is held: a key the master got through its agent would
+// otherwise have its Up go through passthrough, which that game never sees.
+func (e *Engine) SetMasterByAgent(on bool) {
+	if !on {
+		e.releaseHeld("master by agent off")
+	}
+	e.mu.Lock()
+	e.cfg.MasterByAgent = on
+	e.mu.Unlock()
+	e.notify("master by agent "+onOff(on), false)
+}
+
 // GateOrigin reports whether broadcasting is gated on the focused window
 // being a ticked target.
 func (e *Engine) GateOrigin() bool {

@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 // RunServicesKey is the autostart key processed by `wineboot --init`.
@@ -56,6 +57,13 @@ type RegFile struct {
 	Arch   string // from "#arch=..." in the header, e.g. "win64"
 	header []string
 	blocks []*regBlock
+
+	// What the file was on disk when it was read, so Save can refuse to
+	// overwrite a file something else rewrote in between: a wineserver that
+	// started after the "is this prefix running?" check flushes the registry
+	// from memory (Kamino item 42).
+	loadedMod  time.Time
+	loadedSize int64
 }
 
 type regBlock struct {
@@ -65,11 +73,17 @@ type regBlock struct {
 
 // LoadRegFile reads and parses a Wine registry file.
 func LoadRegFile(path string) (*RegFile, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return ParseRegFile(path, string(b)), nil
+	f := ParseRegFile(path, string(b))
+	f.loadedMod, f.loadedSize = info.ModTime(), info.Size()
+	return f, nil
 }
 
 // ParseRegFile parses the contents of a Wine registry file.
@@ -186,6 +200,9 @@ func (f *RegFile) Save() error {
 	info, err := os.Stat(f.Path)
 	if err != nil {
 		return err
+	}
+	if !f.loadedMod.IsZero() && (!info.ModTime().Equal(f.loadedMod) || info.Size() != f.loadedSize) {
+		return fmt.Errorf("%s changed on disk since it was read (did the prefix start?); nothing written, run it again", f.Path)
 	}
 	if orig, err := os.ReadFile(f.Path); err == nil {
 		bak := f.Path + ".clonecast.bak"
@@ -309,10 +326,12 @@ func parseValueLine(line string) (name, data string, ok bool) {
 	return "", "", false
 }
 
-// quoteRegString renders a Go string as a quoted Wine registry string.
-// Wine's own dumper escapes the backslash, the quote and the control
-// characters; ASCII text needs nothing more, and agent command lines are
-// ASCII (paths under drive_c, a port number, a window title).
+// quoteRegString renders a Go string as a quoted Wine registry string, escaped
+// the way Wine's own dumper does it (dump_strW in Wine's server/unicode.c):
+// the backslash and the quote get a backslash, control characters and
+// everything from 127 up become \xNNNN UTF-16 code units. Wine's loader
+// (parse_strW) reads any other byte as one code unit, so raw UTF-8 for a
+// non-ASCII window title would come back garbled (Kamino item 43).
 func quoteRegString(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
@@ -335,8 +354,10 @@ func escapeRegBody(s string) string {
 		case '\t':
 			b.WriteString(`\t`)
 		default:
-			if r < 0x20 {
-				fmt.Fprintf(&b, `\x%04x`, r)
+			if r < 0x20 || r >= 0x7f {
+				for _, u := range utf16.Encode([]rune{r}) {
+					fmt.Fprintf(&b, `\x%04x`, u)
+				}
 				continue
 			}
 			b.WriteRune(r)
@@ -396,17 +417,22 @@ func unescapeReg(s string) (string, bool) {
 			b.WriteByte(11)
 		case 'x':
 			// \xNNNN (up to four hex digits), Wine's escape for anything
-			// outside printable ASCII.
-			n := 0
-			var v rune
-			for n < 4 && i+1 < len(s) && isHex(s[i+1]) {
-				i++
-				v = v<<4 | rune(hexVal(s[i]))
-				n++
-			}
+			// outside printable ASCII: one UTF-16 code unit, so a character
+			// beyond U+FFFF is two of them in a row.
+			v, n := hexUnit(s, i+1)
 			if n == 0 {
 				b.WriteByte('x')
 				continue
+			}
+			i += n
+			if utf16.IsSurrogate(v) && i+2 < len(s) && s[i+1] == '\\' && s[i+2] == 'x' {
+				if lo, m := hexUnit(s, i+3); m > 0 {
+					if r := utf16.DecodeRune(v, lo); r != '\uFFFD' {
+						b.WriteRune(r)
+						i += 2 + m
+						continue
+					}
+				}
 			}
 			b.WriteRune(v)
 		default:
@@ -414,6 +440,17 @@ func unescapeReg(s string) (string, bool) {
 		}
 	}
 	return b.String(), true
+}
+
+// hexUnit reads up to four hex digits of s from i, and how many it read.
+func hexUnit(s string, i int) (rune, int) {
+	var v rune
+	n := 0
+	for n < 4 && i+n < len(s) && isHex(s[i+n]) {
+		v = v<<4 | rune(hexVal(s[i+n]))
+		n++
+	}
+	return v, n
 }
 
 func isHex(c byte) bool {

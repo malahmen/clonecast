@@ -10,9 +10,10 @@
 // temp file, asks KWin to load and run it, and receives the result on a DBus
 // object clonecast exports on the session bus.
 //
-// This is the slow path (a script load per operation, typically a few
-// milliseconds). It is good enough to prove the concept; see REFERENCE.md for
-// the planned optimisations.
+// That is a script load per operation, a few milliseconds each. The one asked
+// per key, Active, is answered from a cache instead: one script stays loaded
+// for the whole run and pushes KWin's active window and window list whenever
+// they change (watch.go, Kamino item 14).
 package kwin
 
 import (
@@ -62,8 +63,12 @@ type WM struct {
 	haveXdotool bool
 
 	// xfocus corrects Active with the X input focus; nil means KWin alone.
-	// See Active.
-	xfocus InputFocus
+	// See Active. correct, when set, says whether to apply it right now.
+	xfocus  InputFocus
+	correct func() bool
+
+	// watch is what the persistent script last pushed; see watch.go.
+	watch watcher
 }
 
 // kwinReply is one script's answer, with the call it answers.
@@ -87,6 +92,10 @@ type callback struct{ wm *WM }
 // keystroke, which REFERENCE.md 4.15 exists to prevent and which a game does
 // not let you undo.
 func (c *callback) Result(seq string, payload string) *dbus.Error {
+	if seq == watchSeq {
+		c.wm.watch.update(payload)
+		return nil
+	}
 	n, err := strconv.ParseInt(seq, 10, 64)
 	if err != nil {
 		// Unattributable, so dropped rather than guessed at.
@@ -127,11 +136,13 @@ func New() (*WM, error) {
 	if _, err := exec.LookPath("xdotool"); err == nil {
 		wm.haveXdotool = true
 	}
+	wm.startWatch()
 	return wm, nil
 }
 
 // Close releases the bus name and temp files.
 func (w *WM) Close() error {
+	w.stopWatch()
 	_, _ = w.conn.ReleaseName(busName)
 	_ = os.RemoveAll(w.tmpDir)
 	return w.conn.Close()
@@ -183,8 +194,21 @@ type InputFocus interface {
 }
 
 // SetInputFocus lets Active correct KWin's answer with the X input focus.
-// Without it Active is KWin's activeWindow alone.
+// Without it Active is KWin's activeWindow alone. Call before Active is used.
 func (w *WM) SetInputFocus(f InputFocus) { w.xfocus = f }
+
+// SetCorrectWhen makes the X focus correction conditional: with
+// --master-by-agent the master is KWin's active window alone, and that can be
+// switched while running. Call before Active is used.
+func (w *WM) SetCorrectWhen(f func() bool) { w.correct = f }
+
+// focus is the X focus to correct with right now, nil for none.
+func (w *WM) focus() InputFocus {
+	if w.correct != nil && !w.correct() {
+		return nil
+	}
+	return w.xfocus
+}
 
 // Active returns the window keyboard input is going to — the master — or ""
 // when nothing is focused.
@@ -200,7 +224,22 @@ func (w *WM) SetInputFocus(f InputFocus) { w.xfocus = f }
 // left on a game while the user types elsewhere, and the origin gate must
 // still see the terminal.
 func (w *WM) Active(ctx context.Context) (broadcast.WindowID, error) {
-	if w.xfocus == nil {
+	xfocus := w.focus()
+	if st, ok := w.watch.state(); ok {
+		if xfocus == nil {
+			if st.Active == nil {
+				return "", nil
+			}
+			return broadcast.WindowID(st.Active.ID), nil
+		}
+		focusPID, xPIDs, xerr := xfocus.Snapshot()
+		if xerr != nil {
+			focusPID, xPIDs = 0, nil
+		}
+		return pickActive(st, focusPID, xPIDs), nil
+	}
+	w.rewatch()
+	if xfocus == nil {
 		out, err := w.run(ctx, `
 			const a = workspace.activeWindow;
 			reply(a ? String(a.internalId) : "");
@@ -223,7 +262,7 @@ func (w *WM) Active(ctx context.Context) (broadcast.WindowID, error) {
 	if err := json.Unmarshal([]byte(out), &st); err != nil {
 		return "", fmt.Errorf("decode active window: %w", err)
 	}
-	focusPID, xPIDs, xerr := w.xfocus.Snapshot()
+	focusPID, xPIDs, xerr := xfocus.Snapshot()
 	if xerr != nil {
 		// The X side is a correction, not the source: without it, KWin's
 		// answer is what clonecast always used.

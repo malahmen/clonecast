@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/malahmen/clonecast/internal/broadcast"
@@ -126,6 +127,38 @@ func (b *backends) use(name string) error {
 	return nil
 }
 
+// XsendSpec is the xsend title map in use (--xsend).
+func (b *backends) XsendSpec() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.xsendSpec
+}
+
+// SetXsendSpec changes the xsend title map from the TUI. An xsend backend
+// already built is dropped so the next use builds it with the new map, and
+// rebuilt at once if it is the one delivering.
+func (b *backends) SetXsendSpec(spec string) error {
+	if _, err := parseTitleMap(spec); err != nil {
+		return fmt.Errorf("xsend map: %w", err)
+	}
+	b.mu.Lock()
+	b.xsendSpec = spec
+	if cl, ok := b.close[deliverXsend]; ok {
+		cl()
+		delete(b.close, deliverXsend)
+		delete(b.made, deliverXsend)
+	}
+	inUse := b.cur == deliverXsend
+	if inUse {
+		b.cur = ""
+	}
+	b.mu.Unlock()
+	if inUse {
+		return b.use(deliverXsend)
+	}
+	return nil
+}
+
 // Close releases every backend that was built. The agent registry is not one
 // of them: it belongs to the run, not to the backend, so agents stay connected
 // while the user tries another backend.
@@ -163,4 +196,33 @@ func errNoAgentsRegistered(addr string) error {
     Until then, fall back to the legacy focus dance with
         clonecast --deliver dance
     (the dance moves real focus per key: slow, and rejected for multiboxing — see REFERENCE.md 4.11/4.12)`, addr, tui.AgentMark)
+}
+
+// parseTitleMap parses "Title A=val,Title B=val2" into a map. Keys and values
+// are trimmed; empty entries are ignored. A key may contain spaces (window
+// titles do); only the first '=' separates key from value.
+//
+// Only --xsend uses this now: the agent backend's title map is gone, replaced
+// by agents that register themselves and are paired by prefix (REFERENCE.md
+// 4.17). It lives here, not with xsend, because the TUI can change the map
+// and is checked on every platform.
+func parseTitleMap(spec string) (map[string]string, error) {
+	m := map[string]string{}
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		eq := strings.IndexByte(part, '=')
+		if eq < 0 {
+			return nil, fmt.Errorf("entry %q has no '='", part)
+		}
+		key := strings.TrimSpace(part[:eq])
+		val := strings.TrimSpace(part[eq+1:])
+		if key == "" || val == "" {
+			return nil, fmt.Errorf("entry %q has an empty key or value", part)
+		}
+		m[key] = val
+	}
+	return m, nil
 }

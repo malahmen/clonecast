@@ -52,6 +52,7 @@ import (
 
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/keys"
+	"github.com/malahmen/clonecast/internal/logcap"
 	"github.com/malahmen/clonecast/internal/platform/agent"
 	"github.com/malahmen/clonecast/internal/tui"
 )
@@ -145,7 +146,7 @@ func run() error {
 		// what made every keypress arrive twice.
 		var kbd []string
 		if kbd, err = resolveKeyboards(*kbdSpec); err == nil {
-			p, err = newLinuxPlatform(*masterByAgent, kbd...)
+			p, err = newLinuxPlatform(kbd...)
 		}
 	default:
 		err = fmt.Errorf("unknown backend %q", *backend)
@@ -156,6 +157,12 @@ func run() error {
 	defer p.close()
 
 	engine := broadcast.New(p.src, p.inj, p.wm, cfg)
+	// With master by agent on, the master is KWin's active window alone, not
+	// corrected by the X focus (REFERENCE.md 4.25); the Settings pane can
+	// switch it while running.
+	if c, ok := p.wm.(interface{ SetCorrectWhen(func() bool) }); ok {
+		c.SetCorrectWhen(func() bool { return !engine.Config().MasterByAgent })
+	}
 	// Notices are what the README sends people to the log file for: agent
 	// registrations, pairing, the origin gate, delivery failures.
 	engine.SetNoticeSink(func(n broadcast.Notice) {
@@ -173,9 +180,14 @@ func run() error {
 	// selected: agents connect when their prefix boots, which may be long
 	// before (or after) the user switches delivery to them, and the TUI marks
 	// the windows they cover either way.
+	token, err := agentToken()
+	if err != nil {
+		return err
+	}
 	agents := agent.NewRegistry(agent.Options{
 		Windows: p.wm.List,
 		Notify:  engine.Notify,
+		Token:   token,
 	})
 	defer agents.Close()
 	if err := agents.Listen(*listen); err != nil {
@@ -223,6 +235,7 @@ func run() error {
 		Port:    func() int { return portFromAddr(agents.Addr()) },
 		Title:   *agentTitle,
 		WineCmd: *agentWine,
+		Token:   token,
 	}
 	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents, prefixCfg, p.devCtl), tea.WithAltScreen())
 	go func() {
@@ -275,11 +288,14 @@ func defaultLogPath() string {
 	return filepath.Join(dir, "clonecast", "clonecast.log")
 }
 
+// logCap is the log's size cap; the full one is kept as <log>.1.
+const logCap = 10 << 20
+
 func setupLog(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := logcap.Open(path, logCap)
 	if err != nil {
 		return err
 	}

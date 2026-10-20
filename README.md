@@ -70,7 +70,10 @@ running prefixes, `p` points at any prefix by path (including an idle one
 for that prefix — installed or not, autostart entry, running or idle — is
 fetched automatically as you move, so there's no separate "status" keypress.
 `--agent-exe`/`--agent-title`/`--agent-wine` seed that pane's install
-defaults the same way `--exe`/`--title`/`--wine` do for the CLI subcommand.
+defaults the same way `--exe`/`--title`/`--wine` do for the CLI subcommand,
+and the pane changes every install option itself: `t` title, `w` wine
+command, `x` agent exe, `n` registry value name, `o` cycles the route
+(auto, file, reg), `a` assume idle, `K` keep the exe on uninstall.
 
 `install` copies the agent to `<prefix>/drive_c/clonecast/` and registers it
 under `HKLM\Software\Microsoft\Windows\CurrentVersion\RunServices`, so it
@@ -87,6 +90,14 @@ the host pid KWin gets from the X server), falling back to matching the window
 title when the pid or its environment cannot be read. So there is no per-instance
 port and no title→port map: a window with a live agent is marked `●` in the
 Targets list, and ticking it is the only action.
+
+**Only your agents can register.** `install` also writes a secret beside the
+agent (`drive_c/clonecast/token`, readable by you only), the same one clonecast
+keeps in `~/.config/clonecast/agent-token`, created on first use. An agent that
+does not send it is refused, and the log says to install it again. clonecast
+listens on loopback addresses only, and refuses any other `--listen`. An agent
+installed with v1.0.0 or earlier has no token: install it again (the game must
+restart for the new agent to start).
 
 The agent retries the connection with backoff forever, so it does not matter
 whether clonecast or the game starts first. `agent install --port N` is
@@ -117,7 +128,7 @@ clonecast --agent-exe ./bin/clonecast-agent.exe --agent-wine "flatpak run --comm
                                   # install defaults for the TUI's Prefixes pane
 ```
 
-Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the settle delay, the toggle hotkey and the agent listen address are all editable at runtime in the TUI's Settings pane. `--master-by-agent` is set at start only.
+Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the settle delay, the toggle hotkey, the agent listen address, master by agent and the xsend map are all editable at runtime in the TUI's Settings pane.
 
 Key names are Linux `KEY_*` names without the prefix, case insensitive: `a`, `F1`, `LEFTSHIFT`, `SPACE`, `KP1`.
 
@@ -133,18 +144,20 @@ Inside the TUI:
 | `e`                 | in Keys: edit the key set; in Settings: type an exact value — settle delay, toggle key, listen address (`enter` applies, `esc` cancels) |
 | `i` / `u`           | in Prefixes: install / uninstall the agent in the selected prefix             |
 | `p`                 | in Prefixes: point at a prefix by path instead of the running-process list (`enter` applies, `esc` cancels) |
+| `t` `w` `x` `n`     | in Prefixes: edit the install's window title, wine command, agent exe, registry value name |
+| `o` / `a` / `K`     | in Prefixes: cycle the install route; toggle assume idle; toggle keep the exe on uninstall |
 | `b`                 | broadcasting on/off (same as the toggle hotkey)                               |
 | `g`                 | origin gate on/off (from any panel)                                           |
 | `r`                 | in Targets/Keys/Settings: refresh the window list; in Prefixes: rescan running prefixes (both also auto-refresh) |
 | `q`                 | quit                                                                          |
 
-The Settings panel holds the runtime-tunable options: delivery backend, origin gate, settle delay, toggle hotkey and the address agents connect to — and shows how many agents are registered. \
+The Settings panel holds the runtime-tunable options: delivery backend, origin gate, settle delay, toggle hotkey, the address agents connect to, master by agent (`space` switches it) and the xsend title map (`e`) — and shows how many agents are registered. \
 In the Targets list, `M` marks the master, `[x]` a ticked target and `●` a window that has a live in-bottle agent. A ticked window with no agent says `no agent` on its own row: tick it and nothing will reach it until an agent for that prefix registers. \
 The Prefixes panel is where that agent gets there in the first place: install, uninstall and status for a Wine prefix, without leaving the TUI (see "The in-bottle agent" above).
 
 The toggle hotkey (`SCROLLLOCK` by default) works from any window and is never delivered anywhere.
 
-Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change): agent registrations and how each was paired, the origin gate, broadcast on/off and delivery errors — everything the Log pane shows except the per-key `A down -> 2 target(s)` lines, which are kept off disk (see "Security and privacy" in REFERENCE.md 8).
+Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change): agent registrations and how each was paired, the origin gate, broadcast on/off and delivery errors — everything the Log pane shows except the per-key `A down -> 2 target(s)` lines, which are kept off disk (see "Security and privacy" in REFERENCE.md 8). The log is capped at 10 MB, and each agent's at 1 MB: at the cap the file becomes `<log>.1`, replacing the previous one, and a new one starts.
 
 ## Choosing which keyboards to capture
 
@@ -238,16 +251,22 @@ Before trusting it with anything:
 
 If a target ignores the injected key, that application reads input in a way uinput cannot satisfy (rare). Note it in an issue.
 
-A running prefix no longer has to be closed first. Editing its `system.reg`
-while a wineserver holds it would be discarded on shutdown, so clonecast
-registers through the prefix's own wine instead — found in its process list,
-since Bottles launches `wineserver` by absolute path and `wine` is its sibling.
-The install then reports that the game must be **restarted** for the agent to
-start: an agent is launched by the prefix booting, and never attaches to a
-prefix already running.
+A running prefix does not have to be closed first, for install or uninstall.
+Editing its `system.reg` while a wineserver holds it would be discarded on
+shutdown, so clonecast goes through the prefix's own wine instead — found in
+its process list, since Bottles launches `wineserver` by absolute path and
+`wine` is its sibling — run inside the game's Flatpak sandbox when the game
+runs in one, so that it reaches the game's wineserver. The install then reports
+that the game must be **restarted** for the agent to start: the agent starts
+with the game, and clonecast never starts one itself (one started from outside
+the game's sandbox outlived the game and kept the prefix up).
 
-If that wine cannot be worked out, the install is refused up front rather than
-attempted and failed, and says to close the game or pass `--agent-wine`.
+The agent never keeps a prefix up by itself: like Wine's own services, it exits
+when the last program in the prefix (the game) does, crash or not.
+
+If that wine cannot be worked out, the change is refused up front rather than
+attempted and failed, and says to close the game or set the wine command with
+`w`.
 
 Then the agent path, with a real game:
 
@@ -279,6 +298,8 @@ internal/keys/           key codes, names, and the allowlist (Set)
 internal/agentwire/      the clonecast <-> agent protocol: hello, keepalive, key frames (tested)
 internal/broadcast/      the engine: passthrough + focus-juggle delivery (tested)
 internal/redial/         the agent's reconnect backoff — reset by a session, not a dial (tested)
+internal/lookup/         the agent's pacing of window searches while its game window is gone (tested)
+internal/logcap/         the size-capped log file clonecast and the agent write (tested)
 internal/platform/agent/ the agent registry: agents connect here and are paired to windows (tested)
 internal/prefix/         Wine prefix discovery and `clonecast agent install` (tested)
 internal/platform/evdev/ Linux capture (grab), injection (uinput clone) and mouse clicks (tested)
@@ -291,7 +312,7 @@ scripts/                 setup-bazzite.sh
 
 ### Tests and CI
 
-**141 test functions** across 27 `_test.go` files, in eleven packages. No
+**168 test functions** across 31 `_test.go` files, in thirteen packages. No
 display, no uinput, no DBus: window lists and key events are fabricated, and
 the TUI's end-to-end checks drive a pty.
 

@@ -9,7 +9,7 @@ import (
 	"github.com/malahmen/clonecast/internal/broadcast"
 )
 
-func newLinuxPlatform(_ bool, _ ...string) (*platform, error) {
+func newLinuxPlatform(_ ...string) (*platform, error) {
 	return nil, errors.New("the linux backend only builds on Linux; use --backend mock here")
 }
 

@@ -34,6 +34,8 @@
 //	exe=     the agent's own image path (diagnostics only)
 //	pid=     the agent's Windows process id, decimal (diagnostics only)
 //	hwnd=    the resolved game window handle, hex without 0x (diagnostics)
+//	token=   the secret `clonecast agent install` left beside the agent;
+//	         clonecast refuses an agent without the right one
 //
 // Values are percent-encoded (net/url query escaping), so a title or a path
 // may contain spaces, '=' or non-ASCII and still survive a space-separated,
@@ -135,6 +137,7 @@ type Hello struct {
 	Exe     string // the agent binary's own path
 	PID     int    // the agent's *Windows* pid — never a host pid
 	HWND    uint64 // the resolved game window handle
+	Token   string // the install's shared secret; never logged
 }
 
 // Write encodes h as the hello line.
@@ -159,6 +162,9 @@ func (h Hello) Write(w io.Writer) error {
 	}
 	if h.HWND != 0 {
 		fmt.Fprintf(&b, " hwnd=%x", h.HWND)
+	}
+	if h.Token != "" {
+		fmt.Fprintf(&b, " token=%s", url.QueryEscape(h.Token))
 	}
 	b.WriteByte('\n')
 	_, err := io.WriteString(w, b.String())
@@ -256,7 +262,7 @@ func parseHello(fields []string) (Hello, error) {
 			return Hello{}, fmt.Errorf("field %q has no '='", kv)
 		}
 		switch key {
-		case "prefix", "title", "exe":
+		case "prefix", "title", "exe", "token":
 			val, err := url.QueryUnescape(raw)
 			if err != nil {
 				return Hello{}, fmt.Errorf("field %s: %w", key, err)
@@ -268,6 +274,8 @@ func parseHello(fields []string) (Hello, error) {
 				h.Title = val
 			case "exe":
 				h.Exe = val
+			case "token":
+				h.Token = val
 			}
 		case "pid":
 			n, err := strconv.Atoi(raw)

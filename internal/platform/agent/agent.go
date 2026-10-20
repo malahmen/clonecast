@@ -70,12 +70,16 @@ func (d *Deliverer) Deliver(_ context.Context, req broadcast.Delivery) (int, err
 			continue
 		}
 		d.clearWarning(t)
-		if err := a.send(frame); err != nil {
-			// A broken connection means the agent (or its whole prefix) is
-			// gone. Drop it so it disappears from the registry and the
-			// Targets list; it re-registers by itself when it comes back.
+		// Queued, not written here: each agent has its own writer, so one
+		// that stopped reading cannot hold up the keys for the others
+		// (Kamino item 44). A write that fails later drops the agent and
+		// says so through the registry's log.
+		if !a.enqueue(frame) {
+			// Its queue is full: it has not read for a long while. Drop it
+			// so it disappears from the Targets list; it re-registers by
+			// itself when it comes back.
 			d.reg.drop(a)
-			req.Notify(fmt.Sprintf("agent %s: %v (dropped; it will re-register)", a.Label(), err), true)
+			req.Notify(fmt.Sprintf("agent %s: not reading, %d keys waiting (dropped; it will re-register)", a.Label(), queueLen), true)
 			continue
 		}
 		delivered++

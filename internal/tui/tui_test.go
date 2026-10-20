@@ -61,14 +61,14 @@ type terminal struct {
 	buf strings.Builder
 }
 
-var ansi = regexp.MustCompile("\x1b\\[[0-9;?]*[a-zA-Z]|\x1b\\][^\x07]*\x07|\x1b[()][A-Z0-9]")
+var ansiCode = regexp.MustCompile("\x1b\\[[0-9;?]*[a-zA-Z]|\x1b\\][^\x07]*\x07|\x1b[()][A-Z0-9]")
 
 // text is everything rendered so far, with escape sequences removed so
 // assertions read like what a user sees.
 func (tm *terminal) text() string {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	return ansi.ReplaceAllString(tm.buf.String(), "")
+	return ansiCode.ReplaceAllString(tm.buf.String(), "")
 }
 
 // typeKeys sends keystrokes the way a user would: one at a time, with a pause

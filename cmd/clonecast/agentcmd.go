@@ -121,6 +121,11 @@ func agentInstall(args []string, out io.Writer) error {
 	if err := a.parse(args); err != nil {
 		return err
 	}
+	token, err := agentToken()
+	if err != nil {
+		return err
+	}
+	a.cfg.Token = token
 	res, err := prefix.Install(a.cfg)
 	if err != nil {
 		return err

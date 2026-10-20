@@ -216,11 +216,32 @@ func TestEscapeRoundTrip(t *testing.T) {
 		`back\\slashes`,
 		"tab\there",
 		"café ☕",
+		"🎮 beyond the BMP",
 		"",
 	} {
 		got, ok := unquoteRegString(quoteRegString(s))
 		if !ok || got != s {
 			t.Errorf("round trip of %q gave %q (ok=%v) via %s", s, got, ok, quoteRegString(s))
+		}
+	}
+}
+
+// Kamino item 43: Wine's loader reads a raw byte as one UTF-16 unit, so
+// anything from 127 up must be written as \xNNNN, the way Wine dumps it.
+func TestNonASCIIIsWrittenAsWineEscapes(t *testing.T) {
+	cases := map[string]string{
+		"café":    `"caf\x00e9"`,
+		"☕":       `"\x2615"`,
+		"\x7f":    `"\x007f"`,
+		"🎮":       `"\xd83c\xdfae"`,
+		"plain A": `"plain A"`,
+	}
+	for in, want := range cases {
+		if got := quoteRegString(in); got != want {
+			t.Errorf("quoteRegString(%q) = %s, want %s", in, got, want)
+		}
+		if back, ok := unquoteRegString(want); !ok || back != in {
+			t.Errorf("unquoteRegString(%s) = %q, want %q", want, back, in)
 		}
 	}
 }

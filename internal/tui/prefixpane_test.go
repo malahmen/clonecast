@@ -201,8 +201,8 @@ func TestPrefixPaneRefusesRunningPrefixWhenWineUnknown(t *testing.T) {
 	if !strings.Contains(strings.ToLower(p.status), "close the game") {
 		t.Fatalf("status = %q, want it to say to close the game", p.status)
 	}
-	if !strings.Contains(p.status, "--agent-wine") {
-		t.Fatalf("status = %q, want it to offer --agent-wine as the alternative", p.status)
+	if !strings.Contains(p.status, "wine command with w") {
+		t.Fatalf("status = %q, want it to offer setting the wine command (w) as the alternative", p.status)
 	}
 	if p.busy {
 		t.Fatal("pane was left busy after a refusal")
@@ -299,6 +299,72 @@ func TestPrefixPaneInstallsRunningPrefixViaDerivedWine(t *testing.T) {
 	}
 	if !p.installRunning {
 		t.Fatal("installRunning not set, so the result would not mention restarting the game")
+	}
+}
+
+// Uninstall from a running prefix used the configured wine only, which is
+// empty by default, so it went for system.reg and was refused (2026-10-20).
+func TestPrefixPaneUninstallsRunningPrefixViaDerivedWine(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "runner", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"wine", "wineserver"} {
+		if err := os.WriteFile(filepath.Join(bin, n), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := NewPrefixPane(PrefixPaneConfig{})
+	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{{
+		Prefix:    "/bottles/live",
+		Processes: []prefix.Running{{PID: 2, Command: filepath.Join(bin, "wineserver")}},
+	}}})
+
+	wine, ok := p.wineFor("/bottles/live")
+	if !ok || wine != filepath.Join(bin, "wine") {
+		t.Fatalf("wineFor = %q, %v; want the prefix's own wine", wine, ok)
+	}
+	if _, cmd := p.Update(keyRune('u')); cmd == nil {
+		t.Fatal("uninstall was not attempted")
+	}
+}
+
+// The pane scanned once at startup and on r, so games started after
+// clonecast showed as not running for good (2026-10-20). The periodic
+// refresh updates the list and leaves the status line alone.
+func TestPrefixPaneAutoRefreshUpdatesTheListOnly(t *testing.T) {
+	p := NewPrefixPane(PrefixPaneConfig{})
+	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{{Prefix: "/bottles/a"}}})
+	p.status = "installed (file route) — the agent starts with the game"
+
+	running := prefix.Proc{Prefix: "/bottles/a", Processes: []prefix.Running{{PID: 7, Command: `C:\Game\WoW.exe`}}}
+	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{running}, auto: true})
+	if !p.procs[0].Running() {
+		t.Fatal("the periodic refresh did not update the list")
+	}
+	if p.status != "installed (file route) — the agent starts with the game" {
+		t.Fatalf("the periodic refresh replaced the status: %q", p.status)
+	}
+}
+
+// The status below the list said "running: yes" after the games had closed:
+// it was fetched only when the selection changed (2026-10-20).
+func TestPrefixPaneAutoRefreshRefetchesTheStatusWhenTheGameStops(t *testing.T) {
+	running := prefix.Proc{Prefix: "/bottles/a", Processes: []prefix.Running{{PID: 7, Command: `C:\Game\WoW.exe`}}}
+	p := NewPrefixPane(PrefixPaneConfig{})
+	p, _ = p.Update(prefixListMsg{procs: []prefix.Proc{running}})
+
+	p, cmd := p.Update(prefixListMsg{procs: []prefix.Proc{running}, auto: true})
+	if cmd != nil {
+		t.Fatal("refetched the status with nothing changed")
+	}
+	p, cmd = p.Update(prefixListMsg{procs: []prefix.Proc{{Prefix: "/bottles/a"}}, auto: true})
+	if cmd == nil {
+		t.Fatal("the game stopped and the status was not refetched")
+	}
+	if _, ok := cmd().(prefixStatusMsg); !ok {
+		t.Fatal("the refresh did not fetch the status")
 	}
 }
 
