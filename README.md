@@ -7,7 +7,7 @@ Broadcast your keyboard to several windows at once, from a lazygit-style termina
 Pick which running windows receive the keys, and which keys are broadcast: everything, or an explicit set such as `A B C F1`.
 Built for [Bazzite](https://bazzite.gg) desktop mode (KDE Plasma 6 on Wayland), written in Go with [Bubble Tea](https://github.com/charmbracelet/bubbletea).
 
-> **Status: v1.0.0.** Runs three World of Warcraft clients under Wine/Bottles on Bazzite, with the in-bottle agent and switching by click (2026-10-20). \
+> **Status: v2.0.0.** Not tied to any game. Tested with three World of Warcraft clients under Wine/Bottles on Bazzite: broadcast through the in-bottle agent, switching by click, and agents that exit with their game (2026-10-20). \
 > Other games and desktops are untested.
 
 ## How it works
