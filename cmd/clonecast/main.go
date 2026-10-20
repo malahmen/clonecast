@@ -98,6 +98,7 @@ func run() error {
 	toggle := flag.String("toggle", "SCROLLLOCK", "key that toggles broadcasting on/off")
 	settle := flag.Duration("settle", 30*time.Millisecond, "delay between focusing a target and injecting (dance backend)")
 	gateOrigin := flag.Bool("gate-origin", true, "only broadcast while the focused window is itself a ticked target")
+	masterByAgent := flag.Bool("master-by-agent", false, "while broadcasting, send the focused game's own keys through its agent too, so a game that takes the X keyboard focus gets nothing (experimental)")
 	logPath := flag.String("log", defaultLogPath(), "log file (stdout is the TUI)")
 	agentExe := flag.String("agent-exe", "", "built clonecast-agent.exe for the TUI's Prefixes pane to install (default: look next to this binary or in ./bin)")
 	agentTitle := flag.String("agent-title", "", `window title an agent installed from the TUI delivers to ("" = agent default, "World of Warcraft")`)
@@ -122,6 +123,7 @@ func run() error {
 	cfg := broadcast.DefaultConfig()
 	cfg.SettleDelay = *settle
 	cfg.GateOrigin = *gateOrigin
+	cfg.MasterByAgent = *masterByAgent
 	if *toggle != "" {
 		c, err := keys.Parse(*toggle)
 		if err != nil {
@@ -143,7 +145,7 @@ func run() error {
 		// what made every keypress arrive twice.
 		var kbd []string
 		if kbd, err = resolveKeyboards(*kbdSpec); err == nil {
-			p, err = newLinuxPlatform(kbd...)
+			p, err = newLinuxPlatform(*masterByAgent, kbd...)
 		}
 	default:
 		err = fmt.Errorf("unknown backend %q", *backend)

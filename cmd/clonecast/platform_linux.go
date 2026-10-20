@@ -21,7 +21,10 @@ import (
 	"github.com/malahmen/clonecast/internal/tui"
 )
 
-func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
+// newLinuxPlatform wires capture, injection and KWin. kwinOnly leaves the
+// master as KWin's active window alone, without the X input focus correction:
+// with --master-by-agent the master's keys no longer follow the X focus.
+func newLinuxPlatform(kwinOnly bool, kbdPaths ...string) (*platform, error) {
 	// Switchable rather than Open: which keyboard to capture has to be
 	// changeable while running, because discovery cannot tell one node of a
 	// keyboard from another and only typing on it can.
@@ -54,21 +57,29 @@ func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 	// when the two disagree between XWayland clients (REFERENCE.md 4.22).
 	// Optional: without an X server the master is KWin's answer alone.
 	closeFocus := func() {}
-	if f, err := x11.NewFocus(); err == nil {
+	if kwinOnly {
+		log.Infof("master: KWin's active window (--master-by-agent); its keys go through its agent")
+	} else if f, err := x11.NewFocus(); err == nil {
 		wm.SetInputFocus(f)
 		closeFocus = func() { _ = f.Close() }
 	} else {
 		log.Infof("master: X input focus unavailable (%v); following KWin's active window only", err)
 	}
-	// A click must move the keyboard too, not just KWin's idea of the active
-	// window (REFERENCE.md 4.24). Optional, like the X focus above.
-	closeClick := func() {}
+	// The keys must go where KWin says, not to a client that took the X focus
+	// (REFERENCE.md 4.24). Optional, like the X focus above.
+	closeGuard := func() {}
 	var setNotify func(func(string, bool))
-	if cf, err := x11.NewClickFocus(); err == nil {
-		closeClick = func() { _ = cf.Close() }
-		setNotify = func(n func(string, bool)) { cf.SetNotify(func(s string) { n(s, false) }) }
+	if g, err := x11.NewFocusGuard(); err == nil {
+		closeGuard = func() { _ = g.Close() }
+		setNotify = func(n func(string, bool)) { g.SetNotify(func(s string) { n(s, false) }) }
+		// The game you click wins over KWin, which does not always activate it.
+		if c, err := evdev.WatchClicks(g.Clicked); err == nil {
+			closeGuard = func() { _ = c.Close(); _ = g.Close() }
+		} else {
+			log.Infof("focus guard: mouse clicks unavailable (%v); following KWin's active window only", err)
+		}
 	} else {
-		log.Infof("click focus unavailable (%v); a click may need repeating to move the keyboard", err)
+		log.Infof("focus guard unavailable (%v); a game may take the keyboard from the one you clicked", err)
 	}
 	return &platform{
 		src:       src,
@@ -77,7 +88,7 @@ func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 		devCtl:    deviceController{src: src},
 		setNotify: setNotify,
 		close: func() {
-			closeClick()
+			closeGuard()
 			closeFocus()
 			_ = wm.Close()
 			_ = inj.Close()

@@ -17,7 +17,10 @@ type Delivery struct {
 	// Targets are the ticked windows, in list order.
 	Targets []WindowID
 	// Origin is the focused window (the master). Always one of Targets when
-	// the gate is on, and always a window the engine actually resolved.
+	// the gate is on, and always a window the engine actually resolved —
+	// except "" when there is no window to skip: a release going to every
+	// window holding the key, or the master's own keys fed through a
+	// focus-free deliverer (Config.MasterByAgent).
 	Origin WindowID
 	// Notify reports per-target failures to the engine's notice stream.
 	Notify func(string, bool)
