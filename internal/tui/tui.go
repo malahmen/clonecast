@@ -231,10 +231,26 @@ func (m Model) focusWindow(id broadcast.WindowID) tea.Cmd {
 		if err := m.wm.Activate(ctx, id); err != nil {
 			return masterMsg{err: err}
 		}
+		// Activate can return before every view of the switch has caught up
+		// (KWin's, then the X focus Active also reads), so one read straight
+		// after it could still name the previous client, and "M" would stay
+		// there until the next poll (Kamino item 110). Re-read briefly until
+		// it names the window asked for; past that, report what it says.
 		got, err := m.wm.Active(ctx)
+		for i := 0; err == nil && got != id && i < focusSettleTries; i++ {
+			time.Sleep(focusSettleStep)
+			got, err = m.wm.Active(ctx)
+		}
 		return masterMsg{id: got, err: err}
 	}
 }
+
+// focusSettleTries and focusSettleStep bound focusWindow's re-reads: 500 ms,
+// within the 700 ms the master poll would have taken anyway.
+const (
+	focusSettleTries = 10
+	focusSettleStep  = 50 * time.Millisecond
+)
 
 func (m Model) waitNotice() tea.Cmd {
 	ch := m.engine.Notices()

@@ -9,7 +9,7 @@ import (
 	"github.com/malahmen/clonecast/internal/broadcast"
 )
 
-func newLinuxPlatform(_ ...string) (*platform, error) {
+func newLinuxPlatform(_ bool, _ ...string) (*platform, error) {
 	return nil, errors.New("the linux backend only builds on Linux; use --backend mock here")
 }
 
@@ -28,6 +28,13 @@ func isTerminal(_ *os.File) bool { return false }
 // listCandidates: evdev only builds on Linux.
 func listCandidates() ([]candidate, error) {
 	return nil, errors.New("keyboard discovery is only available on Linux")
+}
+
+// keypressTimeout and waitForKeyPress: the keypress picker is evdev, Linux only.
+const keypressTimeout = 0
+
+func waitForKeyPress(_ []candidate) (int, error) {
+	return -1, errors.New("picking a keyboard by keypress is only available on Linux")
 }
 
 // listKeyboards: evdev only builds on Linux.

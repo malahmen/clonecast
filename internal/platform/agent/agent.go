@@ -40,6 +40,14 @@ func New(reg *Registry) *Deliverer {
 
 func (d *Deliverer) MovesFocus() bool { return false }
 
+// The engine finds Reaches by a type assertion; this keeps a rename from
+// silently turning --master-by-agent off.
+var _ broadcast.Reacher = (*Deliverer)(nil)
+
+// Reaches reports whether an agent serves the window, which is what lets the
+// engine feed the master through it (broadcast.Config.MasterByAgent).
+func (d *Deliverer) Reaches(id broadcast.WindowID) bool { return d.reg.Paired(id) }
+
 // Close does not close the registry: the registry outlives any one backend
 // (the TUI can switch to the dance and back, and agents must stay connected
 // across that), so cmd/clonecast owns its lifetime.

@@ -132,6 +132,21 @@ type Config struct {
 	// behaviour, which is occasionally wanted (e.g. driving clients from a
 	// window that is deliberately not a target).
 	GateOrigin bool
+	// MasterByAgent sends the master's keys through the deliverer too,
+	// instead of replaying them to the compositor (REFERENCE.md 4.25). Only
+	// while broadcasting is on, and only when the master is a ticked target
+	// the deliverer can reach (a Reacher that says yes, so an agent is paired
+	// with it); otherwise, the terminal included, keys take passthrough as
+	// before. Broadcast off is therefore also the way to type normally. It makes the X input focus
+	// irrelevant for the games: one that takes it receives nothing.
+	MasterByAgent bool
+}
+
+// Reacher is implemented by a focus-free Deliverer that can tell whether it
+// reaches a window, so the engine knows the master can be fed through it
+// (Config.MasterByAgent).
+type Reacher interface {
+	Reaches(WindowID) bool
 }
 
 // DefaultConfig is a sane starting point.
@@ -170,6 +185,9 @@ type Engine struct {
 	enabled bool
 
 	notices chan Notice
+	// noticeSink, when set, also receives every notice except the per-key
+	// delivery line (see SetNoticeSink). Set once, before Run.
+	noticeSink func(Notice)
 
 	// focusMu is held by a dance for its entire duration — from before it
 	// reads the origin window through the final restore — and by
@@ -182,7 +200,7 @@ type Engine struct {
 	// for a burst of keystrokes typed faster than the worker can dance
 	// through them; a full queue drops the newest event rather than ever
 	// blocking Run, with a notice so drops are visible instead of silent.
-	queue chan keys.Event
+	queue chan item
 
 	// gateBlocked / activeBroken keep the gate and the wm.Active failure path
 	// from writing one notice per keystroke. Only broadcastLoop touches them
@@ -220,7 +238,7 @@ func New(src Source, inj Injector, wm WindowManager, cfg Config) *Engine {
 		wm:      wm,
 		cfg:     cfg,
 		notices: make(chan Notice, 64),
-		queue:   make(chan keys.Event, 16),
+		queue:   make(chan item, 64),
 		held:    map[WindowID]map[keys.Code]bool{},
 	}
 	// Built-in backend: the focus dance, reading SettleDelay live from cfg.
@@ -390,6 +408,19 @@ func (e *Engine) Run(ctx context.Context) error {
 // down is bad, and an unresponsive keyboard is worse.
 const releaseEnqueueWait = 250 * time.Millisecond
 
+// item is one event for the worker. master is set when the key goes to the
+// master through the deliverer (Config.MasterByAgent) rather than through
+// passthrough; broadcast says whether it also goes to the other targets.
+type item struct {
+	ev        keys.Event
+	master    WindowID
+	broadcast bool
+	// everywhere releases ev on every window holding it, the master
+	// included: releaseHeld's Ups, queued when the user's own Up may never
+	// come through the deliverer.
+	everywhere bool
+}
+
 func (e *Engine) handle(ev keys.Event) {
 	toggle := e.Config().ToggleKey
 	if toggle != 0 && ev.Code == toggle {
@@ -399,12 +430,17 @@ func (e *Engine) handle(ev keys.Event) {
 		return // consumed, never replayed
 	}
 
-	// Step 1: the focused window always gets the key. Waits only if a dance
-	// is actively holding real focus away from origin right now (focusMu) —
-	// never for the rest of the queue behind it. See package doc.
-	if err := e.passthroughEmit(ev); err != nil {
-		e.notify(fmt.Sprintf("passthrough %v: %v", ev, err), true)
-		return
+	// Step 1: the focused window always gets the key: through the deliverer
+	// when it is a game an agent reaches (MasterByAgent), else by replaying
+	// it to the compositor. Passthrough waits only if a dance is actively
+	// holding real focus away from origin right now (focusMu) — never for
+	// the rest of the queue behind it. See package doc.
+	master := e.agentMaster()
+	if master == "" {
+		if err := e.passthroughEmit(ev); err != nil {
+			e.notify(fmt.Sprintf("passthrough %v: %v", ev, err), true)
+			return
+		}
 	}
 
 	e.mu.RLock()
@@ -415,28 +451,60 @@ func (e *Engine) handle(ev keys.Event) {
 	// checks decide whether to START broadcasting a key; none of them is a
 	// reason to leave one held down.
 	release := e.isRelease(ev)
-	if !release && (!enabled || ev.State == keys.Repeat || !filter.Allows(ev.Code)) {
+	bcast := release || (enabled && ev.State != keys.Repeat && filter.Allows(ev.Code))
+	if master == "" && !bcast {
 		return
 	}
 
 	// Step 2: hand off to the worker instead of dancing here. A full queue
 	// means keys are arriving faster than the worker can visit targets for
-	// them — drop this one rather than block passthrough to catch up.
+	// them — drop this one rather than block passthrough to catch up. The
+	// master's own keys are not dropped like that: they are its keyboard.
+	it := item{ev: ev, master: master, broadcast: bcast}
 	select {
-	case e.queue <- ev:
+	case e.queue <- it:
 	default:
-		if !release {
+		if !release && master == "" {
 			e.notify(fmt.Sprintf("broadcast queue full, dropped %v", ev), true)
 			return
 		}
 		// Dropping this would leave the key held. Wait for room — bounded,
 		// so a wedged worker still cannot block passthrough forever.
 		select {
-		case e.queue <- ev:
+		case e.queue <- it:
 		case <-time.After(releaseEnqueueWait):
 			e.notify(fmt.Sprintf("queue full for %s after %s — the key may be left held on its targets", ev, releaseEnqueueWait), true)
 		}
 	}
+}
+
+// agentMaster is the master when its keys go through the deliverer
+// (Config.MasterByAgent): while broadcasting is on, the focused window, if it
+// is a ticked target the current deliverer reaches. "" means passthrough. A focused window that
+// cannot be read is passthrough too: the keyboard keeps working, the old way.
+func (e *Engine) agentMaster() WindowID {
+	e.mu.RLock()
+	cfg := e.cfg
+	targets := e.targets
+	enabled := e.enabled
+	e.mu.RUnlock()
+	if !cfg.MasterByAgent || !enabled || len(targets) == 0 {
+		return ""
+	}
+	e.delivMu.Lock()
+	d := e.deliverer
+	e.delivMu.Unlock()
+	r, ok := d.(Reacher)
+	if !ok || d.MovesFocus() {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.OpTimeout)
+	defer cancel()
+	active, err := e.wm.Active(ctx)
+	if err != nil || active == "" || !contains(targets, active) || !r.Reaches(active) {
+		return ""
+	}
+	return active
 }
 
 // broadcastLoop is the single worker that performs every focus dance, one at
@@ -450,13 +518,73 @@ func (e *Engine) broadcastLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case ev := <-e.queue:
-			e.broadcast(ctx, ev)
+		case it := <-e.queue:
+			if it.everywhere {
+				e.releaseEverywhere(ctx, it.ev)
+				continue
+			}
+			if it.master != "" {
+				e.toMaster(ctx, it.ev, it.master)
+			}
+			if it.broadcast {
+				e.broadcast(ctx, it.ev, it.master)
+			}
 		}
 	}
 }
 
-func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
+// toMaster delivers a key to the master through the deliverer
+// (Config.MasterByAgent). A release also goes to every window still holding
+// the key from when it was the master, or the key stays down there.
+func (e *Engine) toMaster(ctx context.Context, ev keys.Event, master WindowID) {
+	e.delivMu.Lock()
+	d := e.deliverer
+	e.delivMu.Unlock()
+	targets := []WindowID{master}
+	if ev.State == keys.Up {
+		for _, id := range e.heldTargets(ev.Code) {
+			if id != master {
+				targets = append(targets, id)
+			}
+		}
+	}
+	opCtx, cancel := context.WithTimeout(ctx, e.Config().OpTimeout)
+	defer cancel()
+	if _, err := d.Deliver(opCtx, Delivery{Event: ev, Targets: targets, Notify: e.notify}); err != nil {
+		return // deliverer already reported the failure via notify
+	}
+	e.noteDelivered(ev, targets)
+}
+
+// releaseEverywhere delivers an Up to every window holding the key, the master
+// included. Turning broadcast off mid-keypress with MasterByAgent sends the
+// user's own Up by passthrough, which never reaches a game whose Down came
+// through its agent. A focus-moving deliverer keeps the old path: it has to
+// restore an origin.
+func (e *Engine) releaseEverywhere(ctx context.Context, ev keys.Event) {
+	e.delivMu.Lock()
+	d := e.deliverer
+	e.delivMu.Unlock()
+	if d.MovesFocus() {
+		e.broadcast(ctx, ev, "")
+		return
+	}
+	targets := e.heldTargets(ev.Code)
+	if len(targets) == 0 {
+		return
+	}
+	opCtx, cancel := context.WithTimeout(ctx, e.Config().OpTimeout)
+	defer cancel()
+	if _, err := d.Deliver(opCtx, Delivery{Event: ev, Targets: targets, Notify: e.notify}); err != nil {
+		return
+	}
+	e.noteDelivered(ev, targets)
+}
+
+// broadcast delivers ev to the targets other than the master. master is the
+// window toMaster just fed, or "" when the master got the key by passthrough
+// and is resolved here.
+func (e *Engine) broadcast(ctx context.Context, ev keys.Event, master WindowID) {
 	e.mu.RLock()
 	targets := append([]WindowID(nil), e.targets...)
 	cfg := e.cfg
@@ -495,9 +623,16 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 		if len(targets) == 0 {
 			return
 		}
+	} else if ev.State == keys.Up {
+		// An Up no target holds: toMaster has just released it everywhere,
+		// or its Down was never broadcast. There is nothing to let go of.
+		return
 	}
 
-	origin, ok := e.origin(opCtx, targets, cfg)
+	origin, ok := master, true
+	if master == "" {
+		origin, ok = e.origin(opCtx, targets, cfg)
+	}
 	if !ok {
 		if !release {
 			return
@@ -515,7 +650,7 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event) {
 		return // deliverer already reported the failure via notify
 	}
 	e.noteDelivered(ev, targets)
-	e.notify(fmt.Sprintf("%v -> %d target(s)", ev, delivered), false)
+	e.notifyKey(fmt.Sprintf("%v -> %d target(s)", ev, delivered))
 }
 
 // origin resolves the master window for this broadcast and applies the origin
@@ -627,7 +762,7 @@ func (e *Engine) releaseHeld(why string) {
 	n := 0
 	for c := range codes {
 		select {
-		case e.queue <- keys.Event{Code: c, State: keys.Up}:
+		case e.queue <- item{ev: keys.Event{Code: c, State: keys.Up}, everywhere: true}:
 			n++
 		default:
 		}
@@ -654,11 +789,32 @@ func (e *Engine) passthroughEmit(ev keys.Event) error {
 }
 
 func (e *Engine) notify(text string, isErr bool) {
+	n := Notice{Time: time.Now(), Text: text, Err: isErr}
+	if e.noticeSink != nil {
+		e.noticeSink(n)
+	}
 	select {
-	case e.notices <- Notice{Time: time.Now(), Text: text, Err: isErr}:
+	case e.notices <- n:
 	default:
 	}
 }
+
+// notifyKey is notify for the line each broadcast key produces: the UI only,
+// never the sink. Written to the log file it would be a record on disk of
+// every key broadcast, which REFERENCE.md 8 promises not to keep.
+func (e *Engine) notifyKey(text string) {
+	select {
+	case e.notices <- Notice{Time: time.Now(), Text: text}:
+	default:
+	}
+}
+
+// SetNoticeSink also hands every notice — agent registrations, pairing,
+// gate and delivery errors — to sink, which clonecast uses to put them in its
+// log file. They used to reach only the TUI's Log pane, so the file the README
+// sends people to held nothing but startup warnings. Per-key lines are left
+// out (see notifyKey). Call before Run; sink must not block.
+func (e *Engine) SetNoticeSink(sink func(Notice)) { e.noticeSink = sink }
 
 func sleep(ctx context.Context, d time.Duration) {
 	if d <= 0 {

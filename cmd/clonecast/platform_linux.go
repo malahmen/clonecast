@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,10 @@ import (
 	"github.com/malahmen/clonecast/internal/tui"
 )
 
-func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
+// newLinuxPlatform wires capture, injection and KWin. kwinOnly leaves the
+// master as KWin's active window alone, without the X input focus correction:
+// with --master-by-agent the master's keys no longer follow the X focus.
+func newLinuxPlatform(kwinOnly bool, kbdPaths ...string) (*platform, error) {
 	// Switchable rather than Open: which keyboard to capture has to be
 	// changeable while running, because discovery cannot tell one node of a
 	// keyboard from another and only typing on it can.
@@ -53,18 +57,38 @@ func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 	// when the two disagree between XWayland clients (REFERENCE.md 4.22).
 	// Optional: without an X server the master is KWin's answer alone.
 	closeFocus := func() {}
-	if f, err := x11.NewFocus(); err == nil {
+	if kwinOnly {
+		log.Infof("master: KWin's active window (--master-by-agent); its keys go through its agent")
+	} else if f, err := x11.NewFocus(); err == nil {
 		wm.SetInputFocus(f)
 		closeFocus = func() { _ = f.Close() }
 	} else {
 		log.Infof("master: X input focus unavailable (%v); following KWin's active window only", err)
 	}
+	// The keys must go where KWin says, not to a client that took the X focus
+	// (REFERENCE.md 4.24). Optional, like the X focus above.
+	closeGuard := func() {}
+	var setNotify func(func(string, bool))
+	if g, err := x11.NewFocusGuard(); err == nil {
+		closeGuard = func() { _ = g.Close() }
+		setNotify = func(n func(string, bool)) { g.SetNotify(func(s string) { n(s, false) }) }
+		// The game you click wins over KWin, which does not always activate it.
+		if c, err := evdev.WatchClicks(g.Clicked); err == nil {
+			closeGuard = func() { _ = c.Close(); _ = g.Close() }
+		} else {
+			log.Infof("focus guard: mouse clicks unavailable (%v); following KWin's active window only", err)
+		}
+	} else {
+		log.Infof("focus guard unavailable (%v); a game may take the keyboard from the one you clicked", err)
+	}
 	return &platform{
-		src:    src,
-		inj:    inj,
-		wm:     wm,
-		devCtl: deviceController{src: src},
+		src:       src,
+		inj:       inj,
+		wm:        wm,
+		devCtl:    deviceController{src: src},
+		setNotify: setNotify,
 		close: func() {
+			closeGuard()
 			closeFocus()
 			_ = wm.Close()
 			_ = inj.Close()
@@ -197,15 +221,57 @@ func listCandidates() ([]candidate, error) {
 	if err != nil {
 		return nil, err
 	}
+	byID := byIDLinks()
 	out := make([]candidate, 0, len(found))
 	for _, p := range found {
 		state := "free"
 		if err := evdev.CanGrab(p.Path); err != nil {
 			state = "BUSY (" + err.Error() + ")"
 		}
-		out = append(out, candidate{Path: p.Path, State: state, Name: p.Name})
+		id := byID[p.Path]
+		if id == "" {
+			id = "name:" + p.Name
+		}
+		out = append(out, candidate{Path: p.Path, State: state, Name: p.Name, ID: id})
 	}
 	return out, nil
+}
+
+// byIDLinks maps each device node to its /dev/input/by-id link — udev's
+// stable name, built from the device's bus, model and interface, so the two
+// nodes of one keyboard get different ones. Devices udev gives no such link
+// (keyd's virtual keyboard, most Bluetooth ones) are absent.
+func byIDLinks() map[string]string {
+	const dir = "/dev/input/by-id"
+	out := map[string]string{}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, e := range ents {
+		link := filepath.Join(dir, e.Name())
+		if target, err := filepath.EvalSymlinks(link); err == nil {
+			out[target] = link
+		}
+	}
+	return out
+}
+
+// keypressTimeout is how long the picker listens before offering a list.
+const keypressTimeout = 20 * time.Second
+
+// waitForKeyPress is the picker's "press a key on it", over the free
+// candidates. It then discards whatever the keypress typed into this
+// terminal, so a printable key cannot reach the TUI as its first input.
+func waitForKeyPress(free []candidate) (int, error) {
+	paths := make([]string, len(free))
+	for i, c := range free {
+		paths[i] = c.Path
+	}
+	i, err := evdev.WaitForKeyPress(paths, keypressTimeout)
+	time.Sleep(150 * time.Millisecond) // let the key's own characters arrive, then drop them
+	_ = unix.IoctlSetInt(int(os.Stdin.Fd()), unix.TCFLSH, unix.TCIFLUSH)
+	return i, err
 }
 
 // listKeyboards prints what discovery selects and whether each device can be
@@ -255,6 +321,11 @@ func (d deviceController) Captured() []string { return d.src.Paths() }
 // for exactly that reason at startup).
 func (d deviceController) Capture(paths []string) error { return d.src.Switch(paths...) }
 
+// Save remembers the choice by ID, as the startup picker does.
 func (d deviceController) Save(paths []string) error {
-	return configSet(kbdKey, strings.Join(paths, ","))
+	cands, err := listCandidates()
+	if err != nil {
+		return err
+	}
+	return saveKeyboards(cands, paths)
 }

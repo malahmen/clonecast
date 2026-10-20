@@ -703,7 +703,7 @@ func TestFullQueueDoesNotDropARelease(t *testing.T) {
 	e, a := heldEngine(t, rec, src, "t1", "origin")
 
 	for len(e.queue) < cap(e.queue) { // full, with no worker running
-		e.queue <- keys.Event{Code: a, State: keys.Repeat}
+		e.queue <- item{ev: keys.Event{Code: a, State: keys.Repeat}, broadcast: true}
 	}
 	e.noteDelivered(keys.Event{Code: a, State: keys.Down}, []WindowID{"t1"})
 
@@ -720,7 +720,7 @@ func TestFullQueueDoesNotDropARelease(t *testing.T) {
 
 	var ups int
 	for len(e.queue) > 0 {
-		if ev := <-e.queue; ev.State == keys.Up {
+		if it := <-e.queue; it.ev.State == keys.Up {
 			ups++
 		}
 	}

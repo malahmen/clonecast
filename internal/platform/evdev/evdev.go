@@ -155,11 +155,71 @@ func CanGrab(path string) error {
 		return err
 	}
 	defer func() { _ = d.Close() }()
-	if err := d.Grab(); err != nil {
+	if err := grabKeysUp(d, keysUpTimeout); err != nil {
 		return err
 	}
 	_ = d.Ungrab()
 	return nil
+}
+
+// keysUpTimeout is how long a grab waits for the keys held on a device to be
+// released before giving up on it.
+const keysUpTimeout = 3 * time.Second
+
+// grabber is the part of *ev.InputDevice grabKeysUp needs.
+type grabber interface {
+	State(ev.EvType) (ev.StateMap, error)
+	Grab() error
+	Ungrab() error
+}
+
+// grabKeysUp grabs d only while no key on it is down. A key held across a
+// grab is pressed for the compositor but released to clonecast, so the
+// compositor thinks it is held for good and ignores every later press of it,
+// even after clonecast exits: the Enter that started clonecast, or the Shift
+// pressed for the keyboard picker, then stopped working until a reboot.
+//
+// The state is checked again after the grab, because a key can go down
+// between the check and the grab. Ungrabbing then lets its release reach the
+// compositor, and the wait starts over.
+func grabKeysUp(d grabber, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		held, err := heldKeys(d)
+		if err != nil {
+			return err
+		}
+		if held == 0 {
+			if err := d.Grab(); err != nil {
+				return err
+			}
+			if held, err = heldKeys(d); err == nil && held == 0 {
+				return nil
+			}
+			_ = d.Ungrab()
+			if err != nil {
+				return err
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%d key(s) still held after %v; release them and try again", held, timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func heldKeys(d grabber) (int, error) {
+	st, err := d.State(ev.EV_KEY)
+	if err != nil {
+		return 0, fmt.Errorf("read key state: %w", err)
+	}
+	n := 0
+	for _, down := range st {
+		if down {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // Open grabs the given devices (or every discovered keyboard when paths is
@@ -193,7 +253,7 @@ func Open(paths ...string) (*Source, error) {
 			s.skipped = append(s.skipped, fmt.Sprintf("%s: open: %v", p, err))
 			continue
 		}
-		if err := d.Grab(); err != nil {
+		if err := grabKeysUp(d, keysUpTimeout); err != nil {
 			_ = d.Close()
 			s.skipped = append(s.skipped, fmt.Sprintf("%s: grab: %v", p, err))
 			continue
