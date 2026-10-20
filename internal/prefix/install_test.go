@@ -182,3 +182,144 @@ func TestShellQuote(t *testing.T) {
 		}
 	}
 }
+
+// argvW splits a command line the way CommandLineToArgvW does, for checking
+// winArg against the reader that matters.
+func argvW(cmd string) []string {
+	var args []string
+	var cur strings.Builder
+	inQuote, started := false, false
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case c == '\\':
+			n := 0
+			for i < len(cmd) && cmd[i] == '\\' {
+				n++
+				i++
+			}
+			if i < len(cmd) && cmd[i] == '"' {
+				cur.WriteString(strings.Repeat(`\`, n/2))
+				if n%2 == 1 {
+					cur.WriteByte('"')
+				} else {
+					inQuote = !inQuote
+				}
+			} else {
+				cur.WriteString(strings.Repeat(`\`, n))
+				i--
+			}
+			started = true
+		case c == '"':
+			inQuote = !inQuote
+			started = true
+		case (c == ' ' || c == '\t') && !inQuote:
+			if started {
+				args = append(args, cur.String())
+				cur.Reset()
+				started = false
+			}
+		default:
+			cur.WriteByte(c)
+			started = true
+		}
+	}
+	if started {
+		args = append(args, cur.String())
+	}
+	return args
+}
+
+// Kamino item 41: a title ending in a backslash escaped the closing quote.
+func TestCommandLineTitleSurvivesCommandLineToArgvW(t *testing.T) {
+	for _, title := range []string{
+		`World of Warcraft`,
+		`ends in a backslash\`,
+		`two at the end\\`,
+		`a "quoted" word`,
+		`slash before quote\"`,
+		`C:\path\with spaces\`,
+		``,
+	} {
+		cmd := commandLine(Config{Port: 48800, Title: title})
+		args := argvW(cmd)
+		if title == "" {
+			if len(args) != 3 {
+				t.Errorf("no title: %q", args)
+			}
+			continue
+		}
+		if len(args) != 5 || args[3] != "-title" || args[4] != title {
+			t.Errorf("title %q: command %s reads back as %q", title, cmd, args)
+		}
+	}
+}
+
+// Kamino item 40: a failed registry import left the copied exe behind.
+func TestInstallLeavesNothingWhenTheRegistryCannotBeRead(t *testing.T) {
+	pfx := fakePrefix(t)
+	reg := filepath.Join(pfx, "system.reg")
+	if err := os.Chmod(reg, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(reg); err == nil {
+		t.Skip("running as root: the file stays readable")
+	}
+	_, err := Install(Config{Prefix: pfx, ExePath: fakeExe(t), Route: RouteFile, AssumeIdle: true})
+	if err == nil {
+		t.Fatal("install succeeded with an unreadable system.reg")
+	}
+	if _, err := os.Stat(ExeDest(pfx)); !os.IsNotExist(err) {
+		t.Errorf("the agent was left at %s: %v", ExeDest(pfx), err)
+	}
+	if _, err := os.Stat(filepath.Dir(ExeDest(pfx))); !os.IsNotExist(err) {
+		t.Errorf("its directory was left behind: %v", err)
+	}
+}
+
+// Kamino item 42: system.reg rewritten between reading and writing it (a
+// wineserver flushing) must not be overwritten.
+func TestSaveRefusesAFileChangedSinceItWasRead(t *testing.T) {
+	pfx := fakePrefix(t)
+	f, err := LoadRegFile(SystemReg(pfx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetString(RunServicesKey, DefaultValueName, "X")
+	flushed := sampleReg + "\n[Software\\\\Wine] 1\n"
+	if err := os.WriteFile(SystemReg(pfx), []byte(flushed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Save(); err == nil {
+		t.Fatal("Save overwrote a file rewritten since it was read")
+	}
+	if b, _ := os.ReadFile(SystemReg(pfx)); string(b) != flushed {
+		t.Error("the rewritten file was changed")
+	}
+}
+
+// Kamino item 2: the token sits beside the agent, readable by its owner only,
+// and goes with it on uninstall.
+func TestInstallWritesThePrivateTokenAndUninstallRemovesIt(t *testing.T) {
+	pfx := fakePrefix(t)
+	cfg := Config{Prefix: pfx, ExePath: fakeExe(t), Route: RouteFile, AssumeIdle: true, Token: "s3cret"}
+	if _, err := Install(cfg); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(TokenDest(pfx))
+	if err != nil || string(b) != "s3cret" {
+		t.Fatalf("token file = %q, %v", b, err)
+	}
+	if info, _ := os.Stat(TokenDest(pfx)); info.Mode().Perm() != 0o600 {
+		t.Errorf("token file mode %o, want 600", info.Mode().Perm())
+	}
+	if res, _ := Install(cfg); strings.Contains(res.Command, "s3cret") {
+		t.Error("the token is on the autostart command line, which any local user can read")
+	}
+	if _, err := Uninstall(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(TokenDest(pfx)); !os.IsNotExist(err) {
+		t.Errorf("token left after uninstall: %v", err)
+	}
+}

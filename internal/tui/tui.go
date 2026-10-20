@@ -49,6 +49,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/keys"
@@ -64,6 +65,13 @@ type Backends interface {
 	Current() string
 	// Use switches to name, reporting why if it cannot.
 	Use(name string) error
+}
+
+// XsendMap is implemented by Backends that can change the xsend title map
+// (--xsend) while running.
+type XsendMap interface {
+	XsendSpec() string
+	SetXsendSpec(spec string) error
 }
 
 // Agents is the live agent registry as the UI sees it: how many in-bottle
@@ -105,6 +113,8 @@ const (
 	setSettle
 	setToggle
 	setListen
+	setMasterAgent
+	setXsend
 	settingCount
 )
 
@@ -130,6 +140,7 @@ const (
 	editSettle
 	editToggle
 	editListen
+	editXsend
 )
 
 type (
@@ -303,7 +314,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case refreshTick:
-		return m, tea.Batch(m.refreshWindows(), tickRefresh())
+		return m, tea.Batch(m.refreshWindows(), m.prefixes.AutoRefresh(), tickRefresh())
 
 	case masterTick:
 		return m, tea.Batch(m.refreshMaster(), tickMaster())
@@ -404,8 +415,24 @@ func (m *Model) applyEdit() error {
 			return err
 		}
 		m.appendLog("agents listening on "+m.agents.Addr(), false)
+	case editXsend:
+		xm, ok := m.backends.(XsendMap)
+		if !ok {
+			return fmt.Errorf("this build has no xsend backend")
+		}
+		if err := xm.SetXsendSpec(value); err != nil {
+			return err
+		}
+		m.appendLog("xsend map: "+orNone(value), false)
 	}
 	return nil
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
 
 func (m *Model) startEdit(f editField, value, placeholder string) tea.Cmd {
@@ -578,6 +605,15 @@ func (m *Model) changeSetting() tea.Cmd {
 			return nil
 		}
 		return m.startEdit(editListen, m.agents.Addr(), "host:port agents dial, e.g. 127.0.0.1:48800")
+	case setMasterAgent:
+		m.engine.SetMasterByAgent(!m.engine.Config().MasterByAgent)
+	case setXsend:
+		xm, ok := m.backends.(XsendMap)
+		if !ok {
+			m.appendLog("this build has no xsend backend", true)
+			return nil
+		}
+		return m.startEdit(editXsend, xm.XsendSpec(), `KWin title=X title, e.g. "Almerinda=World of Warcraft"`)
 	}
 	return nil
 }
@@ -873,16 +909,26 @@ func (m Model) viewSettings(w int) string {
 			agents = onStyle.Render(fmt.Sprintf("%d agents", n)) + dimStyle.Render(" registered")
 		}
 	}
+	masterAgent := offStyle.Render("OFF")
+	if cfg.MasterByAgent {
+		masterAgent = onStyle.Render("ON")
+	}
+	xsend := dimStyle.Render("—")
+	if xm, ok := m.backends.(XsendMap); ok {
+		xsend = orNone(xm.XsendSpec())
+	}
 	rows := [settingCount]struct{ label, value string }{
-		setDelivery: {"delivery", backend},
-		setGate:     {"origin gate", gate},
-		setSettle:   {"settle", cfg.SettleDelay.String()},
-		setToggle:   {"toggle key", toggleName(cfg.ToggleKey)},
-		setListen:   {"listen", listen},
+		setDelivery:    {"delivery", backend},
+		setGate:        {"origin gate", gate},
+		setSettle:      {"settle", cfg.SettleDelay.String()},
+		setToggle:      {"toggle key", toggleName(cfg.ToggleKey)},
+		setListen:      {"listen", listen},
+		setMasterAgent: {"master→agent", masterAgent},
+		setXsend:       {"xsend map", xsend},
 	}
 	var b strings.Builder
 	for i, r := range rows {
-		line := fmt.Sprintf("%-11s %s", r.label, r.value)
+		line := fmt.Sprintf("%-12s %s", r.label, r.value)
 		if setting(i) == m.setCursor && m.pane == paneSettings {
 			line = cursorStyle.Render(line)
 		}
@@ -892,7 +938,7 @@ func (m Model) viewSettings(w int) string {
 	// change — but how many have is the first thing to look at when a ticked
 	// window is not receiving keys.
 	b.WriteString(agents + "\n")
-	if m.editing == editSettle || m.editing == editToggle || m.editing == editListen {
+	if m.editing == editSettle || m.editing == editToggle || m.editing == editListen || m.editing == editXsend {
 		b.WriteString("\n" + m.input.View())
 		if m.editErr != "" {
 			b.WriteString("\n" + errStyle.Render(m.editErr))
@@ -917,11 +963,9 @@ func truncate(s string, n int) string {
 	if lipgloss.Width(s) <= n {
 		return s
 	}
-	r := []rune(s)
-	if n <= 1 {
-		return string(r[:n])
-	}
-	return string(r[:n-1]) + "…"
+	// By display width, skipping colour codes: cutting by runes counted them,
+	// and a styled line came out short, its border a column in.
+	return ansi.Truncate(s, n, "…")
 }
 
 func wrap(s string, w int) string {

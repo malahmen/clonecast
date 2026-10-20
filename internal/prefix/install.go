@@ -8,9 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -49,6 +47,7 @@ type Config struct {
 	ValueName  string // registry value name ("" = DefaultValueName)
 	AssumeIdle bool   // skip the "is this prefix booted?" check and edit system.reg anyway
 	KeepExe    bool   // uninstall: leave the copied exe in place
+	Token      string // secret the agent sends clonecast, written beside it ("" = none)
 }
 
 func (c Config) valueName() string {
@@ -106,29 +105,52 @@ func Install(cfg Config) (*Result, error) {
 	}
 	res.Route = route
 
+	// Read system.reg before copying anything, so a prefix whose registry
+	// cannot be read is refused with nothing left behind (Kamino item 40).
+	var f *RegFile
+	if route == RouteFile {
+		if f, err = LoadRegFile(SystemReg(cfg.Prefix)); err != nil {
+			return nil, err
+		}
+		res.Arch = f.Arch
+	}
+
 	dest := ExeDest(cfg.Prefix)
 	res.ExeDest = dest
+	_, statErr := os.Stat(dest)
+	hadExe := statErr == nil
 	if err := copyFile(exe, dest); err != nil {
 		return nil, fmt.Errorf("copy agent into prefix: %w", err)
 	}
 	res.CopiedTo = dest
+	// A failure from here on takes back an exe this run put there; one that
+	// was already installed stays, it may be the one the prefix runs.
+	installed := false
+	defer func() {
+		if !installed && !hadExe {
+			_ = os.Remove(TokenDest(cfg.Prefix))
+			_ = os.Remove(dest)
+			_ = os.Remove(filepath.Dir(dest))
+		}
+	}()
+	if cfg.Token != "" {
+		if err := writeToken(TokenDest(cfg.Prefix), cfg.Token); err != nil {
+			return nil, fmt.Errorf("write the agent's token: %w", err)
+		}
+	}
 
 	res.Command = commandLine(cfg)
 	name := cfg.valueName()
 	switch route {
 	case RouteFile:
-		f, err := LoadRegFile(SystemReg(cfg.Prefix))
-		if err != nil {
-			return nil, err
-		}
-		res.Arch = f.Arch
 		res.Changed = f.SetString(RunServicesKey, name, res.Command)
 		if !res.Changed {
 			res.note("registry value was already exactly this; system.reg untouched")
+			installed = true
 			return res, nil
 		}
-		if err := f.Save(); err != nil {
-			return nil, fmt.Errorf("write system.reg: %w", err)
+		if err := saveIdle(cfg, f, res); err != nil {
+			return nil, err
 		}
 		res.note("edited %s (backup: %s)", SystemReg(cfg.Prefix), SystemReg(cfg.Prefix)+".clonecast.bak")
 	case RouteReg:
@@ -143,6 +165,7 @@ func Install(cfg Config) (*Result, error) {
 			res.note("wine output: %s", firstLine(s))
 		}
 	}
+	installed = true
 	res.note("the agent starts on the prefix's next boot; it does not start an already-running prefix")
 	if cfg.Port > 0 {
 		res.note("it dials clonecast on port %d; CLONECAST_PORT in the prefix's environment overrides that per launch", cfg.Port)
@@ -172,8 +195,8 @@ func Uninstall(cfg Config) (*Result, error) {
 		res.Arch = f.Arch
 		res.Changed = f.DeleteValue(RunServicesKey, name)
 		if res.Changed {
-			if err := f.Save(); err != nil {
-				return nil, fmt.Errorf("write system.reg: %w", err)
+			if err := saveIdle(cfg, f, res); err != nil {
+				return nil, err
 			}
 			res.note("removed %q from %s", name, RunServicesKey)
 		} else {
@@ -190,6 +213,7 @@ func Uninstall(cfg Config) (*Result, error) {
 	}
 
 	if !cfg.KeepExe {
+		_ = os.Remove(TokenDest(cfg.Prefix))
 		dest := ExeDest(cfg.Prefix)
 		res.ExeDest = dest
 		if err := os.Remove(dest); err == nil {
@@ -237,6 +261,38 @@ func ExeDest(prefix string) string {
 	return filepath.Join(prefix, "drive_c", "clonecast", ExeName)
 }
 
+// TokenName is the file beside the agent holding the secret it sends
+// clonecast. A file, not a command-line flag: any local user can read another
+// process's command line, while this is readable by its owner only.
+const TokenName = "token"
+
+// TokenDest is where the agent's token is written on the host.
+func TokenDest(prefix string) string {
+	return filepath.Join(prefix, "drive_c", "clonecast", TokenName)
+}
+
+// writeToken writes the token readable by its owner only, through a temp file
+// so a half-written one is never read.
+func writeToken(path, token string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".token*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.WriteString(token); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
 // Validate checks that a path really looks like a Wine prefix.
 func Validate(prefix string) error {
 	if strings.TrimSpace(prefix) == "" {
@@ -257,9 +313,32 @@ func Validate(prefix string) error {
 	return nil
 }
 
+// saveIdle writes system.reg, narrowing the gap between chooseRoute's "is the
+// prefix running?" check and the write (Kamino item 42). It checks again just
+// before writing, Save refuses a file rewritten since it was read, and a
+// prefix that started during the write is reported, since its wineserver may
+// overwrite the edit on shutdown. No lock closes the gap entirely: Wine takes
+// none on its registry files.
+func saveIdle(cfg Config, f *RegFile, res *Result) error {
+	if !cfg.AssumeIdle {
+		if busy, hits, err := Busy(cfg.Prefix); err == nil && busy {
+			return busyError(hits)
+		}
+	}
+	if err := f.Save(); err != nil {
+		return fmt.Errorf("write system.reg: %w", err)
+	}
+	if !cfg.AssumeIdle {
+		if busy, hits, err := Busy(cfg.Prefix); err == nil && busy {
+			res.note("warning: the prefix started while system.reg was written (%s); if the change is gone after it exits, run this again with the game closed", processList(hits))
+		}
+	}
+	return nil
+}
+
 // commandLine builds the autostart command line stored in the registry. The
 // path is fixed and space-free, so it needs no quoting; the title may contain
-// spaces and is quoted the way CommandLineToArgvW expects.
+// spaces and is quoted the way CommandLineToArgvW expects (winArg).
 //
 // -port is clonecast's listening port, the one the agent dials (REFERENCE.md
 // 4.17). It used to be the port the agent itself listened on, back when
@@ -274,9 +353,36 @@ func commandLine(cfg Config) string {
 		cmd += fmt.Sprintf(" -port %d", cfg.Port)
 	}
 	if cfg.Title != "" {
-		cmd += ` -title "` + strings.ReplaceAll(cfg.Title, `"`, `\"`) + `"`
+		cmd += " -title " + winArg(cfg.Title)
 	}
 	return cmd
+}
+
+// winArg quotes s as one argument the way CommandLineToArgvW, and Go's
+// os.Args on Windows, read it back. Backslashes are literal except before a
+// quote, where 2n of them stand for n: so a title ending in a backslash needs
+// it doubled, or it escapes the closing quote and the rest of the command line
+// joins the title (Kamino item 41).
+func winArg(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	slashes := 0
+	for _, r := range s {
+		switch r {
+		case '\\':
+			slashes++
+			continue
+		case '"':
+			b.WriteString(strings.Repeat(`\`, 2*slashes+1))
+		default:
+			b.WriteString(strings.Repeat(`\`, slashes))
+		}
+		slashes = 0
+		b.WriteRune(r)
+	}
+	b.WriteString(strings.Repeat(`\`, 2*slashes))
+	b.WriteByte('"')
+	return b.String()
 }
 
 // chooseRoute picks between editing system.reg and shelling out to wine, and
@@ -455,51 +561,4 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
-}
-
-// StartAgent launches the agent inside a prefix now, instead of waiting for
-// something to process the autostart entry.
-//
-// The registry value is only read by wineboot, which runs when a prefix is
-// created or updated — NOT when an application is launched into an
-// already-initialised prefix. A launcher that runs `wine Game.exe` directly
-// therefore never starts the agent, however correct the registry entry is, and
-// "installed — starts on the next boot" is then quietly untrue. Observed
-// exactly that: three prefixes with the value present, the games restarted, and
-// no agent process anywhere.
-//
-// Detached on purpose (its own process group, no inherited stdio): the agent
-// outlives the clonecast run that installed it, which is what the autostart was
-// for. It writes its own log inside the prefix.
-func StartAgent(cfg Config) error {
-	if strings.TrimSpace(cfg.WineCmd) == "" {
-		return errors.New("starting the agent needs a wine command for this prefix")
-	}
-	exe := InstallDirWin + `\` + ExeName
-	if _, err := os.Stat(ExeDest(cfg.Prefix)); err != nil {
-		return fmt.Errorf("agent is not installed in this prefix: %w", err)
-	}
-
-	var b strings.Builder
-	b.WriteString(cfg.WineCmd)
-	b.WriteByte(' ')
-	b.WriteString(shellQuote(exe))
-	if cfg.Port > 0 {
-		b.WriteString(" -port " + strconv.Itoa(cfg.Port))
-	}
-	if cfg.Title != "" {
-		b.WriteString(" -title " + shellQuote(cfg.Title))
-	}
-
-	cmd := exec.Command("/bin/sh", "-c", b.String())
-	cmd.Env = append(os.Environ(), "WINEPREFIX="+CleanPrefix(cfg.Prefix))
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting the agent: %w", err)
-	}
-	// Reaped in the background so this never becomes a zombie, and never
-	// waited on: the agent is meant to keep running.
-	go func() { _ = cmd.Wait() }()
-	return nil
 }

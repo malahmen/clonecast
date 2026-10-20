@@ -181,3 +181,20 @@ func TestKeepaliveAndPingWrite(t *testing.T) {
 		t.Fatalf("got %q, want %q", b.String(), "K\nP\n")
 	}
 }
+
+func TestHelloCarriesTheToken(t *testing.T) {
+	var b strings.Builder
+	if err := (Hello{Version: Version, Title: "Game", Token: "a b=c"}).Write(&b); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Decode(strings.TrimSpace(b.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Hello.Token != "a b=c" {
+		t.Errorf("token = %q", m.Hello.Token)
+	}
+	if strings.Contains(m.Hello.Describe(), "a b=c") {
+		t.Error("Describe, which goes to the log, shows the token")
+	}
+}

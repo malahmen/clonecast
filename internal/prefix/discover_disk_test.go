@@ -66,6 +66,29 @@ func TestWineCmdFromProcesses(t *testing.T) {
 		}
 	})
 
+	// Traced 2026-10-20: the Bottles sandbox has its own /tmp, so the
+	// runner's wine run on the host started a second wineserver for the
+	// prefix instead of reaching the game's.
+	t.Run("a sandboxed wineserver gets its wine through flatpak", func(t *testing.T) {
+		dir := runnerWith(t, "wine", "wineserver")
+		procRoot = t.TempDir()
+		t.Cleanup(func() { procRoot = "/proc" })
+		root := filepath.Join(procRoot, "4242", "root")
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		info := "[Application]\nname=com.usebottles.bottles\nruntime=runtime/org.gnome.Platform\n\n[Instance]\ninstance-id=1\n"
+		if err := os.WriteFile(filepath.Join(root, ".flatpak-info"), []byte(info), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		p := Proc{Prefix: "/bottles/dp-Marx", Processes: []Running{{PID: 4242, Command: serverPath(dir)}}}
+		want := "flatpak run --command='" + filepath.Join(dir, "runner", "bin", "wine") +
+			"' --env=WINEPREFIX='/bottles/dp-Marx' com.usebottles.bottles"
+		if got := WineCmdFromProcesses(p); got != want {
+			t.Fatalf("WineCmdFromProcesses =\n %q\nwant\n %q", got, want)
+		}
+	})
+
 	t.Run("an idle prefix has nothing to read", func(t *testing.T) {
 		if got := WineCmdFromProcesses(Proc{}); got != "" {
 			t.Fatalf("got %q, want empty", got)

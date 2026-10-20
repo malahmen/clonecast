@@ -58,6 +58,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -66,6 +67,8 @@ import (
 	"golang.org/x/sys/windows/registry"
 
 	"github.com/malahmen/clonecast/internal/agentwire"
+	"github.com/malahmen/clonecast/internal/logcap"
+	"github.com/malahmen/clonecast/internal/lookup"
 	"github.com/malahmen/clonecast/internal/redial"
 )
 
@@ -82,7 +85,15 @@ var (
 
 	kernel32        = syscall.NewLazyDLL("kernel32.dll")
 	procCreateMutex = kernel32.NewProc("CreateMutexW")
+	procTerminate   = kernel32.NewProc("TerminateProcess")
+
+	ntdll                       = syscall.NewLazyDLL("ntdll.dll")
+	procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
 )
+
+// processWineMakeProcessSystem is Wine's private NtSetInformationProcess
+// class (winternl.h), the one services.exe and explorer.exe use.
+const processWineMakeProcessSystem = 1000
 
 const (
 	gwHWNDNEXT = 2
@@ -114,10 +125,19 @@ var out io.Writer = os.Stderr
 // noWindowOnce keeps the "no window" explanation to a single line.
 var noWindowOnce sync.Once
 
+// searchEvery is the least time between two window searches that find
+// nothing, so keys arriving while the game is gone do not each walk the whole
+// window tree (Kamino item 39).
+const searchEvery = time.Second
+
 func logf(format string, a ...any) {
 	fmt.Fprintf(out, "%s [clonecast-agent] "+format+"\n",
 		append([]any{time.Now().Format("15:04:05.000")}, a...)...)
 }
+
+// logCap is the log's size cap; the full one is kept as <log>.1. An agent
+// writes a few lines per game session, and there is one per prefix.
+const logCap = 1 << 20
 
 // setupLog tees the log to a file. Failure is not fatal: the agent is more
 // useful running without a log than not running at all.
@@ -125,7 +145,7 @@ func setupLog(path string) {
 	if path == "" {
 		return
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := logcap.Open(path, logCap)
 	if err != nil {
 		logf("log file %s: %v (continuing without one)", path, err)
 		return
@@ -167,6 +187,41 @@ func singleInstance(name string) bool {
 		return true
 	}
 	return callErr != errAlreadyExists
+}
+
+// systemOnce runs exitWithThePrefix once, when the game window is first found.
+var systemOnce sync.Once
+
+// exitWithThePrefix makes the agent a Wine system process, like services.exe,
+// and exits when Wine shuts the prefix down. Wine keeps a prefix up while any
+// ordinary process runs, so an ordinary agent kept it up after the game had
+// closed or crashed: the wineserver and services stayed, the launcher thought
+// the game still ran, and installing refused the "running" prefix. As a
+// system process the agent no longer counts, and Wine signals the event once
+// the last ordinary process (the game) is gone.
+//
+// Only once the game's window exists. Wine does not count a system process as
+// a user of the desktop, and the agent starts at boot, seconds before the
+// game's first window: made a system process then, it was the desktop's only
+// would-be user, Wine closed that desktop, the game got a new one, and the
+// agent saw no windows at all and dropped every key (2026-10-20).
+func exitWithThePrefix() {
+	var ev syscall.Handle
+	const currentProcess = ^uintptr(0) // the pseudo-handle -1
+	st, _, _ := procNtSetInformationProcess.Call(currentProcess, processWineMakeProcessSystem,
+		uintptr(unsafe.Pointer(&ev)), unsafe.Sizeof(ev))
+	if st != 0 {
+		logf("could not become a Wine system process (NTSTATUS 0x%x); this agent will keep the prefix up after the game exits", st)
+		return
+	}
+	go func() {
+		_, _ = syscall.WaitForSingleObject(ev, syscall.INFINITE)
+		logf("the prefix is shutting down (its last program exited); exiting")
+		// Not os.Exit: its ExitProcess hung under Wine here, the main
+		// thread spinning at full CPU after the wineserver had gone.
+		_, _, _ = procTerminate.Call(currentProcess, 0)
+		os.Exit(0)
+	}()
 }
 
 func getWindowText(hwnd uintptr) string {
@@ -267,11 +322,13 @@ func findGameWindow() uintptr {
 // char-select -> world, loading screens), so a once-cached HWND becomes a dead
 // handle and PostMessage silently goes nowhere. Validity is checked cheaply
 // (IsWindow + the title still matches) on every send; only when that fails is
-// the full GetWindow tree-walk re-run.
+// the full GetWindow tree-walk re-run, and while it finds nothing, at most
+// every searchEvery.
 type resolver struct {
 	title string
 	mu    sync.Mutex
 	hwnd  uintptr
+	pace  lookup.Pacer
 }
 
 func (r *resolver) valid(h uintptr) bool {
@@ -299,6 +356,23 @@ func (r *resolver) current() uintptr {
 	if r.valid(r.hwnd) {
 		return r.hwnd
 	}
+	now := time.Now()
+	if !r.pace.Due(now) {
+		r.hwnd = 0
+		return 0
+	}
+	defer func() {
+		if r.hwnd == 0 {
+			r.pace.Missed(now)
+		} else if n := r.pace.Found(); n > 0 {
+			logf("game window found (hwnd=0x%x); %d key(s) were dropped while it was missing", r.hwnd, n)
+		}
+	}()
+	defer func() {
+		if r.hwnd != 0 {
+			systemOnce.Do(exitWithThePrefix)
+		}
+	}()
 	if r.title == "" {
 		r.hwnd = findGameWindow()
 	} else {
@@ -311,6 +385,14 @@ func (r *resolver) current() uintptr {
 		}
 	}
 	return r.hwnd
+}
+
+// dropped counts a key that had no window to go to, and reports whether it is
+// the first since the window went missing.
+func (r *resolver) dropped() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pace.Drop()
 }
 
 func lparam(scan uint16, extended, up bool) uintptr {
@@ -332,7 +414,9 @@ func post(r *resolver, f agentwire.Frame) {
 	}
 	hwnd := r.current()
 	if hwnd == 0 {
-		logf("target window not found (gone?), dropping evdev %d", f.Code)
+		if r.dropped() {
+			logf("target window not found (gone?); dropping keys until it is back, looking at most every %s", searchEvery)
+		}
 		return
 	}
 	msg := uintptr(wmKEYUP)
@@ -413,10 +497,29 @@ func resolveHost(flagHost string) string {
 	return flagHost
 }
 
+// readToken reads the secret `clonecast agent install` wrote beside this exe;
+// clonecast refuses an agent without it (Kamino item 2). Read once, at start.
+func readToken() string {
+	self, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(self), "token"))
+	if err != nil {
+		logf("no token beside the agent (%v); clonecast will refuse it until it is installed again", err)
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// token is this install's secret, sent in every hello.
+var token string
+
 // hello is what this agent announces on every (re)connection.
 func hello(title string, hwnd uintptr) agentwire.Hello {
 	self, _ := os.Executable()
 	return agentwire.Hello{
+		Token:   token,
 		Version: agentwire.Version,
 		// WINEPREFIX is what clonecast joins against the host pid of the KWin
 		// window (REFERENCE.md 4.17). Wine hands the Unix environment to
@@ -549,6 +652,7 @@ func main() {
 	})
 
 	setupLog(*logPath)
+	token = readToken()
 
 	p, from := resolvePort(*port, portSet)
 	addr := net.JoinHostPort(resolveHost(*host), strconv.Itoa(p))
@@ -570,7 +674,16 @@ func main() {
 	// clonecast reported "no agent" for a prefix running a perfectly good one.
 	// resolver.current() already re-walks on demand and returns 0 while there
 	// is nothing to find, so starting from 0 is exactly what it expects.
-	connectLoop(addr, &resolver{title: *title}, *title)
+	res := &resolver{title: *title, pace: lookup.Pacer{Every: searchEvery}}
+	// Look for the game window with or without clonecast, so the agent
+	// becomes a system process (exitWithThePrefix) and never keeps the prefix
+	// up after the game, even when clonecast never ran.
+	go func() {
+		for res.current() == 0 {
+			time.Sleep(agentwire.KeepaliveInterval)
+		}
+	}()
+	connectLoop(addr, res, *title)
 }
 
 // tolerantTee writes to every writer and reports success if ANY of them took

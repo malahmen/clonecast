@@ -3,7 +3,9 @@ package agent
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -95,12 +97,17 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 func startRegistry(t *testing.T, wins []broadcast.Window, procRoot string) (*Registry, context.CancelFunc) {
 	t.Helper()
+	return startRegistryNotify(t, wins, procRoot, func(string, bool) {})
+}
+
+func startRegistryNotify(t *testing.T, wins []broadcast.Window, procRoot string, notify func(string, bool)) (*Registry, context.CancelFunc) {
+	t.Helper()
 	reg := NewRegistry(Options{
 		Windows: func(context.Context) ([]broadcast.Window, error) {
 			return append([]broadcast.Window(nil), wins...), nil
 		},
 		PrefixOf: func(pid int) (string, error) { return prefix.PrefixOfPIDIn(procRoot, pid) },
-		Notify:   func(string, bool) {},
+		Notify:   notify,
 	})
 	if err := reg.Listen("127.0.0.1:0"); err != nil { // :0 — never collide with a real clonecast
 		t.Fatalf("listen: %v", err)
@@ -288,33 +295,41 @@ func TestRegistryRebind(t *testing.T) {
 // rather than retried forever, and the window stops claiming to be covered.
 func TestRegistryDropsAgentOnSendFailure(t *testing.T) {
 	wins := []broadcast.Window{{ID: "w1", Title: "Game"}}
-	reg, _ := startRegistry(t, wins, t.TempDir())
-	c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game"})
+	var mu sync.Mutex
+	var sawErr bool
+	reg, _ := startRegistryNotify(t, wins, t.TempDir(), func(s string, isErr bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		sawErr = sawErr || (isErr && strings.Contains(s, "dropped"))
+	})
+	dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game"})
 	waitFor(t, "the agent", func() bool { return reg.Paired("w1") })
 
 	a := reg.agentFor("w1")
 	if a == nil {
 		t.Fatal("no agent for w1")
 	}
-	_ = c.conn.Close()
-	_ = a.conn.Close() // the socket is dead from clonecast's side too
+	// Writes fail while the read side stays up, so the writer, not the read
+	// loop, is what notices.
+	if err := a.conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
 
 	d := New(reg)
 	code, _ := keys.Parse("a")
-	var sawErr bool
-	n, err := d.Deliver(context.Background(), broadcast.Delivery{
+	if _, err := d.Deliver(context.Background(), broadcast.Delivery{
 		Event:   keys.Event{Code: code, State: keys.Down},
 		Targets: []broadcast.WindowID{"w1"},
 		Origin:  "w9",
-		Notify:  func(_ string, isErr bool) { sawErr = sawErr || isErr },
-	})
-	if err != nil {
+		Notify:  func(string, bool) {},
+	}); err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
-	if n != 0 || !sawErr {
-		t.Fatalf("delivered %d with error reported = %v; want 0 and a reported error", n, sawErr)
-	}
-	waitFor(t, "the dead agent to be dropped", func() bool { return reg.Count() == 0 && !reg.Paired("w1") })
+	waitFor(t, "the dead agent to be dropped and reported", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return sawErr && reg.Count() == 0 && !reg.Paired("w1")
+	})
 }
 
 // TestRegistryKeepaliveKeepsAgent: an idle but live agent stays registered,
@@ -435,4 +450,142 @@ func TestAgentHelloIsReadAsOneValue(t *testing.T) {
 		}
 	}
 	<-done
+}
+
+// Kamino item 44: sends used to be sequential, so an agent that stopped
+// reading held every other agent's keys for up to its 2 s write deadline.
+func TestAStuckAgentDoesNotDelayTheOthers(t *testing.T) {
+	stuckEnd, stuckPeer := net.Pipe() // nobody reads stuckPeer: writes block
+	okEnd, okPeer := net.Pipe()
+	t.Cleanup(func() { _ = stuckEnd.Close(); _ = stuckPeer.Close(); _ = okEnd.Close(); _ = okPeer.Close() })
+	stuck, ok := newAgent(1, stuckEnd), newAgent(2, okEnd)
+	go stuck.run(func(error) {})
+	go ok.run(func(error) {})
+	t.Cleanup(func() { stuck.stop(); ok.stop() })
+
+	got := make(chan string, 1)
+	go func() {
+		line, _ := bufio.NewReader(okPeer).ReadString('\n')
+		got <- line
+	}()
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		if !stuck.enqueue(agentwire.Frame{Code: 30, Down: true}) {
+			t.Fatal("enqueue refused with room in the queue")
+		}
+	}
+	ok.enqueue(agentwire.Frame{Code: 30, Down: true})
+	select {
+	case line := <-got:
+		if line != "D 30\n" {
+			t.Errorf("the healthy agent got %q", line)
+		}
+		if d := time.Since(start); d > 500*time.Millisecond {
+			t.Errorf("the healthy agent waited %v", d)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the healthy agent got nothing while another was stuck")
+	}
+}
+
+func TestAFullQueueIsRefused(t *testing.T) {
+	end, peer := net.Pipe()
+	t.Cleanup(func() { _ = end.Close(); _ = peer.Close() })
+	a := newAgent(1, end) // no writer: nothing leaves the queue
+	for i := 0; i < queueLen; i++ {
+		if !a.enqueue(agentwire.Frame{Code: 30}) {
+			t.Fatalf("frame %d refused", i)
+		}
+	}
+	if a.enqueue(agentwire.Frame{Code: 30}) {
+		t.Error("a frame past the queue's length was accepted")
+	}
+	a.stop()
+	_ = <-a.out
+	if a.enqueue(agentwire.Frame{Code: 30}) {
+		t.Error("a frame was accepted for a removed agent")
+	}
+}
+
+// Kamino item 2: any local process could register as an agent and be sent
+// every broadcast key. Only an agent sending the install's token registers.
+func TestRegistryRefusesAnAgentWithoutTheToken(t *testing.T) {
+	var mu sync.Mutex
+	var lines []string
+	reg := NewRegistry(Options{Token: "s3cret", Notify: func(s string, _ bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, s)
+	}})
+	if err := reg.Listen("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	var held []*testClient
+	for _, tok := range []string{"", "", "b4d-t0ken"} {
+		c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game", Token: tok})
+		held = append(held, c)
+		if reg.Count() != 0 {
+			t.Fatalf("token %q: the agent registered", tok)
+		}
+	}
+	waitFor(t, "the refusals", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(lines) >= 2
+	})
+	dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game", Token: "s3cret"})
+	waitFor(t, "the agent with the token", func() bool { return reg.Count() == 1 })
+
+	// Held open, not closed: an agent built before 2026-10-09 redials at
+	// once when a connection ends, about 500 times a second.
+	for _, c := range held {
+		_ = c.conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if c.sc.Scan() {
+			t.Fatalf("a refused agent was sent %q", c.sc.Text())
+		}
+		var ne net.Error
+		if !errors.As(c.sc.Err(), &ne) || !ne.Timeout() {
+			t.Fatalf("a refused connection was closed (%v); want it held open", c.sc.Err())
+		}
+	}
+	_ = reg.Close()
+	for _, c := range held {
+		// Read the conn itself: the scanner keeps its timeout error.
+		_ = c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if _, err := c.conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("Close left a refused connection open (%v)", err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	refusals := 0
+	for _, l := range lines {
+		if strings.Contains(l, "refused") {
+			refusals++
+		}
+		if strings.Contains(l, "s3cret") || strings.Contains(l, "b4d-t0ken") {
+			t.Errorf("a token reached the log: %q", l)
+		}
+	}
+	if refusals != 2 {
+		t.Errorf("%d refusals logged, want 2 (no token once, the wrong token once): %q", refusals, lines)
+	}
+}
+
+func TestRegistryListensOnLoopbackOnly(t *testing.T) {
+	reg := NewRegistry(Options{})
+	t.Cleanup(func() { _ = reg.Close() })
+	for _, addr := range []string{"0.0.0.0:0", ":0", "[::]:0", "192.0.2.1:48800"} {
+		if err := reg.Listen(addr); err == nil {
+			t.Errorf("listened on %s", addr)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1:0", "localhost:0", "[::1]:0"} {
+		if err := loopbackOnly(addr); err != nil {
+			t.Errorf("%s refused: %v", addr, err)
+		}
+	}
 }

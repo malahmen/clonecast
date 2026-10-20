@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -186,7 +187,43 @@ func WineCmdFromProcesses(p Proc) string {
 		if err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
 			continue // present but not runnable: not a usable answer
 		}
+		if app := flatpakApp(r.PID); app != "" {
+			// Run on the host, this wine would not find the game's
+			// wineserver: the sandbox has its own /tmp, where the socket
+			// is. It booted a second wineserver for the same prefix, whose
+			// registry writes the game's then overwrote on exit, and which
+			// outlived the game with the agent it started (2026-10-20).
+			return "flatpak run --command=" + shellQuote(wine) +
+				" --env=WINEPREFIX=" + shellQuote(CleanPrefix(p.Prefix)) + " " + app
+		}
 		return wine
+	}
+	return ""
+}
+
+// procRoot is /proc, replaced in tests.
+var procRoot = "/proc"
+
+// flatpakApp is the Flatpak application a process runs sandboxed in, from the
+// /.flatpak-info every sandbox has; empty for a process on the host.
+func flatpakApp(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "root", ".flatpak-info"))
+	if err != nil {
+		return ""
+	}
+	inApp := false
+	for _, l := range strings.Split(string(b), "\n") {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "[") {
+			inApp = l == "[Application]"
+			continue
+		}
+		if name, ok := strings.CutPrefix(l, "name="); ok && inApp {
+			return name
+		}
 	}
 	return ""
 }

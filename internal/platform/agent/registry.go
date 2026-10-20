@@ -3,8 +3,10 @@ package agent
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"sort"
@@ -26,6 +28,11 @@ const DefaultListen = "127.0.0.1:48800"
 // (REFERENCE.md 4.16) and the game window shows up minutes later.
 const repairInterval = 2 * time.Second
 
+// queueLen is how many frames may wait for one agent. Each agent has its own
+// queue and writer, so one that stops reading delays only itself (Kamino item
+// 44); a full queue means it has not read for a long while, and it is dropped.
+const queueLen = 256
+
 // Agent is one connected in-bottle agent.
 type Agent struct {
 	ID     int64  // registry-local identity, stable for the connection
@@ -44,7 +51,50 @@ type Agent struct {
 
 	conn net.Conn
 	mu   sync.Mutex // serialises writes; the read loop runs concurrently
+
+	out      chan agentwire.Frame // frames waiting for this agent's writer
+	done     chan struct{}        // closed when the agent is removed
+	doneOnce sync.Once
 }
+
+func newAgent(id int64, c net.Conn) *Agent {
+	return &Agent{ID: id, Remote: c.RemoteAddr().String(), Since: time.Now(), conn: c,
+		out: make(chan agentwire.Frame, queueLen), done: make(chan struct{})}
+}
+
+// enqueue hands a frame to the agent's writer without waiting for the socket,
+// and reports false if its queue is full or it is gone.
+func (a *Agent) enqueue(f agentwire.Frame) bool {
+	select {
+	case <-a.done:
+		return false
+	default:
+	}
+	select {
+	case a.out <- f:
+		return true
+	default:
+		return false
+	}
+}
+
+// run writes queued frames in order until the agent is removed, or a write
+// fails, which it reports to fail and stops.
+func (a *Agent) run(fail func(error)) {
+	for {
+		select {
+		case <-a.done:
+			return
+		case f := <-a.out:
+			if err := a.send(f); err != nil {
+				fail(err)
+				return
+			}
+		}
+	}
+}
+
+func (a *Agent) stop() { a.doneOnce.Do(func() { close(a.done) }) }
 
 // Hello is what this agent announced. Always read it once and work from the
 // copy: a re-announce can land between two reads, and a comparison made from
@@ -74,9 +124,10 @@ func (a *Agent) Label() string {
 	return a.Remote
 }
 
-// send writes one frame. The deadline is short and absolute: a wedged agent
-// (a suspended prefix, a full socket buffer) must never stall the engine's
-// broadcast worker, and dropping it is recoverable — it reconnects.
+// send writes one frame, from the agent's own writer (run). The deadline is
+// short and absolute: a wedged agent (a suspended prefix, a full socket
+// buffer) is dropped rather than waited on, which is recoverable — it
+// reconnects.
 func (a *Agent) send(f agentwire.Frame) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -110,6 +161,11 @@ type Options struct {
 	// Notify reports registrations, disconnections and pairing decisions to
 	// the UI's log. nil discards them.
 	Notify func(text string, isErr bool)
+	// Token is the secret every agent must send in its hello, the one
+	// `clonecast agent install` leaves beside it (Kamino item 2). Without it
+	// any local process could register and be sent the keystrokes. "" checks
+	// nothing, for tests.
+	Token string
 }
 
 // Registry accepts agent connections and keeps the live set (REFERENCE.md
@@ -128,6 +184,10 @@ type Registry struct {
 	agents map[int64]*Agent
 	nextID int64
 	closed bool
+	// held are refused connections kept open, and warned the refusals
+	// already logged; see refuse.
+	held   map[net.Conn]struct{}
+	warned map[string]bool
 
 	changed chan struct{} // nudges the repair loop when the agent set changes
 }
@@ -146,6 +206,8 @@ func NewRegistry(opts Options) *Registry {
 		opts:    opts,
 		pair:    newPairing(opts.Windows, opts.PrefixOf, opts.Notify),
 		agents:  map[int64]*Agent{},
+		held:    map[net.Conn]struct{}{},
+		warned:  map[string]bool{},
 		changed: make(chan struct{}, 1),
 	}
 }
@@ -159,6 +221,9 @@ func NewRegistry(opts Options) *Registry {
 func (r *Registry) Listen(addr string) error {
 	if addr == "" {
 		addr = DefaultListen
+	}
+	if err := loopbackOnly(addr); err != nil {
+		return err
 	}
 	r.mu.Lock()
 	if r.closed {
@@ -189,6 +254,23 @@ func (r *Registry) Listen(addr string) error {
 	}
 	go r.accept(ln, gen)
 	return nil
+}
+
+// loopbackOnly refuses an address other machines could reach. Agents run in
+// Wine prefixes on this machine, and the keys they are sent are everything
+// broadcast (Kamino item 2).
+func loopbackOnly(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("listen address %q: %w", addr, err)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("refusing to listen for agents on %s: agents run on this machine, so the address must be loopback (for example %s)", addr, DefaultListen)
 }
 
 // Addr is the address agents are expected to dial.
@@ -286,6 +368,9 @@ func (r *Registry) Close() error {
 	for _, a := range r.agents {
 		conns = append(conns, a.conn)
 	}
+	for c := range r.held {
+		conns = append(conns, c)
+	}
 	r.agents = map[int64]*Agent{}
 	r.mu.Unlock()
 
@@ -347,6 +432,14 @@ func (r *Registry) serve(c net.Conn) {
 		r.opts.Notify(fmt.Sprintf("agent %s: first line was a %s, not a hello; closing", c.RemoteAddr(), msg.Kind), true)
 		return
 	}
+	if r.opts.Token != "" && subtle.ConstantTimeCompare([]byte(msg.Hello.Token), []byte(r.opts.Token)) != 1 {
+		why := "the wrong token"
+		if msg.Hello.Token == "" {
+			why = "no token"
+		}
+		r.refuse(c, msg.Hello, why)
+		return
+	}
 
 	a := r.add(c, msg.Hello)
 	defer r.remove(a)
@@ -372,15 +465,47 @@ func (r *Registry) serve(c net.Conn) {
 	}
 }
 
+// refuse turns away an agent without the token, and keeps its connection open
+// rather than closing it. Agents built before 2026-10-09 redial with no sleep
+// when a connection ends at once (redial.Next), so closing it spun them about
+// 500 times a second: 50,000 refusals in 90 seconds, in both logs and on the
+// wineserver the game shares. Held open, they sit idle until the game exits.
+// The refusal is logged once per prefix.
+func (r *Registry) refuse(c net.Conn, h agentwire.Hello, why string) {
+	key := h.Describe() + "\x00" + why
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	first := !r.warned[key]
+	r.warned[key] = true
+	r.held[c] = struct{}{}
+	r.mu.Unlock()
+	if first {
+		r.opts.Notify(fmt.Sprintf("agent %s (%s): refused, it sent %s; install it again (`clonecast agent install`, or i in the Prefixes pane) and restart the game",
+			c.RemoteAddr(), h.Describe(), why), true)
+	}
+	_ = c.SetReadDeadline(time.Time{})
+	_, _ = io.Copy(io.Discard, c)
+	r.mu.Lock()
+	delete(r.held, c)
+	r.mu.Unlock()
+}
+
 func (r *Registry) add(c net.Conn, h agentwire.Hello) *Agent {
 	r.mu.Lock()
 	r.nextID++
-	a := &Agent{ID: r.nextID, Remote: c.RemoteAddr().String(), Since: time.Now(), conn: c}
+	a := newAgent(r.nextID, c)
 	a.setHello(h)
 	r.agents[a.ID] = a
 	n := len(r.agents)
 	r.mu.Unlock()
 	r.opts.Notify(fmt.Sprintf("agent registered: %s (%s, win pid %d, hwnd 0x%x) — %d connected", a.Label(), h.Describe(), h.PID, h.HWND, n), false)
+	go a.run(func(err error) {
+		r.opts.Notify(fmt.Sprintf("agent %s: %v (dropped; it will re-register)", a.Label(), err), true)
+		r.drop(a)
+	})
 	r.nudge()
 	return a
 }
@@ -391,6 +516,7 @@ func (r *Registry) remove(a *Agent) {
 	delete(r.agents, a.ID)
 	n := len(r.agents)
 	r.mu.Unlock()
+	a.stop()
 	_ = a.conn.Close()
 	if present {
 		r.opts.Notify(fmt.Sprintf("agent gone: %s — %d connected", a.Label(), n), n == 0)

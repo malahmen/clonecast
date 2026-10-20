@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,10 +20,8 @@ import (
 	"github.com/malahmen/clonecast/internal/tui"
 )
 
-// newLinuxPlatform wires capture, injection and KWin. kwinOnly leaves the
-// master as KWin's active window alone, without the X input focus correction:
-// with --master-by-agent the master's keys no longer follow the X focus.
-func newLinuxPlatform(kwinOnly bool, kbdPaths ...string) (*platform, error) {
+// newLinuxPlatform wires capture, injection and KWin.
+func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 	// Switchable rather than Open: which keyboard to capture has to be
 	// changeable while running, because discovery cannot tell one node of a
 	// keyboard from another and only typing on it can.
@@ -54,12 +51,12 @@ func newLinuxPlatform(kwinOnly bool, kbdPaths ...string) (*platform, error) {
 		return nil, fmt.Errorf("kwin: %w", err)
 	}
 	// The master is KWin's active window, corrected by the X input focus
-	// when the two disagree between XWayland clients (REFERENCE.md 4.22).
-	// Optional: without an X server the master is KWin's answer alone.
+	// when the two disagree between XWayland clients (REFERENCE.md 4.22),
+	// except with master by agent on (4.25), which main wires through
+	// SetCorrectWhen. Optional: without an X server the master is KWin's
+	// answer alone.
 	closeFocus := func() {}
-	if kwinOnly {
-		log.Infof("master: KWin's active window (--master-by-agent); its keys go through its agent")
-	} else if f, err := x11.NewFocus(); err == nil {
+	if f, err := x11.NewFocus(); err == nil {
 		wm.SetInputFocus(f)
 		closeFocus = func() { _ = f.Close() }
 	} else {
@@ -126,35 +123,6 @@ func setupXsend(wm broadcast.WindowManager, spec string) (broadcast.Deliverer, f
 	}
 	d := x11.NewDeliverer(s, titles)
 	return d, func() { _ = d.Close() }, nil
-}
-
-// parseTitleMap parses "Title A=val,Title B=val2" into a map. Keys and values
-// are trimmed; empty entries are ignored. A key may contain spaces (window
-// titles do); only the first '=' separates key from value.
-//
-// Only --xsend uses this now: the agent backend's title map is gone, replaced
-// by agents that register themselves and are paired by prefix (REFERENCE.md
-// 4.17). xsend is experimental and Linux-only, which is why the last of the
-// title-map machinery lives here rather than in deliver.go.
-func parseTitleMap(spec string) (map[string]string, error) {
-	m := map[string]string{}
-	for _, part := range strings.Split(spec, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		eq := strings.IndexByte(part, '=')
-		if eq < 0 {
-			return nil, fmt.Errorf("entry %q has no '='", part)
-		}
-		key := strings.TrimSpace(part[:eq])
-		val := strings.TrimSpace(part[eq+1:])
-		if key == "" || val == "" {
-			return nil, fmt.Errorf("entry %q has an empty key or value", part)
-		}
-		m[key] = val
-	}
-	return m, nil
 }
 
 // titleCache resolves a WindowID to its current title via the WindowManager,

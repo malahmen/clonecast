@@ -40,7 +40,30 @@ type PrefixPaneConfig struct {
 	Port    func() int
 	Title   string // target window title ("" = agent default)
 	WineCmd string // wine command for prefixes that are already booted
+	Token   string // the secret installed agents must send clonecast
+
+	// The rest of `agent install`/`uninstall`'s flags, changeable in the pane
+	// like the ones above (Kamino item 45).
+	Route      string // prefix.RouteAuto (""), RouteFile or RouteReg
+	ValueName  string // registry value name ("" = prefix.DefaultValueName)
+	AssumeIdle bool   // skip the running-prefix check
+	KeepExe    bool   // uninstall leaves the agent's exe in place
 }
+
+// optField is the install option the pane's text input is editing.
+type optField int
+
+const (
+	optNone optField = iota
+	optPath
+	optTitle
+	optWine
+	optExe
+	optName
+)
+
+// routes is the order o cycles the install route through.
+var routes = []string{prefix.RouteAuto, prefix.RouteFile, prefix.RouteReg}
 
 // PrefixPane lists running Wine prefixes and installs/removes/describes the
 // agent in one — the list selection or a manually entered path, whichever
@@ -56,9 +79,9 @@ type PrefixPane struct {
 	err            bool
 	busy           bool
 
-	manual      string // manually entered prefix path; "" defers to the list
-	editingPath bool
-	pathInput   textinput.Model
+	manual    string // manually entered prefix path; "" defers to the list
+	editing   optField
+	pathInput textinput.Model
 
 	target  string         // last resolved Target(), to detect a selection change
 	desc    *prefix.Status // last status fetch for target
@@ -70,18 +93,12 @@ type (
 	prefixListMsg struct {
 		procs []prefix.Proc
 		err   error
+		auto  bool // from the periodic refresh: list only, status untouched
 	}
 	prefixInstallMsg struct {
-		// started records whether the agent was launched straight away, and
-		// startErr why it was not. The autostart entry is only read by
-		// wineboot, so on a launcher that runs the game directly it never
-		// fires: installing and then starting is what actually produces a
-		// running agent.
-		started  bool
-		startErr error
-		prefix   string
-		res      *prefix.Result
-		err      error
+		prefix string
+		res    *prefix.Result
+		err    error
 	}
 	prefixUninstallMsg struct {
 		prefix string
@@ -107,7 +124,56 @@ func (p PrefixPane) Init() tea.Cmd { return p.Refresh() }
 
 // Editing reports whether the pane is capturing keystrokes for its own path
 // input, so the parent model knows not to steal them for global shortcuts.
-func (p PrefixPane) Editing() bool { return p.editingPath }
+func (p PrefixPane) Editing() bool { return p.editing != optNone }
+
+// startEdit opens the text input on one option.
+func (p PrefixPane) startEdit(f optField, value, placeholder string) (PrefixPane, tea.Cmd) {
+	p.editing = f
+	p.pathInput.Placeholder = placeholder
+	p.pathInput.SetValue(value)
+	p.pathInput.CursorEnd()
+	p.pathInput.Focus()
+	return p, textinput.Blink
+}
+
+// applyEdit stores what was typed into the option being edited.
+func (p *PrefixPane) applyEdit(value string) tea.Cmd {
+	value = strings.TrimSpace(value)
+	f := p.editing
+	p.editing = optNone
+	switch f {
+	case optPath:
+		p.manual = value
+		return p.refreshTargetIfChanged()
+	case optTitle:
+		p.cfg.Title = value
+	case optWine:
+		p.cfg.WineCmd = value
+	case optExe:
+		p.cfg.ExePath = value
+	case optName:
+		p.cfg.ValueName = value
+		p.target = "" // the status shown depends on the value name
+		return p.refreshTargetIfChanged()
+	}
+	return nil
+}
+
+// config is an install/uninstall/status of path with the pane's options.
+func (p PrefixPane) config(path, wineCmd string) prefix.Config {
+	return prefix.Config{
+		Prefix:     path,
+		ExePath:    p.cfg.ExePath,
+		Port:       p.port(),
+		Title:      p.cfg.Title,
+		WineCmd:    wineCmd,
+		Token:      p.cfg.Token,
+		Route:      p.cfg.Route,
+		ValueName:  p.cfg.ValueName,
+		AssumeIdle: p.cfg.AssumeIdle,
+		KeepExe:    p.cfg.KeepExe,
+	}
+}
 
 // Refresh relists prefixes: the ones with live processes, plus the ones found
 // on disk. Process-only discovery could not see a prefix until its game was
@@ -117,6 +183,17 @@ func (p PrefixPane) Refresh() tea.Cmd {
 	return func() tea.Msg {
 		procs, err := prefix.DiscoverAll()
 		return prefixListMsg{procs: procs, err: err}
+	}
+}
+
+// AutoRefresh is Refresh on the TUI's periodic tick. It updates the list
+// only: the status line keeps the last install result or error. The pane used
+// to scan once at startup and on r, so a game started after clonecast showed
+// as not running for good (2026-10-20).
+func (p PrefixPane) AutoRefresh() tea.Cmd {
+	return func() tea.Msg {
+		procs, err := prefix.DiscoverAll()
+		return prefixListMsg{procs: procs, err: err, auto: true}
 	}
 }
 
@@ -154,33 +231,22 @@ func (p PrefixPane) install(path, wineCmd string) tea.Cmd {
 	if wineCmd == "" {
 		wineCmd = p.cfg.WineCmd
 	}
-	cfg := prefix.Config{
-		Prefix:  path,
-		ExePath: p.cfg.ExePath,
-		Port:    p.port(),
-		Title:   p.cfg.Title,
-		WineCmd: wineCmd,
-	}
+	cfg := p.config(path, wineCmd)
 	return func() tea.Msg {
+		// The agent is not started here: one started from outside the
+		// game's sandbox outlived the game, keeping the prefix up behind
+		// the launcher's back, and could not see the game's window. The
+		// autostart entry starts it with the game, inside the sandbox.
 		res, err := prefix.Install(cfg)
-		msg := prefixInstallMsg{prefix: path, res: res, err: err}
-		if err != nil || cfg.WineCmd == "" {
-			// No wine command means an idle prefix: there is no session to
-			// start the agent in, and booting one just to do it would be a
-			// surprise. It starts with the prefix instead.
-			return msg
-		}
-		if serr := prefix.StartAgent(cfg); serr != nil {
-			msg.startErr = serr
-		} else {
-			msg.started = true
-		}
-		return msg
+		return prefixInstallMsg{prefix: path, res: res, err: err}
 	}
 }
 
-func (p PrefixPane) uninstall(path string) tea.Cmd {
-	cfg := prefix.Config{Prefix: path, WineCmd: p.cfg.WineCmd}
+func (p PrefixPane) uninstall(path, wineCmd string) tea.Cmd {
+	if wineCmd == "" {
+		wineCmd = p.cfg.WineCmd
+	}
+	cfg := p.config(path, wineCmd)
 	return func() tea.Msg {
 		res, err := prefix.Uninstall(cfg)
 		return prefixUninstallMsg{prefix: path, res: res, err: err}
@@ -189,7 +255,7 @@ func (p PrefixPane) uninstall(path string) tea.Cmd {
 
 func (p PrefixPane) describe(path string) tea.Cmd {
 	return func() tea.Msg {
-		st, err := prefix.Describe(prefix.Config{Prefix: path})
+		st, err := prefix.Describe(prefix.Config{Prefix: path, ValueName: p.cfg.ValueName})
 		return prefixStatusMsg{prefix: path, st: st, err: err}
 	}
 }
@@ -198,6 +264,26 @@ func (p PrefixPane) describe(path string) tea.Cmd {
 func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 	switch msg := msg.(type) {
 	case prefixListMsg:
+		if msg.auto {
+			if msg.err != nil {
+				return p, nil
+			}
+			t := p.Target()
+			was := p.runningTarget(t)
+			p.procs = msg.procs
+			if p.cursor >= len(p.procs) {
+				p.cursor = max(0, len(p.procs)-1)
+			}
+			if cmd := p.refreshTargetIfChanged(); cmd != nil {
+				return p, cmd
+			}
+			if t != "" && p.runningTarget(t) != was {
+				// Its game started or stopped: the status below the list
+				// said "running: yes" after the game had closed.
+				return p, p.describe(t)
+			}
+			return p, nil
+		}
 		if msg.err != nil {
 			p.status, p.err = "scan: "+msg.err.Error(), true
 			return p, nil
@@ -222,19 +308,10 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 			return p, nil
 		}
 		p.err = false
-		switch {
-		case msg.started:
-			p.status = fmt.Sprintf("installed (%s route) and agent started — it should register in a moment; "+
-				"no restart needed", msg.res.Route)
-		case msg.startErr != nil:
-			p.status = fmt.Sprintf("installed (%s route), but starting the agent failed: %v — "+
-				"restart the game and it will start with the prefix", msg.res.Route, msg.startErr)
-			p.err = true
-		default:
-			p.status = fmt.Sprintf("installed (%s route) — it starts when this prefix next boots "+
-				"(a launcher that runs the game directly does not process the autostart entry, "+
-				"so start the game through something that boots the prefix, or install again while it runs)",
-				msg.res.Route)
+		if p.installRunning {
+			p.status = fmt.Sprintf("installed (%s route) — restart the game to start the new agent", msg.res.Route)
+		} else {
+			p.status = fmt.Sprintf("installed (%s route) — the agent starts with the game", msg.res.Route)
 		}
 		return p, p.describe(msg.prefix)
 
@@ -263,15 +340,13 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 		return p, nil
 
 	case tea.KeyMsg:
-		if p.editingPath {
+		if p.editing != optNone {
 			switch msg.Type {
 			case tea.KeyEsc:
-				p.editingPath = false
+				p.editing = optNone
 				return p, nil
 			case tea.KeyEnter:
-				p.manual = strings.TrimSpace(p.pathInput.Value())
-				p.editingPath = false
-				return p, p.refreshTargetIfChanged()
+				return p, p.applyEdit(p.pathInput.Value())
 			}
 			var cmd tea.Cmd
 			p.pathInput, cmd = p.pathInput.Update(msg)
@@ -293,11 +368,24 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 			}
 			return p, p.refreshTargetIfChanged()
 		case "p":
-			p.editingPath = true
-			p.pathInput.SetValue(p.manual)
-			p.pathInput.CursorEnd()
-			p.pathInput.Focus()
-			return p, textinput.Blink
+			return p.startEdit(optPath, p.manual, "/path/to/prefix (empty clears the manual path)")
+		case "t":
+			return p.startEdit(optTitle, p.cfg.Title, "window title the agent delivers to (empty: the prefix's game window)")
+		case "w":
+			return p.startEdit(optWine, p.cfg.WineCmd, "wine command for a running prefix (empty: worked out from its processes)")
+		case "x":
+			return p.startEdit(optExe, p.cfg.ExePath, "built clonecast-agent.exe (empty: next to clonecast, or ./bin)")
+		case "n":
+			return p.startEdit(optName, p.cfg.ValueName, "registry value name (empty: "+prefix.DefaultValueName+")")
+		case "o":
+			p.cfg.Route = nextRoute(p.cfg.Route)
+			return p, nil
+		case "a":
+			p.cfg.AssumeIdle = !p.cfg.AssumeIdle
+			return p, nil
+		case "K":
+			p.cfg.KeepExe = !p.cfg.KeepExe
+			return p, nil
 		case "i", "enter":
 			t := p.Target()
 			if t == "" || p.busy {
@@ -308,17 +396,11 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 			// would be silently discarded — but it CAN be registered through
 			// its own wine. That wine is derivable from the prefix's own
 			// processes, so a running prefix no longer has to be closed first.
-			wineCmd := ""
-			running := p.runningTarget(t)
-			if running && p.cfg.WineCmd == "" {
-				wineCmd = prefix.WineCmdFromProcesses(p.procFor(t))
-				if wineCmd == "" {
-					p.status, p.err = "this prefix is running and its wine command could not be worked out "+
-						"from its processes, so the registry cannot be written safely. Close the game and "+
-						"press i again, or start clonecast with --agent-wine.", true
-					return p, nil
-				}
+			wineCmd, ok := p.wineFor(t)
+			if !ok {
+				return p, nil
 			}
+			running := p.runningTarget(t)
 			p.busy = true
 			p.installRunning = running
 			p.status, p.err = "installing into "+t+"…", false
@@ -328,12 +410,34 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 			if t == "" || p.busy {
 				return p, nil
 			}
+			wineCmd, ok := p.wineFor(t)
+			if !ok {
+				return p, nil
+			}
 			p.busy = true
 			p.status, p.err = "uninstalling from "+t+"…", false
-			return p, p.uninstall(t)
+			return p, p.uninstall(t, wineCmd)
 		}
 	}
 	return p, nil
+}
+
+// wineFor is the wine to change a prefix's registry through: none for an idle
+// prefix (its system.reg is edited directly), else the prefix's own wine,
+// derived from its processes. A running prefix's system.reg cannot be edited
+// (its wineserver rewrites it on shutdown), so uninstall needs this as much as
+// install does. ok is false, with the status set, when it cannot be worked out.
+func (p *PrefixPane) wineFor(t string) (wineCmd string, ok bool) {
+	if !p.runningTarget(t) || p.cfg.WineCmd != "" {
+		return "", true
+	}
+	if wineCmd = prefix.WineCmdFromProcesses(p.procFor(t)); wineCmd == "" {
+		p.status, p.err = "this prefix is running and its wine command could not be worked out "+
+			"from its processes, so the registry cannot be written safely. Close the game and "+
+			"try again, or set the wine command with w.", true
+		return "", false
+	}
+	return wineCmd, true
 }
 
 // procFor is the listed entry for a prefix, so its processes can be inspected.
@@ -390,8 +494,8 @@ var (
 func (p PrefixPane) View(w, h int) string {
 	var b strings.Builder
 
-	if p.editingPath {
-		b.WriteString("prefix: " + p.pathInput.View() + "\n")
+	if p.editing != optNone {
+		b.WriteString(optLabel[p.editing] + ": " + p.pathInput.View() + "\n")
 	} else if p.manual != "" {
 		b.WriteString("prefix: " + prefixPaneOK.Render(shortPath(p.manual, max(8, w-8))) + dimHint(" (p: change)") + "\n")
 	} else {
@@ -405,7 +509,7 @@ func (p PrefixPane) View(w, h int) string {
 	// instead — so the list gives up the room rather than the message being
 	// cut to its first line, which is how the remedy got lost before.
 	statusLines := wrapTo(p.status, w)
-	rows := max(1, h-6-(len(statusLines)-1))
+	rows := max(1, h-7-(len(statusLines)-1))
 	start := 0
 	if p.cursor >= rows {
 		start = p.cursor - rows + 1
@@ -439,8 +543,52 @@ func (p PrefixPane) View(w, h int) string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString(prefixPaneDim.Render(truncate("i: install  u: uninstall  p: path  r: rescan", w)))
+	b.WriteString(truncate(p.viewOptions(), w) + "\n")
+	b.WriteString(prefixPaneDim.Render(truncate("i: install  u: uninstall  p: path  r: rescan  t/w/x/n: title/wine/exe/name  o: route  a: assume idle  K: keep exe", w)))
 	return b.String()
+}
+
+var optLabel = map[optField]string{
+	optPath: "prefix", optTitle: "title", optWine: "wine", optExe: "exe", optName: "name",
+}
+
+// viewOptions is the install options in one line, defaults dimmed.
+func (p PrefixPane) viewOptions() string {
+	opt := func(label, v, def string) string {
+		if v == "" {
+			return label + "=" + prefixPaneDim.Render(def)
+		}
+		return label + "=" + v
+	}
+	flag := func(label string, on bool) string {
+		if on {
+			return prefixPaneOK.Render(label)
+		}
+		return prefixPaneDim.Render("no " + label)
+	}
+	route := p.cfg.Route
+	if route == "" {
+		route = prefix.RouteAuto
+	}
+	return strings.Join([]string{
+		"route=" + route,
+		opt("title", p.cfg.Title, "game window"),
+		opt("name", p.cfg.ValueName, prefix.DefaultValueName),
+		opt("wine", p.cfg.WineCmd, "from its processes"),
+		opt("exe", p.cfg.ExePath, "found"),
+		flag("assume idle", p.cfg.AssumeIdle),
+		flag("keep exe", p.cfg.KeepExe),
+	}, "  ")
+}
+
+// nextRoute is the route after r in routes.
+func nextRoute(r string) string {
+	for i, x := range routes {
+		if x == r || (r == "" && x == prefix.RouteAuto) {
+			return routes[(i+1)%len(routes)]
+		}
+	}
+	return prefix.RouteAuto
 }
 
 // viewStatus renders what's installed in the current target, refreshed
