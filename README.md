@@ -7,9 +7,8 @@ Broadcast your keyboard to several windows at once, from a lazygit-style termina
 Pick which running windows receive the keys, and which keys are broadcast: everything, or an explicit set such as `A B C F1`.
 Built for [Bazzite](https://bazzite.gg) desktop mode (KDE Plasma 6 on Wayland), written in Go with [Bubble Tea](https://github.com/charmbracelet/bubbletea).
 
-> **Status: pre-alpha.** The core engine is unit tested and the UI runs against a mock backend. \
-> The Linux backends (evdev capture, uinput injection, KWin window control) compile but have **not yet been run on real Bazzite hardware**. \
-> The first thing to do on a Bazzite box is the smoke test below.
+> **Status: v1.0.0.** Runs three World of Warcraft clients under Wine/Bottles on Bazzite, with the in-bottle agent and switching by click (2026-10-20). \
+> Other games and desktops are untested.
 
 ## How it works
 
@@ -21,6 +20,8 @@ The focused window is therefore the **master**: tick all your clients, and which
 Switch windows and the master switches with you; the Targets list marks it with `M`. \
 By default nothing is broadcast unless the focused window is itself a ticked target, so typing in the terminal that runs clonecast does not drive every client (`--gate-origin=false` lifts that). \
 If KWin cannot report which window has focus, that keystroke is not broadcast at all and the log says so — clonecast would otherwise deliver to the window that just received the key through passthrough, doubling it on the client you are playing.
+
+Wine games under XWayland take the keyboard focus on their own, and KWin does not always activate the game you click. clonecast watches your mouse buttons (without grabbing them) and keeps the keyboard on the game you clicked last, until you click something else (REFERENCE.md 4.24–4.26). With `--master-by-agent`, the game you play also gets its keys through its agent while broadcasting is on, so a game that takes the focus gets nothing (4.25).
 
 How step 3 reaches an unfocused window is a selectable backend (`--deliver`):
 
@@ -98,15 +99,14 @@ running, pass the wine command to use instead, for example
 `--wine "flatpak run --command=<runner>/bin/wine com.usebottles.bottles"` or
 `--wine "PROTON_VERB=run umu-run"`; the command chosen is reported either way.
 
-> Untested against a real prefix. The mechanism is derived from Wine's source
-> (see REFERENCE.md 4.16) but has not yet been run on the Bazzite box — verify
-> with `research.md` §E step 2 before relying on it.
+Run on the Bazzite box with three Bottles prefixes since 2026-10-18 (REFERENCE.md 4.22).
 
 ## Usage
 
 ```sh
 clonecast                         # agent backend (default): agents register themselves
 clonecast --listen 127.0.0.1:48800  # where agents connect (this is the default)
+clonecast --master-by-agent       # recommended for Wine games: the game you play gets its keys through its agent while broadcasting
 clonecast --deliver dance         # legacy focus dance, no agents needed
 clonecast --keys "a b c"          # start with an explicit key set
 clonecast --keys all              # broadcast every key
@@ -117,7 +117,7 @@ clonecast --agent-exe ./bin/clonecast-agent.exe --agent-wine "flatpak run --comm
                                   # install defaults for the TUI's Prefixes pane
 ```
 
-Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the settle delay, the toggle hotkey and the agent listen address are all editable at runtime in the TUI's Settings pane.
+Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the settle delay, the toggle hotkey and the agent listen address are all editable at runtime in the TUI's Settings pane. `--master-by-agent` is set at start only.
 
 Key names are Linux `KEY_*` names without the prefix, case insensitive: `a`, `F1`, `LEFTSHIFT`, `SPACE`, `KP1`.
 
@@ -273,7 +273,7 @@ Layout:
 ```
 cmd/clonecast/           entrypoint, flags, backend selection (build tags)
 cmd/clonecast-agent/      the in-prefix agent; cross-compiled to windows/386
-cmd/kwindiag/            KWin scripting probe, for when window listing misbehaves
+cmd/kwindiag/            KWin scripting probe; `kwindiag watch` logs KWin's active window and the X focus
 cmd/e2ediag/             end-to-end delivery probe
 internal/keys/           key codes, names, and the allowlist (Set)
 internal/agentwire/      the clonecast <-> agent protocol: hello, keepalive, key frames (tested)
@@ -281,17 +281,17 @@ internal/broadcast/      the engine: passthrough + focus-juggle delivery (tested
 internal/redial/         the agent's reconnect backoff — reset by a session, not a dial (tested)
 internal/platform/agent/ the agent registry: agents connect here and are paired to windows (tested)
 internal/prefix/         Wine prefix discovery and `clonecast agent install` (tested)
-internal/platform/evdev/ Linux capture (grab) and injection (uinput clone) (tested)
+internal/platform/evdev/ Linux capture (grab), injection (uinput clone) and mouse clicks (tested)
 internal/platform/kwin/  Linux window listing/activation via KWin scripting over DBus (tested)
 internal/platform/mock/  fake backend for development
-internal/platform/x11/   X11 helpers
+internal/platform/x11/   the X input focus, the focus guard, and xsend (tested)
 internal/tui/            Bubble Tea front end, incl. the Prefixes pane (tested)
 scripts/                 setup-bazzite.sh
 ```
 
 ### Tests and CI
 
-**116 test functions** across 19 `_test.go` files, in ten packages. No
+**141 test functions** across 27 `_test.go` files, in eleven packages. No
 display, no uinput, no DBus: window lists and key events are fabricated, and
 the TUI's end-to-end checks drive a pty.
 
@@ -309,6 +309,8 @@ the TUI's end-to-end checks drive a pty.
 
 - **Modifiers are not tracked.** If `LEFTSHIFT` is not in your key set, targets get `a` when you type `A`. Add the modifier to the set, or use `all`.
 - **Held keys** reach targets as a single Down and a later Up, with the focus dance in between. Each target's own auto-repeat kicks in, but timing across targets is loose. What is *not* a problem any more is losing the Up: a release is delivered regardless of the enabled, filter and gate checks, and toggling broadcast, changing the filter or changing the target list releases whatever is held first (REFERENCE.md 4.20). A dropped Down skips a keystroke; a dropped Up leaves the key held down **inside the game** — autorun engaged, a spell key stuck — with nothing in the log looking wrong.
+- **Switch games by clicking.** Alt+Tab between games is undone while a clicked game is chosen (REFERENCE.md 4.26).
+- **Key combinations on the game you play**, with `--master-by-agent` and broadcasting on, may not work: the agent sends plain key presses. Turn broadcasting off to type chat or use Shift combinations.
 - **The terminal running clonecast** is a window like any other. Do not tick it as a target: with the origin gate on (the default) typing in it broadcasts nothing, which is the point, but ticking it would make it a real target.
 - **Wayland native only via KWin.** Any window KWin can list works, including XWayland ones. GNOME, Sway, Hyprland and gamescope are out of scope for now.
 - While broadcasting is on, the log records which broadcast keys were pressed. Turn it off before typing passwords.
