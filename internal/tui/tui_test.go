@@ -249,10 +249,10 @@ func TestTUIKeysStillWork(t *testing.T) {
 	tm.waitUntil("the origin gate to flip", func() bool { return engine.GateOrigin() != gate })
 
 	// The Settings pane still changes settings: tab twice to it, move to the
-	// settle row and step it to the next preset.
-	before := engine.Config().SettleDelay
-	tm.typeKeys("\t\tjj ")
-	tm.waitUntil("the settle delay to change", func() bool { return engine.Config().SettleDelay != before })
+	// master→agent row and flip it.
+	before := engine.Config().MasterByAgent
+	tm.typeKeys("\t\tjjjj ")
+	tm.waitUntil("master by agent to flip", func() bool { return engine.Config().MasterByAgent != before })
 }
 
 // TestTUIPrefixesPaneReachableAndWired drives the real TUI through the

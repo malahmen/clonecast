@@ -96,10 +96,14 @@ func TestAgentBackendErrorIsActionable(t *testing.T) {
 	if err == nil {
 		t.Fatal("Use(agent) with no agents: want an error")
 	}
-	for _, want := range []string{reg.Addr(), "clonecast agent install", "--deliver dance"} {
+	for _, want := range []string{reg.Addr(), "clonecast agent install", "skipped", "never falls back to moving focus"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error does not mention %q:\n%s", want, err)
 		}
+	}
+	// Kamino 187: it used to tell the user to run --deliver dance.
+	if strings.Contains(err.Error(), "--deliver dance") {
+		t.Errorf("the error still recommends the focus dance:\n%s", err)
 	}
 	if bs.Current() == deliverAgent {
 		t.Error("the refused backend was selected anyway")
@@ -135,17 +139,63 @@ func TestStartWarnsInsteadOfRefusing(t *testing.T) {
 	}
 }
 
-// TestDefaultDeliver keeps the documented defaults: agent on the real
-// platform, the self-contained dance on the mock one.
+// TestDefaultDeliver: the default is the agent backend on every platform,
+// the mock one included (Kamino 187: it was the focus dance there).
 func TestDefaultDeliver(t *testing.T) {
-	for _, tc := range []struct{ deliver, backend, want string }{
-		{"", "linux", deliverAgent},
-		{"", "mock", deliverDance},
-		{deliverXsend, "linux", deliverXsend},
-		{deliverDance, "linux", deliverDance},
+	for _, tc := range []struct{ deliver, want string }{
+		{"", deliverAgent},
+		{deliverXsend, deliverXsend},
+		{deliverAgent, deliverAgent},
 	} {
-		if got := defaultDeliver(tc.deliver, tc.backend); got != tc.want {
-			t.Errorf("defaultDeliver(%q, %q) = %q, want %q", tc.deliver, tc.backend, got, tc.want)
+		if got := defaultDeliver(tc.deliver); got != tc.want {
+			t.Errorf("defaultDeliver(%q) = %q, want %q", tc.deliver, got, tc.want)
 		}
+	}
+}
+
+// Kamino 187: the focus dance (activate each target, inject, restore focus)
+// is not a delivery backend. The TUI's delivery row cycles through Names, so
+// it must never be offered there: with no agent registered, Names on main was
+// [dance xsend] and one space on the row selected it.
+func TestNoBackendSwitchesFocus(t *testing.T) {
+	reg := registryWithWindows(t)
+	bs := newBackends(newTestEngine(), mock.NewWM(), reg, "")
+	t.Cleanup(bs.Close)
+
+	check := func(when string) {
+		t.Helper()
+		for _, name := range bs.Names() {
+			if name != deliverAgent && name != deliverXsend {
+				t.Errorf("%s: Names() offers %q, which is not a per-window backend: %v", when, name, bs.Names())
+			}
+		}
+	}
+	check("no agent registered")
+	connectAgent(t, reg, "Game — instance 1")
+	check("an agent registered")
+}
+
+// Kamino 187: --deliver dance (and the TUI, should anything still ask for it)
+// is refused with the reason and the per-window replacements, not silently
+// accepted and not a bare "unknown backend".
+func TestDanceIsRefused(t *testing.T) {
+	reg := registryWithWindows(t)
+	bs := newBackends(newTestEngine(), mock.NewWM(), reg, "")
+	t.Cleanup(bs.Close)
+
+	if _, err := bs.Start(removedDance); err == nil {
+		t.Fatal("Start(dance): want a refusal")
+	} else {
+		for _, want := range []string{"removed", "never moves focus", "--deliver agent", "--deliver xsend"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not mention %q:\n%s", want, err)
+			}
+		}
+	}
+	if err := bs.Use(removedDance); err == nil {
+		t.Fatal("Use(dance): want a refusal")
+	}
+	if bs.Current() == removedDance {
+		t.Fatal("the dance was selected anyway")
 	}
 }

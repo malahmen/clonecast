@@ -89,10 +89,69 @@ func run(t *testing.T, e *Engine, src *fakeSource, events ...keys.Event) {
 	<-done
 }
 
+// focusMover is a test-only focus-moving Deliverer: activate each target,
+// emit, restore the origin. It is the shape of the removed focus dance
+// (REFERENCE.md 4.30), kept here only because the engine still honours
+// Deliverer.MovesFocus and the logs it writes make the engine's ordering
+// visible. Nothing in clonecast delivers this way.
+type focusMover struct{ rec *recorder }
+
+func (f *focusMover) MovesFocus() bool { return true }
+func (f *focusMover) Close() error     { return nil }
+func (f *focusMover) Deliver(ctx context.Context, req Delivery) (int, error) {
+	n := 0
+	for _, t := range req.Targets {
+		if t == req.Origin {
+			continue
+		}
+		_ = f.rec.Activate(ctx, t)
+		_ = f.rec.Emit(req.Event)
+		n++
+	}
+	_ = f.rec.Activate(ctx, req.Origin)
+	return n, nil
+}
+
 func newEngine(rec *recorder, src *fakeSource) *Engine {
-	cfg := DefaultConfig()
-	cfg.SettleDelay = 0
-	return New(src, rec, rec, cfg)
+	e := New(src, rec, rec, DefaultConfig())
+	e.SetDeliverer(&focusMover{rec: rec})
+	return e
+}
+
+// Kamino 187: an engine nobody gave a backend must not fall back to focus
+// switching. It used to install the focus dance; now step 2 delivers nothing,
+// moves nothing, and says so once. Passthrough still works.
+func TestDefaultDelivererNeverMovesFocus(t *testing.T) {
+	rec := &recorder{active: "origin"}
+	src := &fakeSource{ch: make(chan keys.Event, 8)}
+	e := New(src, rec, rec, DefaultConfig())
+	e.SetTargets([]WindowID{"t1", "origin", "t2"})
+	a, _ := keys.Parse("a")
+	e.SetFilter(keys.Of(a))
+	e.SetEnabled(true)
+
+	run(t, e, src, keys.Event{Code: a, State: keys.Down}, keys.Event{Code: a, State: keys.Up})
+
+	assertLog(t, rec.snapshot(), []string{"emit@origin:A/down", "emit@origin:A/up"})
+
+	warned := 0
+	for {
+		select {
+		case n := <-e.Notices():
+			if n.Text == NoDelivererNotice {
+				warned++
+				if !n.Err {
+					t.Error("the no-backend notice is not shown as an error")
+				}
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if warned != 1 {
+		t.Fatalf("the no-backend notice was raised %d times, want once", warned)
+	}
 }
 
 func TestDisabledOnlyPassesThrough(t *testing.T) {
@@ -109,7 +168,7 @@ func TestDisabledOnlyPassesThrough(t *testing.T) {
 	assertLog(t, rec.snapshot(), want)
 }
 
-func TestBroadcastFocusDance(t *testing.T) {
+func TestBroadcastFocusMovingDeliverer(t *testing.T) {
 	rec := &recorder{active: "origin"}
 	src := &fakeSource{ch: make(chan keys.Event, 8)}
 	e := newEngine(rec, src)

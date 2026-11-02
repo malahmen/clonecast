@@ -4,7 +4,7 @@
 //
 // Every command-line option that can change while clonecast runs is also a
 // row in the Settings pane, so switching delivery backend, lifting the origin
-// gate or retuning the settle delay never means restarting with other flags.
+// gate or changing the toggle key never means restarting with other flags.
 //
 // Layout (lazygit style, five panels):
 //
@@ -110,7 +110,6 @@ type setting int
 const (
 	setDelivery setting = iota
 	setGate
-	setSettle
 	setToggle
 	setListen
 	setMasterAgent
@@ -118,26 +117,12 @@ const (
 	settingCount
 )
 
-// settlePresets is what space cycles through on the settle-delay row; `e`
-// edits it to any duration.
-var settlePresets = []time.Duration{
-	0,
-	10 * time.Millisecond,
-	20 * time.Millisecond,
-	30 * time.Millisecond,
-	50 * time.Millisecond,
-	75 * time.Millisecond,
-	100 * time.Millisecond,
-	150 * time.Millisecond,
-}
-
 // what the text input is currently editing
 type editField int
 
 const (
 	editNone editField = iota
 	editKeys
-	editSettle
 	editToggle
 	editListen
 	editXsend
@@ -388,15 +373,6 @@ func (m *Model) applyEdit() error {
 		}
 		m.engine.SetFilter(set)
 		m.appendLog("keys: "+set.String(), false)
-	case editSettle:
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("settle delay: %w (try 30ms)", err)
-		}
-		if d < 0 {
-			return fmt.Errorf("settle delay: must not be negative")
-		}
-		m.engine.SetSettleDelay(d)
 	case editToggle:
 		if value == "" || strings.EqualFold(value, "none") {
 			m.engine.SetToggleKey(0)
@@ -545,8 +521,6 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.startEdit(editKeys, m.engine.Filter().String(), `keys, e.g. "a b c f1" or "all"`)
 		case paneSettings:
 			switch m.setCursor {
-			case setSettle:
-				return m, m.startEdit(editSettle, m.engine.Config().SettleDelay.String(), "duration, e.g. 30ms")
 			case setToggle, setListen:
 				return m, m.changeSetting()
 			default:
@@ -558,8 +532,9 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // changeSetting applies space/enter on the Settings pane: cycle the delivery
-// backend, flip the gate, step the settle delay through its presets, or fall
-// back to editing the toggle key.
+// backend, flip the gate, or start editing a value. The delivery row cycles
+// only through Backends.Names, which never offers focus switching
+// (REFERENCE.md 4.30).
 func (m *Model) changeSetting() tea.Cmd {
 	switch m.setCursor {
 	case setDelivery:
@@ -568,17 +543,20 @@ func (m *Model) changeSetting() tea.Cmd {
 			return nil
 		}
 		names := m.backends.Names()
-		if len(names) < 2 {
+		cur := m.backends.Current()
+		next := ""
+		if len(names) > 0 {
+			next = names[0]
+			for i, n := range names {
+				if n == cur {
+					next = names[(i+1)%len(names)]
+					break
+				}
+			}
+		}
+		if next == "" || next == cur {
 			m.appendLog("no other delivery backend available for this run (see --deliver)", true)
 			return nil
-		}
-		cur := m.backends.Current()
-		next := names[0]
-		for i, n := range names {
-			if n == cur {
-				next = names[(i+1)%len(names)]
-				break
-			}
 		}
 		if err := m.backends.Use(next); err != nil {
 			m.appendLog("delivery "+next+": "+err.Error(), true)
@@ -587,16 +565,6 @@ func (m *Model) changeSetting() tea.Cmd {
 		m.appendLog("delivery backend: "+next, false)
 	case setGate:
 		m.engine.SetGateOrigin(!m.engine.GateOrigin())
-	case setSettle:
-		cur := m.engine.Config().SettleDelay
-		next := settlePresets[0]
-		for _, d := range settlePresets {
-			if d > cur {
-				next = d
-				break
-			}
-		}
-		m.engine.SetSettleDelay(next)
 	case setToggle:
 		return m.startEdit(editToggle, toggleName(m.engine.Config().ToggleKey), "key name, or none")
 	case setListen:
@@ -888,8 +856,8 @@ func (m Model) viewKeys(w int) string {
 // a command-line flag and can be changed without restarting.
 func (m Model) viewSettings(w int) string {
 	cfg := m.engine.Config()
-	backend := "dance"
-	if m.backends != nil {
+	backend := "none"
+	if m.backends != nil && m.backends.Current() != "" {
 		backend = m.backends.Current()
 	}
 	gate := offStyle.Render("OFF")
@@ -909,6 +877,13 @@ func (m Model) viewSettings(w int) string {
 			agents = onStyle.Render(fmt.Sprintf("%d agents", n)) + dimStyle.Render(" registered")
 		}
 	}
+	// The agent backend with nothing registered delivers to no one: it skips
+	// every target (and logs each once) rather than falling back to moving
+	// focus, which clonecast never does (REFERENCE.md 4.30). Say so on the
+	// row itself, not only in the count below.
+	if backend == "agent" && m.agents != nil && m.agents.Count() == 0 {
+		backend += offStyle.Render(" (no agents: skipped)")
+	}
 	masterAgent := offStyle.Render("OFF")
 	if cfg.MasterByAgent {
 		masterAgent = onStyle.Render("ON")
@@ -920,7 +895,6 @@ func (m Model) viewSettings(w int) string {
 	rows := [settingCount]struct{ label, value string }{
 		setDelivery:    {"delivery", backend},
 		setGate:        {"origin gate", gate},
-		setSettle:      {"settle", cfg.SettleDelay.String()},
 		setToggle:      {"toggle key", toggleName(cfg.ToggleKey)},
 		setListen:      {"listen", listen},
 		setMasterAgent: {"master→agent", masterAgent},
@@ -938,7 +912,7 @@ func (m Model) viewSettings(w int) string {
 	// change — but how many have is the first thing to look at when a ticked
 	// window is not receiving keys.
 	b.WriteString(agents + "\n")
-	if m.editing == editSettle || m.editing == editToggle || m.editing == editListen || m.editing == editXsend {
+	if m.editing == editToggle || m.editing == editListen || m.editing == editXsend {
 		b.WriteString("\n" + m.input.View())
 		if m.editErr != "" {
 			b.WriteString("\n" + errStyle.Render(m.editErr))

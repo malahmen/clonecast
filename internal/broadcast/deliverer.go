@@ -28,14 +28,17 @@ type Delivery struct {
 
 // Deliverer is the pluggable step-2 mechanism: given a broadcast-worthy event
 // and the current target set, it delivers the event to each target. It is what
-// makes clonecast's delivery method swappable (see REFERENCE.md 7.9) — the
-// focus dance is one implementation; an in-bottle PostMessage agent
-// (Technique B) and X11 XSendEvent (Technique A) are others.
+// makes clonecast's delivery method swappable (see REFERENCE.md 7.9): an
+// in-bottle PostMessage agent (Technique B) and X11 XSendEvent (Technique A).
+// The focus dance that used to be the third is gone (REFERENCE.md 4.30):
+// delivery is per window and never moves focus.
 //
 // Implementations fall into two kinds, distinguished by MovesFocus:
 //
-//   - Focus-moving (the dance): it activates each target, so while it runs the
-//     real input focus is NOT on the origin window. The engine must serialise
+//   - Focus-moving: it activates each target, so while it runs the real input
+//     focus is NOT on the origin window. No backend clonecast ships is one
+//     any more (the focus dance was removed, REFERENCE.md 4.30); the contract
+//     stays so the engine remains correct for one. The engine must serialise
 //     such a delivery against passthrough (holding focusMu for its whole
 //     duration) or a keystroke typed mid-delivery lands on the wrong window.
 //   - Focus-free (agent, xsend): it delivers to each target without ever
@@ -69,47 +72,25 @@ type Deliverer interface {
 	Close() error
 }
 
-// danceDeliverer is the original focus-juggling delivery (REFERENCE.md 4.2):
-// for each target activate it, wait SettleDelay, inject, and finally restore
-// focus to the origin the engine resolved. It is no longer the default
-// (REFERENCE.md 4.12/7.9 call it rejected for real multiboxing); it is the
-// last-resort fallback for targets that can take neither the agent nor the
-// xsend backend. It moves focus, so the engine serialises it against
-// passthrough.
-type danceDeliverer struct {
-	wm     WindowManager
-	inj    Injector
-	settle func() Config // returns current config so SettleDelay stays live-tunable
+// noDeliverer is what an engine delivers with until a real backend is set:
+// it delivers nothing and says so, once. It replaces the focus dance as the
+// built-in default (REFERENCE.md 4.30): clonecast never moves focus to
+// broadcast, so an engine nobody configured skips step 2 visibly rather
+// than falling back to focus switching. Passthrough is unaffected.
+type noDeliverer struct {
+	warned bool // only the single broadcast worker calls Deliver
 }
 
-func newDanceDeliverer(wm WindowManager, inj Injector, cfg func() Config) *danceDeliverer {
-	return &danceDeliverer{wm: wm, inj: inj, settle: cfg}
-}
+// NoDelivererNotice is the notice the default deliverer raises, once.
+const NoDelivererNotice = "no delivery backend selected: broadcast keys go nowhere (clonecast never moves focus to deliver; use the agent or xsend backend)"
 
-func (d *danceDeliverer) MovesFocus() bool { return true }
-func (d *danceDeliverer) Close() error     { return nil }
+func (d *noDeliverer) MovesFocus() bool { return false }
+func (d *noDeliverer) Close() error     { return nil }
 
-func (d *danceDeliverer) Deliver(ctx context.Context, req Delivery) (int, error) {
-	cfg := d.settle()
-	delivered := 0
-	for _, t := range req.Targets {
-		if t == req.Origin {
-			continue // already received it in step 1 (passthrough)
-		}
-		if err := d.wm.Activate(ctx, t); err != nil {
-			req.Notify("activate "+string(t)+": "+err.Error(), true)
-			continue
-		}
-		sleep(ctx, cfg.SettleDelay)
-		if err := d.inj.Emit(req.Event); err != nil {
-			req.Notify("emit "+req.Event.String()+" to "+string(t)+": "+err.Error(), true)
-			continue
-		}
-		delivered++
+func (d *noDeliverer) Deliver(_ context.Context, req Delivery) (int, error) {
+	if !d.warned {
+		d.warned = true
+		req.Notify(NoDelivererNotice, true)
 	}
-
-	if err := d.wm.Activate(ctx, req.Origin); err != nil {
-		req.Notify("restore focus to "+string(req.Origin)+": "+err.Error(), true)
-	}
-	return delivered, nil
+	return 0, nil
 }

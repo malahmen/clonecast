@@ -12,12 +12,22 @@ import (
 	"github.com/malahmen/clonecast/internal/tui"
 )
 
-// Delivery backend names, in the order the TUI cycles through them.
+// Delivery backend names, in the order the TUI cycles through them. Both
+// deliver per window and never move focus.
 const (
 	deliverAgent = "agent" // in-bottle PostMessage agent — the reliable path (REFERENCE.md 4.12/7.9)
-	deliverDance = "dance" // legacy focus juggling — last resort
 	deliverXsend = "xsend" // experimental X11 XSendEvent
 )
+
+// removedDance is the name the focus dance had. It is no longer a backend
+// (REFERENCE.md 4.30) and is refused by name, so an old command line gets the
+// reason and the replacements instead of "unknown backend".
+const removedDance = "dance"
+
+// errDanceRemoved is what --deliver dance gets.
+var errDanceRemoved = errors.New(`the "dance" delivery backend (the focus dance) was removed: clonecast never moves focus to broadcast.
+    Delivery is per window: --deliver agent (the default; an in-prefix agent per game, see "clonecast agent install")
+    or --deliver xsend (experimental, X11 XSendEvent). See REFERENCE.md 4.30`)
 
 // backends owns every delivery backend available for this run and which one
 // the engine is currently using. Each backend is built at most once and kept
@@ -53,8 +63,11 @@ func newBackends(engine *broadcast.Engine, wm broadcast.WindowManager, agents *a
 // any more, so "is it usable?" is simply "did an agent show up?"), and xsend
 // only exists on Linux. The answer changes while clonecast runs, as prefixes
 // boot and shut down.
+//
+// There is no focus-switching entry: with no agent registered and no xsend
+// the list is empty, and the TUI's delivery row cannot switch anywhere.
 func (b *backends) Names() []string {
-	names := []string{deliverDance}
+	var names []string
 	if b.agents != nil && b.agents.Count() > 0 {
 		names = append(names, deliverAgent)
 	}
@@ -108,14 +121,14 @@ func (b *backends) use(name string) error {
 			err error
 		)
 		switch name {
-		case deliverDance:
-			d, cl, err = b.engine.DanceDeliverer(), func() {}, nil
+		case removedDance:
+			err = errDanceRemoved
 		case deliverAgent:
 			d, cl, err = b.newAgent()
 		case deliverXsend:
 			d, cl, err = setupXsend(b.wm, b.xsendSpec)
 		default:
-			err = fmt.Errorf("unknown delivery backend %q (want %s, %s, or %s)", name, deliverAgent, deliverDance, deliverXsend)
+			err = fmt.Errorf("unknown delivery backend %q (want %s or %s)", name, deliverAgent, deliverXsend)
 		}
 		if err != nil {
 			return err
@@ -193,9 +206,8 @@ func errNoAgentsRegistered(addr string) error {
         clonecast agent list                          # prefixes of running Wine processes
         clonecast agent install --prefix <prefix>     # autostart it on that prefix's next boot
     Then restart the game (the agent starts with the prefix) and it appears in the Targets list with a %s marker.
-    Until then, fall back to the legacy focus dance with
-        clonecast --deliver dance
-    (the dance moves real focus per key: slow, and rejected for multiboxing — see REFERENCE.md 4.11/4.12)`, addr, tui.AgentMark)
+    Until then broadcast keys are skipped for every target without an agent (each is logged once):
+    clonecast never falls back to moving focus (REFERENCE.md 4.30)`, addr, tui.AgentMark)
 }
 
 // parseTitleMap parses "Title A=val,Title B=val2" into a map. Keys and values

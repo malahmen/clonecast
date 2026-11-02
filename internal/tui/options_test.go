@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,8 +23,8 @@ type fakeXsend struct {
 	spec string
 }
 
-func (f *fakeXsend) Names() []string   { return []string{"dance"} }
-func (f *fakeXsend) Current() string   { return "dance" }
+func (f *fakeXsend) Names() []string   { return []string{"xsend"} }
+func (f *fakeXsend) Current() string   { return "xsend" }
 func (f *fakeXsend) Use(string) error  { return nil }
 func (f *fakeXsend) XsendSpec() string { return f.spec }
 func (f *fakeXsend) SetXsendSpec(s string) error {
@@ -134,5 +135,64 @@ func TestTruncateKeepsTheWidthOfAStyledLine(t *testing.T) {
 		if lipgloss.Width(got) != w {
 			t.Errorf("truncate to %d: width %d (%q)", w, lipgloss.Width(got), got)
 		}
+	}
+}
+
+// Kamino 187: the focus dance is gone from the TUI. The Settings pane has no
+// settle row (the delay existed only for the dance) and, with no backend set,
+// the delivery row shows "none" rather than claiming the dance.
+func TestSettingsHaveNoFocusDance(t *testing.T) {
+	m := settingsModel(nil)
+	view := m.viewSettings(80)
+	for _, gone := range []string{"dance", "settle"} {
+		if strings.Contains(view, gone) {
+			t.Errorf("the Settings pane still shows %q:\n%s", gone, view)
+		}
+	}
+	if !strings.Contains(view, "delivery     none") {
+		t.Errorf("the delivery row does not say none:\n%s", view)
+	}
+}
+
+// fakeBackends is a Backends that records what the TUI asked it to use.
+type fakeBackends struct {
+	names []string
+	cur   string
+	used  []string
+}
+
+func (f *fakeBackends) Names() []string { return f.names }
+func (f *fakeBackends) Current() string { return f.cur }
+func (f *fakeBackends) Use(n string) error {
+	f.used = append(f.used, n)
+	f.cur = n
+	return nil
+}
+
+// Kamino 187: with the agent backend and no agent registered, the delivery
+// row says keys are skipped, and space on it has nowhere to go: Names never
+// offers focus switching, so it is empty, and the row refuses visibly.
+func TestDeliveryRowWithNoAgents(t *testing.T) {
+	b := &fakeBackends{cur: "agent"}
+	m := settingsModel(b)
+	m.agents = &fakeAgents{addr: "127.0.0.1:48800", paired: map[broadcast.WindowID]bool{}}
+	if view := m.viewSettings(80); !strings.Contains(view, "no agents: skipped") {
+		t.Errorf("the delivery row does not say keys are skipped:\n%s", view)
+	}
+
+	m.setCursor = setDelivery
+	m.changeSetting()
+	if len(b.used) != 0 {
+		t.Fatalf("space switched delivery to %v with nothing to switch to", b.used)
+	}
+	if last := m.log[len(m.log)-1]; !strings.Contains(last, "no other delivery backend") {
+		t.Errorf("the refusal is not logged: %q", last)
+	}
+
+	// A single other per-window backend is reachable: from agent to xsend.
+	b.names = []string{"xsend"}
+	m.changeSetting()
+	if len(b.used) != 1 || b.used[0] != "xsend" {
+		t.Fatalf("space did not switch agent -> xsend: %v", b.used)
 	}
 }

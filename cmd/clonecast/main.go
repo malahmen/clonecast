@@ -2,18 +2,19 @@
 //
 // Usage:
 //
-//	clonecast [--backend mock|linux] [--deliver agent|dance|xsend]
+//	clonecast [--backend mock|linux] [--deliver agent|xsend]
 //	          [--listen 127.0.0.1:48800] [--xsend "Title=X Title,..."]
-//	          [--keys "a b c"|all] [--toggle SCROLLLOCK] [--settle 30ms]
+//	          [--keys "a b c"|all] [--toggle SCROLLLOCK]
 //	          [--gate-origin=false] [--log PATH]
 //	          [--agent-exe PATH] [--agent-title TITLE] [--agent-wine "CMD"]
 //
 // --backend picks the platform (default "linux" on Linux, "mock" elsewhere).
-// --deliver picks how broadcast keys reach targets: the in-bottle PostMessage
-// "agent" (the default and the only path proven on real clients), the focus
-// "dance" (legacy last resort, the default with --backend mock since no agent
-// can register there), or "xsend" (experimental X11 XSendEvent; see
-// REFERENCE.md 4.12).
+// --deliver picks how broadcast keys reach targets, always per window: the
+// in-bottle PostMessage "agent" (the default, on every platform, and the only
+// path proven on real clients) or "xsend" (experimental X11 XSendEvent; see
+// REFERENCE.md 4.12). The focus dance ("dance") was removed and is refused
+// (REFERENCE.md 4.30): clonecast never moves focus to broadcast, so a target
+// with no agent is skipped and logged, never reached by focus switching.
 //
 // --listen is the one loopback address every in-bottle agent dials. Agents
 // register themselves and are paired to compositor windows by Wine prefix
@@ -45,7 +46,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/log"
@@ -92,12 +92,11 @@ func run() error {
 		defBackend = "linux"
 	}
 	backend := flag.String("backend", defBackend, "mock or linux")
-	deliver := flag.String("deliver", "", "delivery backend: agent (default), dance (legacy fallback), or xsend (experimental); default dance with --backend mock")
+	deliver := flag.String("deliver", "", "delivery backend: agent (default) or xsend (experimental); both per window, never focus switching (the focus dance was removed)")
 	listen := flag.String("listen", agent.DefaultListen, "loopback address in-bottle agents connect to and register on")
 	xsendSpec := flag.String("xsend", "", `xsend X-window-title overrides by window title, e.g. "Almerinda=World of Warcraft" (with --deliver xsend)`)
 	keySpec := flag.String("keys", "", `initial key set: "all" or names like "a b c f1" (default: none)`)
 	toggle := flag.String("toggle", "SCROLLLOCK", "key that toggles broadcasting on/off")
-	settle := flag.Duration("settle", 30*time.Millisecond, "delay between focusing a target and injecting (dance backend)")
 	gateOrigin := flag.Bool("gate-origin", true, "only broadcast while the focused window is itself a ticked target")
 	masterByAgent := flag.Bool("master-by-agent", false, "while broadcasting, send the focused game's own keys through its agent too, so a game that takes the X keyboard focus gets nothing (experimental)")
 	logPath := flag.String("log", defaultLogPath(), "log file (stdout is the TUI)")
@@ -122,7 +121,6 @@ func run() error {
 	}
 
 	cfg := broadcast.DefaultConfig()
-	cfg.SettleDelay = *settle
 	cfg.GateOrigin = *gateOrigin
 	cfg.MasterByAgent = *masterByAgent
 	if *toggle != "" {
@@ -212,7 +210,7 @@ func run() error {
 
 	bs := newBackends(engine, p.wm, agents, *xsendSpec)
 	defer bs.Close()
-	warn, err := bs.Start(defaultDeliver(*deliver, *backend))
+	warn, err := bs.Start(defaultDeliver(*deliver))
 	if err != nil {
 		return err
 	}
@@ -249,17 +247,14 @@ func run() error {
 	return err
 }
 
-// defaultDeliver resolves an empty --deliver. The agent backend is the
-// reliable one and therefore the mainline default (REFERENCE.md 4.12/7.9,
-// research issue I11); the mock platform has no Wine prefixes and so nothing
-// that could register, so there the demo default stays the self-contained
-// focus dance.
-func defaultDeliver(deliver, backend string) string {
+// defaultDeliver resolves an empty --deliver: the agent backend, on every
+// platform. It used to be the focus dance on the mock platform, where no
+// agent registers; that made the demo move focus, and focus switching is not
+// a delivery path any more (REFERENCE.md 4.30). With no agent the mock demo
+// shows passthrough and skips delivery, logging why.
+func defaultDeliver(deliver string) string {
 	if deliver != "" {
 		return deliver
-	}
-	if backend == "mock" {
-		return deliverDance
 	}
 	return deliverAgent
 }

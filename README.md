@@ -26,8 +26,9 @@ Wine games under XWayland take the keyboard focus on their own, and KWin does no
 How step 3 reaches an unfocused window is a selectable backend (`--deliver`):
 
 - `agent` (default): a small `clonecast-agent.exe` inside each Wine/Proton prefix receives the key over loopback TCP and `PostMessage`s it to the game window. No focus changes at all. Each agent connects to clonecast by itself and says which prefix it serves, so there is nothing to configure: ticking a window is all it takes.
-- `dance` (last resort): the original focus juggling — focus each target, replay the key, restore focus. Fast enough for taps, poor for held movement keys, and rejected for real multiboxing (REFERENCE.md 4.11/4.12). It is the default with `--backend mock`, which has no agents to talk to.
 - `xsend`: experimental X11 `XSendEvent`; only reaches clients in a Wine virtual desktop and can stick a key.
+
+Both deliver per window and never move focus. The old focus dance (focus each target, replay the key, restore focus) is **removed**: `--deliver dance` is refused, the TUI does not offer it, and nothing falls back to it (REFERENCE.md 4.30). A ticked window that no backend can reach — no agent registered for its prefix yet — is skipped, and the TUI and the log say so.
 
 See [REFERENCE.md](REFERENCE.md) for every design decision and the reasoning behind it.
 
@@ -35,7 +36,7 @@ See [REFERENCE.md](REFERENCE.md) for every design decision and the reasoning beh
 
 - Bazzite (or any KDE Plasma 6 Wayland desktop) in **desktop mode**. Game mode (gamescope) and the GNOME image are not supported.
 - Your user in the `input` group and a writable `/dev/uinput`. The setup script handles both.
-- `xdotool`, recommended but not required. Without it, focus switches are trusted on KWin's own report alone, which real testing found isn't reliable for actual game windows under real load (see REFERENCE.md 4.10) — keys can silently go nowhere. With it, each switch is independently verified against real focus and retried if needed. The setup script checks for it and prints an install hint if it's missing.
+- `xdotool`, optional. Delivery never switches focus, but the TUI's `f` (focus the highlighted window) does, and without `xdotool` that switch is trusted on KWin's own report alone, which real testing found isn't reliable for game windows under load (REFERENCE.md 4.10). With it, the switch is verified against real focus and retried. The setup script checks for it and prints an install hint if it's missing.
 
 ## Install
 
@@ -118,17 +119,16 @@ Run on the Bazzite box with three Bottles prefixes since 2026-10-18 (REFERENCE.m
 clonecast                         # agent backend (default): agents register themselves
 clonecast --listen 127.0.0.1:48800  # where agents connect (this is the default)
 clonecast --master-by-agent       # recommended for Wine games: the game you play gets its keys through its agent while broadcasting
-clonecast --deliver dance         # legacy focus dance, no agents needed
+clonecast --deliver xsend         # experimental XSendEvent backend (Wine virtual desktop only)
 clonecast --keys "a b c"          # start with an explicit key set
 clonecast --keys all              # broadcast every key
 clonecast --toggle PAUSE          # change the on/off hotkey (default SCROLLLOCK)
-clonecast --settle 50ms           # more time between focusing a target and injecting (dance)
 clonecast --gate-origin=false     # broadcast even when the focused window is not a target
 clonecast --agent-exe ./bin/clonecast-agent.exe --agent-wine "flatpak run --command=... com.usebottles.bottles"
                                   # install defaults for the TUI's Prefixes pane
 ```
 
-Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the settle delay, the toggle hotkey, the agent listen address, master by agent and the xsend map are all editable at runtime in the TUI's Settings pane.
+Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the toggle hotkey, the agent listen address, master by agent and the xsend map are all editable at runtime in the TUI's Settings pane.
 
 Key names are Linux `KEY_*` names without the prefix, case insensitive: `a`, `F1`, `LEFTSHIFT`, `SPACE`, `KP1`.
 
@@ -141,7 +141,7 @@ Inside the TUI:
 | `space` / `enter`   | in Targets: tick the highlighted window; in Settings: change the highlighted setting |
 | `a`                 | in Targets: tick/untick every window; in Keys: switch between "all keys" and an explicit set |
 | `f`                 | in Targets: focus the highlighted window, making it the master                |
-| `e`                 | in Keys: edit the key set; in Settings: type an exact value — settle delay, toggle key, listen address (`enter` applies, `esc` cancels) |
+| `e`                 | in Keys: edit the key set; in Settings: type an exact value — toggle key, listen address (`enter` applies, `esc` cancels) |
 | `i` / `u`           | in Prefixes: install / uninstall the agent in the selected prefix             |
 | `p`                 | in Prefixes: point at a prefix by path instead of the running-process list (`enter` applies, `esc` cancels) |
 | `t` `w` `x` `n`     | in Prefixes: edit the install's window title, wine command, agent exe, registry value name |
@@ -151,7 +151,7 @@ Inside the TUI:
 | `r`                 | in Targets/Keys/Settings: refresh the window list; in Prefixes: rescan running prefixes (both also auto-refresh) |
 | `q`                 | quit                                                                          |
 
-The Settings panel holds the runtime-tunable options: delivery backend, origin gate, settle delay, toggle hotkey, the address agents connect to, master by agent (`space` switches it) and the xsend title map (`e`) — and shows how many agents are registered. \
+The Settings panel holds the runtime-tunable options: delivery backend (agent or xsend; the row says `(no agents: skipped)` while the agent backend has nobody to deliver to), origin gate, toggle hotkey, the address agents connect to, master by agent (`space` switches it) and the xsend title map (`e`) — and shows how many agents are registered. \
 In the Targets list, `M` marks the master, `[x]` a ticked target and `●` a window that has a live in-bottle agent. A ticked window with no agent says `no agent` on its own row: tick it and nothing will reach it until an agent for that prefix registers. \
 The Prefixes panel is where that agent gets there in the first place: install, uninstall and status for a Wine prefix, without leaving the TUI (see "The in-bottle agent" above).
 
@@ -243,11 +243,11 @@ so capturing a single device behaves exactly as if the check were not there.
 
 Before trusting it with anything:
 
-1. Run `clonecast --deliver dance --keys a` in Konsole (the dance needs no agents; the agent backend needs one registered per target, and two text editors have none).
-2. Open two text editors and tick both as targets with `space` (`a` would tick every window, Konsole included).
-3. Press `b`, then click into **one of the editors** and type `a` a few times. That editor is the master: it gets the key directly, the other one gets it from clonecast. Click into the other editor and it swaps roles.
+1. Pick two Wine prefixes and install the agent in each, pointed at a window you can see typing in, e.g. `clonecast agent install --prefix <prefix> --title "Untitled - Notepad"`; then start `wine notepad` in each prefix (the agent starts with the prefix and registers).
+2. Run `clonecast --keys a` in Konsole. Both Notepad windows show `●` in the Targets list; tick both with `space` (`a` would tick every window, Konsole included).
+3. Press `b`, then click into **one of the Notepads** and type `a` a few times. That window is the master: it gets the key directly, the other one gets it from its agent. Click into the other and it swaps roles.
 4. Typing `a` in Konsole should broadcast nothing (Konsole is not a target — the log says so once). That is the origin gate; `--gate-origin=false`, or `g` in the TUI, lifts it.
-5. Check `~/.cache/clonecast/clonecast.log` for errors. If keys arrive in the wrong window, raise `--settle`.
+5. Check `~/.cache/clonecast/clonecast.log` for errors. A target that gets nothing and shows no `●` has no agent: the log names it once (`no agent has registered for target …`), and clonecast skips it rather than switching focus to reach it.
 
 If a target ignores the injected key, that application reads input in a way uinput cannot satisfy (rare). Note it in an issue.
 
@@ -278,7 +278,7 @@ Then the agent path, with a real game:
 
 ## Development
 
-The whole UI can be developed on macOS or any OS with the mock backend, which fakes windows and generates key events every few seconds.
+The whole UI can be developed on macOS or any OS with the mock backend, which fakes windows and generates key events every few seconds. No agent registers there, so the demo shows passthrough and logs that delivery is skipped.
 
 ```sh
 make run-mock   # TUI with fake windows and keys
@@ -293,10 +293,9 @@ Layout:
 cmd/clonecast/           entrypoint, flags, backend selection (build tags)
 cmd/clonecast-agent/      the in-prefix agent; cross-compiled to windows/386
 cmd/kwindiag/            KWin scripting probe; `kwindiag watch` logs KWin's active window and the X focus
-cmd/e2ediag/             end-to-end delivery probe
 internal/keys/           key codes, names, and the allowlist (Set)
 internal/agentwire/      the clonecast <-> agent protocol: hello, keepalive, key frames (tested)
-internal/broadcast/      the engine: passthrough + focus-juggle delivery (tested)
+internal/broadcast/      the engine: passthrough + per-window delivery through a pluggable backend (tested)
 internal/redial/         the agent's reconnect backoff — reset by a session, not a dial (tested)
 internal/lookup/         the agent's pacing of window searches while its game window is gone (tested)
 internal/logcap/         the size-capped log file clonecast and the agent write (tested)
@@ -329,7 +328,7 @@ the TUI's end-to-end checks drive a pty.
 ## Known limitations
 
 - **Modifiers are not tracked.** If `LEFTSHIFT` is not in your key set, targets get `a` when you type `A`. Add the modifier to the set, or use `all`.
-- **Held keys** reach targets as a single Down and a later Up, with the focus dance in between. Each target's own auto-repeat kicks in, but timing across targets is loose. What is *not* a problem any more is losing the Up: a release is delivered regardless of the enabled, filter and gate checks, and toggling broadcast, changing the filter or changing the target list releases whatever is held first (REFERENCE.md 4.20). A dropped Down skips a keystroke; a dropped Up leaves the key held down **inside the game** — autorun engaged, a spell key stuck — with nothing in the log looking wrong.
+- **Held keys** reach targets as a single Down and a later Up. Each target's own auto-repeat kicks in, but timing across targets is loose. What is *not* a problem any more is losing the Up: a release is delivered regardless of the enabled, filter and gate checks, and toggling broadcast, changing the filter or changing the target list releases whatever is held first (REFERENCE.md 4.20). A dropped Down skips a keystroke; a dropped Up leaves the key held down **inside the game** — autorun engaged, a spell key stuck — with nothing in the log looking wrong.
 - **Switch games by clicking.** Alt+Tab between games is undone while a clicked game is chosen (REFERENCE.md 4.26).
 - **Key combinations on the game you play**, with `--master-by-agent` and broadcasting on, may not work: the agent sends plain key presses. Turn broadcasting off to type chat or use Shift combinations.
 - **The terminal running clonecast** is a window like any other. Do not tick it as a target: with the origin gate on (the default) typing in it broadcasts nothing, which is the point, but ticking it would make it a real target.

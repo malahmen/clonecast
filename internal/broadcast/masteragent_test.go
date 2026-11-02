@@ -16,7 +16,6 @@ func (r *reachDeliverer) Reaches(id WindowID) bool { return r.reach[id] }
 
 func masterEngine(rec *recorder, src *fakeSource, reach ...WindowID) (*Engine, *reachDeliverer) {
 	cfg := DefaultConfig()
-	cfg.SettleDelay = 0
 	cfg.MasterByAgent = true
 	e := New(src, rec, rec, cfg)
 	d := &reachDeliverer{reach: map[WindowID]bool{}}
