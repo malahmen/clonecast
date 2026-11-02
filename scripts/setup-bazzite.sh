@@ -48,15 +48,16 @@ echo "==> reloading udev"
 sudo udevadm control --reload-rules
 sudo udevadm trigger --name-match=uinput || true
 
-# xdotool is optional, not required: without it, Activate() falls back to
-# trusting KWin's own report of a focus switch, which REFERENCE.md 4.10
-# found is not reliable on its own for real game windows under real load.
-# With it, Activate() independently verifies the switch against real X11
-# focus and retries if it hasn't happened yet. Recommended, not installed
-# automatically here — rpm-ostree layering needs a reboot, which this
-# script shouldn't spring on you for an optional dependency.
+# xdotool is optional. Broadcast delivery never switches focus (the focus
+# dance was removed, REFERENCE.md 4.30); the KWin activation xdotool checks
+# is now only the TUI's `f` (focus the highlighted window). Without xdotool that
+# switch trusts KWin's own report, which REFERENCE.md 4.10 found is not
+# reliable for real game windows under load; with it, the switch is verified
+# against real X11 focus and retried. Not installed automatically here —
+# rpm-ostree layering needs a reboot, which this script shouldn't spring on
+# you for an optional dependency.
 if ! command -v xdotool &>/dev/null; then
-  echo "==> xdotool not found (optional, but recommended — see REFERENCE.md 4.10)"
+  echo "==> xdotool not found (optional: only the TUI's focus command uses it — see REFERENCE.md 4.10)"
   if command -v rpm-ostree &>/dev/null; then
     echo "    install with: rpm-ostree install xdotool   (needs a reboot to take effect)"
   elif command -v dnf &>/dev/null; then

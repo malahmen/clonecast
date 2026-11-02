@@ -49,7 +49,7 @@ var _ broadcast.Reacher = (*Deliverer)(nil)
 func (d *Deliverer) Reaches(id broadcast.WindowID) bool { return d.reg.Paired(id) }
 
 // Close does not close the registry: the registry outlives any one backend
-// (the TUI can switch to the dance and back, and agents must stay connected
+// (the TUI can switch to xsend and back, and agents must stay connected
 // across that), so cmd/clonecast owns its lifetime.
 func (d *Deliverer) Close() error { return nil }
 

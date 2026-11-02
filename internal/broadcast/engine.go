@@ -2,7 +2,7 @@
 // takes key events from a Source, decides which ones to broadcast, and drives
 // an Injector and a WindowManager to deliver them to the selected targets.
 //
-// Delivery model (see REFERENCE.md, "Delivery by focus juggling"):
+// Delivery model (see REFERENCE.md 4 and 7.9):
 //
 //  1. Every event is replayed to the currently focused window first. Because
 //     the Source grabs the physical keyboard, nothing reaches that window
@@ -15,9 +15,10 @@
 //     current master (REFERENCE.md 7.10) — and hands the event, the ticked
 //     targets and that origin to the selected Deliverer, which delivers to
 //     every target except the origin (it already got the key in step 1).
-//     With the built-in dance backend "delivering" means activating each
-//     target in turn, replaying the event, and restoring focus to the origin;
-//     the focus-free backends (agent, xsend) never move focus at all.
+//     The backends (agent, xsend) deliver per window and never move focus.
+//     An engine with no backend set delivers nothing and says so once: there
+//     is no focus-switching fallback (the focus dance was removed,
+//     REFERENCE.md 4.30).
 //
 // Because the origin is resolved per broadcast, the master is dynamic: tick
 // every client and whichever one you are looking at is the one that plays the
@@ -30,13 +31,19 @@
 // slow and pointless: the target applications generate their own repeats from
 // the Down they already received.
 //
+// The paragraphs below were written for the focus dance, the focus-moving
+// delivery clonecast had until REFERENCE.md 4.30. No shipped backend moves
+// focus now, but the engine still honours Deliverer.MovesFocus, and the
+// reasoning is why focusMu exists.
+//
 // Passthrough is decoupled from the backlog of broadcast dances, but not
 // from whichever one dance is actually in flight right now — that
 // distinction matters and was originally missed; see the two paragraphs
 // below.
 //
-// Step 2 costs roughly SettleDelay per target plus WindowManager round-trip
-// time — tens of milliseconds per key, easily 100ms+ with several targets.
+// Step 2 of the dance cost a settle delay per target plus WindowManager
+// round-trip time — tens of milliseconds per key, easily 100ms+ with several
+// targets.
 // Running it inline in the same goroutine that reads Source events would
 // mean every keystroke waits for the *previous* keystroke's full
 // multi-window dance before it could even reach your own screen. Instead,
@@ -115,10 +122,6 @@ type Notice struct {
 
 // Config holds the tunables the UI is allowed to change while running.
 type Config struct {
-	// SettleDelay is how long to wait after activating a window before
-	// injecting into it. Too short and the compositor delivers the key to the
-	// previous window. Start at ~30ms and tune per machine.
-	SettleDelay time.Duration
 	// ToggleKey flips broadcasting on and off. It is consumed and never
 	// replayed anywhere. Zero disables the hotkey.
 	ToggleKey keys.Code
@@ -153,10 +156,9 @@ type Reacher interface {
 func DefaultConfig() Config {
 	toggle, _ := keys.Parse("SCROLLLOCK")
 	return Config{
-		SettleDelay: 30 * time.Millisecond,
-		ToggleKey:   toggle,
-		OpTimeout:   2 * time.Second,
-		GateOrigin:  true,
+		ToggleKey:  toggle,
+		OpTimeout:  2 * time.Second,
+		GateOrigin: true,
 	}
 }
 
@@ -170,8 +172,9 @@ type Engine struct {
 	// Deliverer.Deliver and REFERENCE.md 7.10.
 	wm WindowManager
 
-	// deliverer performs step 2 (broadcast). Defaults to the focus dance; swap
-	// with SetDeliverer for the agent or xsend backends. See REFERENCE.md 7.9.
+	// deliverer performs step 2 (broadcast). Defaults to noDeliverer, which
+	// delivers nothing; SetDeliverer installs the agent or xsend backend. See
+	// REFERENCE.md 7.9 and 4.30.
 	// Guarded by delivMu so the UI can switch backends while the engine runs.
 	// A plain Mutex: it covers a single field read once per broadcast key, far
 	// below the contention an RWMutex would need to justify itself.
@@ -189,10 +192,12 @@ type Engine struct {
 	// delivery line (see SetNoticeSink). Set once, before Run.
 	noticeSink func(Notice)
 
-	// focusMu is held by a dance for its entire duration — from before it
-	// reads the origin window through the final restore — and by
-	// passthrough's Emit call, just for that one call. This is what stops
-	// passthrough from firing while a dance has genuinely moved real focus
+	// focusMu is held by a focus-moving delivery (Deliverer.MovesFocus; no
+	// shipped backend is one since the focus dance went, REFERENCE.md 4.30)
+	// for its entire duration — from before it reads the origin window
+	// through the final restore — and by passthrough's Emit call, just for
+	// that one call. This is what stops passthrough from firing while such a
+	// delivery has genuinely moved real focus
 	// away from origin; see package doc for the failure mode it fixes.
 	focusMu sync.Mutex
 
@@ -241,10 +246,10 @@ func New(src Source, inj Injector, wm WindowManager, cfg Config) *Engine {
 		queue:   make(chan item, 64),
 		held:    map[WindowID]map[keys.Code]bool{},
 	}
-	// Built-in backend: the focus dance, reading SettleDelay live from cfg.
-	// cmd/clonecast swaps in the agent backend for real runs (REFERENCE.md
-	// 4.12/7.9); the dance stays as the last-resort fallback.
-	e.deliverer = newDanceDeliverer(wm, inj, e.Config)
+	// No built-in backend: until SetDeliverer, step 2 delivers nothing and
+	// says so. There is deliberately no focus-switching fallback
+	// (REFERENCE.md 4.30); cmd/clonecast installs the agent or xsend backend.
+	e.deliverer = &noDeliverer{}
 	return e
 }
 
@@ -262,29 +267,11 @@ func (e *Engine) SetDeliverer(d Deliverer) {
 	e.delivMu.Unlock()
 }
 
-// DanceDeliverer returns a focus-dance backend bound to this engine's
-// WindowManager, Injector and live config — the same one New installs. It is
-// exported so a UI that switched to the agent or xsend backend can switch
-// back to the last-resort dance without rebuilding the engine.
-func (e *Engine) DanceDeliverer() Deliverer { return newDanceDeliverer(e.wm, e.inj, e.Config) }
-
 // Config returns the live configuration.
 func (e *Engine) Config() Config {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.cfg
-}
-
-// SetSettleDelay changes how long delivery waits after activating a target
-// before injecting (dance backend only). Takes effect on the next delivery.
-func (e *Engine) SetSettleDelay(d time.Duration) {
-	if d < 0 {
-		d = 0
-	}
-	e.mu.Lock()
-	e.cfg.SettleDelay = d
-	e.mu.Unlock()
-	e.notify("settle delay "+d.String(), false)
 }
 
 // SetToggleKey changes the hotkey that flips broadcasting on and off. Zero
@@ -445,7 +432,7 @@ func (e *Engine) handle(ev keys.Event) {
 
 	// Step 1: the focused window always gets the key: through the deliverer
 	// when it is a game an agent reaches (MasterByAgent), else by replaying
-	// it to the compositor. Passthrough waits only if a dance is actively
+	// it to the compositor. Passthrough waits only if a focus-moving delivery is
 	// holding real focus away from origin right now (focusMu) — never for
 	// the rest of the queue behind it. See package doc.
 	master := e.agentMaster()
@@ -520,7 +507,7 @@ func (e *Engine) agentMaster() WindowID {
 	return active
 }
 
-// broadcastLoop is the single worker that performs every focus dance, one at
+// broadcastLoop is the single worker that performs every delivery, one at
 // a time, for as long as ctx is alive. Serialising here (rather than in Run)
 // is what keeps two dances from interleaving, and lets Run keep reading new
 // keys off Source the whole time a dance is in flight — their passthrough
@@ -610,7 +597,7 @@ func (e *Engine) broadcast(ctx context.Context, ev keys.Event, master WindowID) 
 	d := e.deliverer
 	e.delivMu.Unlock()
 
-	// A focus-moving backend (the dance) must hold focusMu for its entire
+	// A focus-moving backend (none ships since REFERENCE.md 4.30) must hold focusMu for its entire
 	// duration: from before it reads the origin window through the final
 	// restore, real focus may not be where passthrough assumes it is (see
 	// package doc). A focus-free backend (agent/xsend) never moves focus, so
@@ -793,7 +780,7 @@ func contains(ids []WindowID, id WindowID) bool {
 }
 
 // passthroughEmit is step 1's Emit, guarded by focusMu so it can never fire
-// while a dance is actively holding real focus away from origin — see
+// while a focus-moving delivery holds real focus away from origin — see
 // package doc and focusMu's doc on Engine.
 func (e *Engine) passthroughEmit(ev keys.Event) error {
 	e.focusMu.Lock()
@@ -828,18 +815,6 @@ func (e *Engine) notifyKey(text string) {
 // sends people to held nothing but startup warnings. Per-key lines are left
 // out (see notifyKey). Call before Run; sink must not block.
 func (e *Engine) SetNoticeSink(sink func(Notice)) { e.noticeSink = sink }
-
-func sleep(ctx context.Context, d time.Duration) {
-	if d <= 0 {
-		return
-	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
-	}
-}
 
 func onOff(b bool) string {
 	if b {
