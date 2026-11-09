@@ -48,6 +48,12 @@ var _ broadcast.Reacher = (*Deliverer)(nil)
 // engine feed the master through it (broadcast.Config.MasterByAgent).
 func (d *Deliverer) Reaches(id broadcast.WindowID) bool { return d.reg.Paired(id) }
 
+var _ broadcast.Carrier = (*Deliverer)(nil)
+
+// Carries reports whether the agent can post code: a key with no Win32
+// mapping is logged and dropped in the bottle (Kamino 185).
+func (d *Deliverer) Carries(code keys.Code) bool { return agentwire.Mappable(uint16(code)) }
+
 // Close does not close the registry: the registry outlives any one backend
 // (the TUI can switch to xsend and back, and agents must stay connected
 // across that), so cmd/clonecast owns its lifetime.
@@ -63,6 +69,11 @@ func (d *Deliverer) Close() error { return nil }
 // for it held and tries again (Kamino 136).
 func (d *Deliverer) Deliver(_ context.Context, req broadcast.Delivery) ([]broadcast.WindowID, error) {
 	frame := agentwire.Frame{Code: uint16(req.Event.Code), Down: req.Event.State != keys.Up}
+	if !agentwire.Mappable(frame.Code) {
+		// No agent can post it, so none is reached: counting it delivered
+		// would be a key the game never got (Kamino 185).
+		return nil, nil
+	}
 	var delivered []broadcast.WindowID
 	for _, t := range req.Targets {
 		if t == req.Origin {

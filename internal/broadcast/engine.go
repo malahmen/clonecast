@@ -152,6 +152,14 @@ type Reacher interface {
 	Reaches(WindowID) bool
 }
 
+// Carrier is implemented by a Deliverer that cannot deliver every key code:
+// the agent posts only the keys it can map to a Win32 virtual key. In master
+// by agent mode a key it cannot carry goes to the master by passthrough, as
+// with broadcast off, instead of to an agent that would drop it (Kamino 185).
+type Carrier interface {
+	Carries(keys.Code) bool
+}
+
 // DefaultConfig is a sane starting point.
 func DefaultConfig() Config {
 	toggle, _ := keys.Parse("SCROLLLOCK")
@@ -523,6 +531,12 @@ func (e *Engine) handle(ev keys.Event) error {
 	// holding real focus away from origin right now (focusMu) — never for
 	// the rest of the queue behind it. See package doc.
 	master := e.agentMaster()
+	if master != "" && !e.carries(ev.Code) {
+		// The agent would drop it: the master gets it the old way. Down and
+		// Up take the same route, so passthrough's Up pairing (Kamino 135)
+		// needs nothing more.
+		master = ""
+	}
 	passthrough := master == ""
 	if !passthrough && ev.State == keys.Up && e.passthroughHolds(ev.Code) {
 		// The Down took passthrough and this Up the agent: the virtual
@@ -618,6 +632,16 @@ func (e *Engine) agentMaster() WindowID {
 		return ""
 	}
 	return active
+}
+
+// carries reports whether the current deliverer can deliver code; one that
+// is not a Carrier carries everything.
+func (e *Engine) carries(code keys.Code) bool {
+	e.delivMu.Lock()
+	d := e.deliverer
+	e.delivMu.Unlock()
+	c, ok := d.(Carrier)
+	return !ok || c.Carries(code)
 }
 
 // broadcastLoop is the single worker that performs every delivery, one at

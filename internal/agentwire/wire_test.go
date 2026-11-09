@@ -198,3 +198,19 @@ func TestHelloCarriesTheToken(t *testing.T) {
 		t.Error("Describe, which goes to the log, shows the token")
 	}
 }
+
+// The hello carries the found window's caption; the -title flag only stands
+// in while there is no window (Kamino 137).
+func TestAnnouncedTitle(t *testing.T) {
+	cases := []struct{ flag, caption, want string }{
+		{"", "World of Warcraft", "World of Warcraft"}, // the default install
+		{"", "", ""},                   // no window yet
+		{"Almerinda", "", "Almerinda"}, // no window yet, -title given
+		{"Almerinda", "World of Warcraft", "World of Warcraft"},
+	}
+	for _, c := range cases {
+		if got := AnnouncedTitle(c.flag, c.caption); got != c.want {
+			t.Errorf("AnnouncedTitle(%q, %q) = %q, want %q", c.flag, c.caption, got, c.want)
+		}
+	}
+}
