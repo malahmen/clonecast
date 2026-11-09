@@ -42,7 +42,7 @@
 //
 // Usage:
 //
-//	clonecast-agent [-port N] [-host 127.0.0.1] [-title "World of Warcraft"] [-log PATH]
+//	clonecast-agent [-port N] [-host 127.0.0.1] [-title "World of Warcraft"] [-protocol 3|2] [-log PATH]
 //
 // Build: GOOS=windows GOARCH=386 CGO_ENABLED=0 go build ./cmd/clonecast-agent
 // (386 because vanilla WoW / its Wine is 32-bit and 64-bit Go PE has been seen
@@ -50,6 +50,8 @@
 package main
 
 import (
+	"bufio"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io"
@@ -533,8 +535,15 @@ func readToken() string {
 	return strings.TrimSpace(string(b))
 }
 
-// token is this install's secret, sent in every hello.
+// token is this install's secret. In protocol 2 it is sent in every hello;
+// in protocol 3 it never leaves the prefix: the agent only checks clonecast's
+// proof of it and proves it back (Kamino 275).
 var token string
+
+// protocol is the agent protocol this agent speaks, -protocol. Only that one:
+// there is no fallback to 2, which a fake clonecast could otherwise ask for
+// to be sent the token.
+var protocol = agentwire.DefaultProtocol
 
 // caption is hwnd's window text, or "" for no window.
 func caption(hwnd uintptr) string {
@@ -549,9 +558,7 @@ func caption(hwnd uintptr) string {
 // from a launcher in the same prefix when clonecast pairs (Kamino 137).
 func hello(title string, hwnd uintptr, caption string) agentwire.Hello {
 	self, _ := os.Executable()
-	return agentwire.Hello{
-		Token:   token,
-		Version: agentwire.Version,
+	return agentwire.AgentHello(protocol, token, agentwire.Hello{
 		// The prefix is what clonecast joins against the host pid of the KWin
 		// window (REFERENCE.md 4.17). Wine hands the Unix environment to
 		// Windows processes unchanged, so WINEPREFIX is set under every
@@ -563,6 +570,17 @@ func hello(title string, hwnd uintptr, caption string) agentwire.Hello {
 		Exe:    self,
 		PID:    os.Getpid(),
 		HWND:   uint64(hwnd),
+	})
+}
+
+// complaints are the handshake failures already logged: an agent that cannot
+// pair redials with backoff for as long as the prefix runs, and says why once.
+var complaints agentwire.Complaints
+
+// complain logs a failed handshake the first time it happens.
+func complain(err error) {
+	if complaints.First(err) {
+		logf("clonecast refused or not proven: %v (logged once; redialling with backoff)", err)
 	}
 }
 
@@ -626,12 +644,14 @@ func cString(p unsafe.Pointer) string {
 	return string(b)
 }
 
-// session runs one connection to clonecast: announce, keep alive, and post
-// every frame that arrives until the connection ends. It returns when the
-// connection is over; the caller redials.
+// session runs one connection to clonecast: announce, prove each other in
+// protocol 3, keep alive, and post every frame that arrives until the
+// connection ends. It returns when the connection is over; the caller
+// redials.
 func session(c net.Conn, res *resolver, title string) {
 	defer c.Close()
 	w := &conn{c: c}
+	sc := bufio.NewScanner(c)
 
 	// Whatever ends the session, its keys still down are released: deferred
 	// after c.Close, so it runs first.
@@ -640,11 +660,34 @@ func session(c net.Conn, res *resolver, title string) {
 
 	announced := res.current()
 	announcedCaption := caption(announced)
-	if err := w.writeHello(hello(title, announced, announcedCaption)); err != nil {
+	h := hello(title, announced, announcedCaption)
+	var auth *agentwire.AgentAuth
+	if protocol >= 3 {
+		var err error
+		if auth, err = agentwire.NewAgentAuth(token, rand.Reader); err != nil {
+			complain(fmt.Errorf("%w; install it again with `clonecast agent install`", err))
+			return
+		}
+		h.Nonce = auth.Nonce()
+	}
+	if err := w.writeHello(h); err != nil {
 		logf("hello: %v", err)
 		return
 	}
-	logf("registered with clonecast at %s (hwnd=0x%x, prefix=%q)", c.RemoteAddr(), announced, announcedPrefix())
+	if auth != nil {
+		// clonecast proves it holds the token before anything else is sent;
+		// on a bad proof Run sends nothing and the connection is closed
+		// (Kamino 275). Nothing else writes yet, so no lock is needed.
+		_ = c.SetReadDeadline(time.Now().Add(agentwire.HelloTimeout))
+		err := auth.Run(sc, c)
+		_ = c.SetReadDeadline(time.Time{})
+		if err != nil {
+			complain(err)
+			return
+		}
+		complaints.Reset()
+	}
+	logf("registered with clonecast at %s over protocol %d (hwnd=0x%x, prefix=%q)", c.RemoteAddr(), protocol, announced, announcedPrefix())
 
 	done := make(chan struct{})
 	defer close(done)
@@ -659,7 +702,8 @@ func session(c net.Conn, res *resolver, title string) {
 				// Re-announce when the game recreated its window or its
 				// caption changed: clonecast pairs on the caption (Kamino
 				// 137), and the HWND, though diagnostic, sends people hunting
-				// the wrong problem when stale.
+				// the wrong problem when stale. In protocol 3 the hello
+				// carries no secret: the session is already proven.
 				if h := res.current(); h != 0 {
 					if text := caption(h); h != announced || text != announcedCaption {
 						announced, announcedCaption = h, text
@@ -680,9 +724,15 @@ func session(c net.Conn, res *resolver, title string) {
 	// Frames (and clonecast's pings) until the connection drops. A malformed
 	// line is skipped, never fatal: one corrupt line must not cost every
 	// keystroke after it.
-	err := agentwire.Read(c, func(m agentwire.Message) {
-		if m.Kind == agentwire.KindFrame {
+	err := agentwire.ReadFrom(sc, func(m agentwire.Message) {
+		switch m.Kind {
+		case agentwire.KindFrame:
 			post(res, &st, m.Frame)
+		case agentwire.KindVersion:
+			// clonecast is set to the other protocol: what an agent at 2
+			// hears from a clonecast at 3 (Kamino 275).
+			complain(&agentwire.VersionMismatch{Clonecast: m.Version, Agent: protocol, AgentSide: true})
+			_ = c.Close()
 		}
 	})
 	if err != nil {
@@ -744,6 +794,7 @@ func main() {
 	// see findGameWindow.
 	title := flag.String("title", "", `exact window title to deliver to; empty (the default) means this prefix's own game window`)
 	logPath := flag.String("log", defaultLogPath(), "log file (there is no console under RunServices autostart); empty to disable")
+	proto := flag.Int("protocol", agentwire.DefaultProtocol, "agent protocol, 3 or 2; clonecast must be set to the same one (2 sends the token in the hello)")
 	flag.Parse()
 
 	portSet := false
@@ -754,6 +805,13 @@ func main() {
 	})
 
 	setupLog(*logPath)
+	if !agentwire.ValidProtocol(*proto) {
+		// No guess: a protocol picked for the user is the fallback a fake
+		// clonecast could exploit.
+		logf("-protocol %d: want %d or %d; exiting", *proto, agentwire.Version, agentwire.MinVersion)
+		return
+	}
+	protocol = *proto
 	token = readToken()
 
 	p, from := resolvePort(*port, portSet)

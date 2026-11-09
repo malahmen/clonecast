@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/malahmen/clonecast/internal/agentwire"
 )
 
 // ErrNoProc is returned where prefix discovery needs /proc and there is none
@@ -47,7 +49,10 @@ type Config struct {
 	ValueName  string // registry value name ("" = DefaultValueName)
 	AssumeIdle bool   // skip the "is this prefix booted?" check and edit system.reg anyway
 	KeepExe    bool   // uninstall: leave the copied exe in place
-	Token      string // secret the agent sends clonecast, written beside it ("" = none)
+	Token      string // secret the agent proves to clonecast, written beside it ("" = none)
+	// Protocol is the agent protocol the agent is started with, 3 or 2 (0 =
+	// the agent's default, 3). It must match clonecast's (Kamino 275).
+	Protocol int
 }
 
 func (c Config) valueName() string {
@@ -93,6 +98,9 @@ type Status struct {
 func Install(cfg Config) (*Result, error) {
 	if err := Validate(cfg.Prefix); err != nil {
 		return nil, err
+	}
+	if cfg.Protocol != 0 && !agentwire.ValidProtocol(cfg.Protocol) {
+		return nil, fmt.Errorf("agent protocol %d: want %d or %d", cfg.Protocol, agentwire.Version, agentwire.MinVersion)
 	}
 	exe, err := FindAgentExe(cfg.ExePath)
 	if err != nil {
@@ -347,10 +355,16 @@ func saveIdle(cfg Config, f *RegFile, res *Result) error {
 // 48800 clonecast listens on, so an entry written without a port keeps
 // working. The value here is baked in at install time, which is why the agent
 // lets CLONECAST_PORT in the environment override it per launch.
+//
+// -protocol is written only when it is not the agent's default, 3, so a
+// default install's command line is unchanged (Kamino 275).
 func commandLine(cfg Config) string {
 	cmd := InstallDirWin + `\` + ExeName
 	if cfg.Port > 0 {
 		cmd += fmt.Sprintf(" -port %d", cfg.Port)
+	}
+	if cfg.Protocol != 0 && cfg.Protocol != agentwire.DefaultProtocol {
+		cmd += fmt.Sprintf(" -protocol %d", cfg.Protocol)
 	}
 	if cfg.Title != "" {
 		cmd += " -title " + winArg(cfg.Title)

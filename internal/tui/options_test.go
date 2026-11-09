@@ -196,3 +196,65 @@ func TestDeliveryRowWithNoAgents(t *testing.T) {
 		t.Fatalf("space did not switch agent -> xsend: %v", b.used)
 	}
 }
+
+// fakeProtoAgents is an agent registry whose protocol can be set, as
+// *agent.Registry's can.
+type fakeProtoAgents struct {
+	fakeAgents
+	proto  int
+	refuse bool
+}
+
+func (f *fakeProtoAgents) Protocol() int { return f.proto }
+func (f *fakeProtoAgents) SetProtocol(p int) error {
+	if f.refuse {
+		return errors.New("no token")
+	}
+	f.proto = p
+	return nil
+}
+
+// Kamino 275: the agent protocol is a Settings row, flipped live between 3
+// and 2 like the master→agent toggle, and shown with what 2 means.
+func TestSettingsFlipTheAgentProtocol(t *testing.T) {
+	m := settingsModel(nil)
+	a := &fakeProtoAgents{proto: 3}
+	m.agents = a
+	m.setCursor = setProtocol
+	m.changeSetting()
+	if a.proto != 2 {
+		t.Fatalf("protocol = %d after space, want 2", a.proto)
+	}
+	if v := m.viewSettings(80); !strings.Contains(v, "agent proto") || !strings.Contains(v, "2 (token in the hello)") {
+		t.Errorf("the row does not show protocol 2:\n%s", v)
+	}
+	m.changeSetting()
+	if a.proto != 3 {
+		t.Fatalf("protocol = %d after a second space, want 3", a.proto)
+	}
+	a.refuse = true
+	m.changeSetting()
+	if a.proto != 3 {
+		t.Fatal("a refused change was applied")
+	}
+	if !strings.Contains(strings.Join(m.log, "\n"), "no token") {
+		t.Errorf("the refusal is not in the log: %q", m.log)
+	}
+}
+
+// The Prefixes pane installs with clonecast's protocol as it is at install
+// time, like the port.
+func TestPrefixPaneInstallsWithTheCurrentProtocol(t *testing.T) {
+	proto := 3
+	p := NewPrefixPane(PrefixPaneConfig{Protocol: func() int { return proto }})
+	if got := p.config("/pfx", "").Protocol; got != 3 {
+		t.Fatalf("Protocol = %d, want 3", got)
+	}
+	proto = 2
+	if got := p.config("/pfx", "").Protocol; got != 2 {
+		t.Fatalf("Protocol = %d after the setting changed, want 2", got)
+	}
+	if got := NewPrefixPane(PrefixPaneConfig{}).config("/pfx", "").Protocol; got != 0 {
+		t.Fatalf("Protocol = %d with no resolver, want 0 (the agent's default)", got)
+	}
+}

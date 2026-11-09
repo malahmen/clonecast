@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -178,11 +179,17 @@ type Options struct {
 	// Notify reports registrations, disconnections and pairing decisions to
 	// the UI's log. nil discards them.
 	Notify func(text string, isErr bool)
-	// Token is the secret every agent must send in its hello, the one
-	// `clonecast agent install` leaves beside it (Kamino item 2). Without it
-	// any local process could register and be sent the keystrokes. "" checks
-	// nothing, for tests.
+	// Token is the secret every agent must prove, the one `clonecast agent
+	// install` leaves beside it (Kamino item 2). Without it any local process
+	// could register and be sent the keystrokes. Protocol 3 proves it by
+	// challenge-response and cannot run without it: every v3 agent is refused
+	// when it is "". In protocol 2 the agent sends it in the hello, and ""
+	// checks nothing, for tests.
 	Token string
+	// Protocol is the agent protocol accepted, 3 or 2; 0 means
+	// agentwire.DefaultProtocol. Only that one is accepted, with no fallback
+	// (Kamino 275); SetProtocol changes it for new connections.
+	Protocol int
 }
 
 // Registry accepts agent connections and keeps the live set (REFERENCE.md
@@ -211,6 +218,8 @@ type Registry struct {
 	maxHeld int
 	holdFor time.Duration
 
+	protocol atomic.Int32 // the agent protocol new connections must speak
+
 	changed chan struct{} // nudges the repair loop when the agent set changes
 }
 
@@ -224,7 +233,7 @@ func NewRegistry(opts Options) *Registry {
 			return nil, errors.New("no window manager")
 		}
 	}
-	return &Registry{
+	r := &Registry{
 		opts:    opts,
 		pair:    newPairing(opts.Windows, opts.PrefixOf, opts.Notify),
 		agents:  map[int64]*Agent{},
@@ -234,6 +243,29 @@ func NewRegistry(opts Options) *Registry {
 		holdFor: holdRefusedFor,
 		changed: make(chan struct{}, 1),
 	}
+	p := opts.Protocol
+	if p == 0 {
+		p = agentwire.DefaultProtocol
+	}
+	r.protocol.Store(int32(p))
+	return r
+}
+
+// Protocol is the agent protocol new connections must speak.
+func (r *Registry) Protocol() int { return int(r.protocol.Load()) }
+
+// SetProtocol changes the agent protocol for new connections; agents already
+// registered keep their session. It is the TUI's "agent proto" row and
+// --agent-protocol (Kamino 275).
+func (r *Registry) SetProtocol(p int) error {
+	if !agentwire.ValidProtocol(p) {
+		return fmt.Errorf("agent protocol %d: want %d or %d", p, agentwire.Version, agentwire.MinVersion)
+	}
+	if p >= 3 && r.opts.Token == "" {
+		return fmt.Errorf("agent protocol %d: %w", p, agentwire.ErrNoToken)
+	}
+	r.protocol.Store(int32(p))
+	return nil
 }
 
 // Listen binds addr and starts accepting agents. Called again with a different
@@ -474,16 +506,13 @@ func (r *Registry) serve(c net.Conn) {
 		r.opts.Notify(fmt.Sprintf("agent %s: first line was a %s, not a hello; closing", c.RemoteAddr(), msg.Kind), true)
 		return
 	}
-	if r.opts.Token != "" && subtle.ConstantTimeCompare([]byte(msg.Hello.Token), []byte(r.opts.Token)) != 1 {
-		why := "the wrong token"
-		if msg.Hello.Token == "" {
-			why = "no token"
-		}
-		r.refuse(c, msg.Hello, why)
+	hello, ok := r.admit(c, sc, msg.Hello)
+	if !ok {
 		return
 	}
+	proto := hello.Version
 
-	a := r.add(c, msg.Hello)
+	a := r.add(c, hello)
 	defer r.remove(a)
 
 	for {
@@ -498,16 +527,77 @@ func (r *Registry) serve(c net.Conn) {
 		if err != nil {
 			continue // one bad line is not worth the connection
 		}
-		if m.Kind == agentwire.KindHello {
+		if m.Kind == agentwire.KindHello && m.Hello.Version == proto {
 			// The agent re-resolved its window (WoW recreates its top-level
-			// window across login/loading, REFERENCE.md 4.14).
-			a.setHello(m.Hello)
+			// window across login/loading, REFERENCE.md 4.14). In v3 it
+			// carries no secret: the session was proven by the handshake.
+			h := m.Hello
+			h.Token, h.Nonce = "", ""
+			a.setHello(h)
 			r.nudge()
 		}
 	}
 }
 
-// refuse turns away an agent without the token, and keeps its connection open
+// admit decides on a connection's hello under the protocol set now, and runs
+// the v3 handshake. It reports the hello to register, without its secrets,
+// and false when the connection was refused or failed; refusals go through
+// refuse. The handshake reads under the hello's deadline, HelloTimeout.
+func (r *Registry) admit(c net.Conn, sc *bufio.Scanner, h agentwire.Hello) (agentwire.Hello, bool) {
+	proto := r.Protocol()
+	if err := agentwire.CheckVersion(proto, h); err != nil {
+		// Said to the agent too: one at the other protocol logs it. An
+		// agent built before protocol 3 ignores the line.
+		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_ = agentwire.WriteVersionRefusal(c, proto)
+		r.refuse(c, h, err.Error())
+		return h, false
+	}
+	if proto == 2 {
+		if r.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(r.opts.Token)) != 1 {
+			why := "the wrong token"
+			if h.Token == "" {
+				why = "no token"
+			}
+			r.refuse(c, h, "it sent "+why+"; "+reinstall)
+			return h, false
+		}
+		h.Token = ""
+		return h, true
+	}
+	auth, err := agentwire.NewClonecastAuth(r.opts.Token, h, rand.Reader)
+	switch {
+	case errors.Is(err, agentwire.ErrBadNonce):
+		r.refuse(c, h, "its protocol 3 hello carries no valid nonce; "+reinstall)
+		return h, false
+	case err != nil:
+		r.opts.Notify(fmt.Sprintf("agent %s (%s): cannot authenticate it: %v", c.RemoteAddr(), h.Describe(), err), true)
+		return h, false
+	}
+	_ = c.SetWriteDeadline(time.Now().Add(agentwire.HelloTimeout))
+	err = auth.Run(sc, c)
+	_ = c.SetWriteDeadline(time.Time{})
+	switch {
+	case errors.Is(err, agentwire.ErrAgentUnproven):
+		r.refuse(c, h, "it does not prove the install's token; "+reinstall)
+		return h, false
+	case err != nil:
+		// A real agent hangs up on a challenge that does not prove its
+		// token, so this is most often an agent installed with another
+		// token. Through refuse, so it is logged once, not per redial.
+		// The reason leaves out the error itself, which names the ports and
+		// would make every redial a new refusal to log.
+		r.refuse(c, h, "it did not answer the challenge: it holds another token, or is not a clonecast agent; "+reinstall)
+		return h, false
+	}
+	h.Token, h.Nonce = "", ""
+	return h, true
+}
+
+// reinstall is the advice a refusal for the token ends with.
+const reinstall = "install it again (`clonecast agent install`, or i in the Prefixes pane) and restart the game"
+
+// refuse turns away an agent without the token, or at the other protocol, and keeps its connection open
 // rather than closing it. Agents built before 2026-10-09 redial with no sleep
 // when a connection ends at once (redial.Next), so closing it spun them about
 // 500 times a second: 50,000 refusals in 90 seconds, in both logs and on the
@@ -517,6 +607,8 @@ func (r *Registry) serve(c net.Conn) {
 // Holding is bounded (Kamino 139): at most maxHeld at once, a refusal past
 // that is closed at once, and each held one is closed after holdFor however
 // much it sends.
+//
+// why is the whole reason, with what to do about it.
 func (r *Registry) refuse(c net.Conn, h agentwire.Hello, why string) {
 	key := h.Describe() + "\x00" + why
 	r.mu.Lock()
@@ -532,8 +624,7 @@ func (r *Registry) refuse(c net.Conn, h agentwire.Hello, why string) {
 	}
 	r.mu.Unlock()
 	if first {
-		r.opts.Notify(fmt.Sprintf("agent %s (%s): refused, it sent %s; install it again (`clonecast agent install`, or i in the Prefixes pane) and restart the game",
-			c.RemoteAddr(), h.Describe(), why), true)
+		r.opts.Notify(fmt.Sprintf("agent %s (%s): refused, %s", c.RemoteAddr(), h.Describe(), why), true)
 	}
 	if full {
 		return // serve's deferred Close

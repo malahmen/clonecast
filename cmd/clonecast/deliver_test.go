@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
 	"net"
 	"strings"
 	"testing"
@@ -13,12 +15,15 @@ import (
 	"github.com/malahmen/clonecast/internal/platform/mock"
 )
 
+// testToken is the token registryWithWindows' registry holds.
+const testToken = "t3st-token"
+
 // registryWithWindows builds the registry the way run() does, over the mock
-// desktop, listening on a free port.
+// desktop, listening on a free port: with a token, at protocol 3.
 func registryWithWindows(t *testing.T) *agent.Registry {
 	t.Helper()
 	wm := mock.NewWM()
-	reg := agent.NewRegistry(agent.Options{Windows: wm.List})
+	reg := agent.NewRegistry(agent.Options{Windows: wm.List, Token: testToken})
 	if err := reg.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -35,8 +40,16 @@ func connectAgent(t *testing.T, reg *agent.Registry, title string) {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	if err := (agentwire.Hello{Version: agentwire.Version, Title: title}).Write(c); err != nil {
+	auth, err := agentwire.NewAgentAuth(testToken, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (agentwire.Hello{Version: agentwire.Version, Title: title, Nonce: auth.Nonce()}).Write(c); err != nil {
 		t.Fatalf("hello: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if err := auth.Run(bufio.NewScanner(c), c); err != nil {
+		t.Fatalf("handshake: %v", err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {

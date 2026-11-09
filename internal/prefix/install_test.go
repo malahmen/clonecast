@@ -129,6 +129,51 @@ func TestCommandLineOmitsDefaults(t *testing.T) {
 	}
 }
 
+// Kamino 275: the agent protocol is written when it is 2, and left out when
+// it is the default 3 (or unset), so a default install is unchanged.
+func TestCommandLineProtocol(t *testing.T) {
+	for _, c := range []struct {
+		proto int
+		want  string
+	}{
+		{0, `C:\clonecast\clonecast-agent.exe -port 48800`},
+		{3, `C:\clonecast\clonecast-agent.exe -port 48800`},
+		{2, `C:\clonecast\clonecast-agent.exe -port 48800 -protocol 2`},
+	} {
+		if got := commandLine(Config{Port: 48800, Protocol: c.proto}); got != c.want {
+			t.Errorf("protocol %d: command = %q, want %q", c.proto, got, c.want)
+		}
+	}
+}
+
+func TestInstallRejectsAnUnknownProtocol(t *testing.T) {
+	pfx := fakePrefix(t)
+	_, err := Install(Config{Prefix: pfx, ExePath: fakeExe(t), Protocol: 4, Route: RouteFile, AssumeIdle: true})
+	if err == nil || !strings.Contains(err.Error(), "protocol 4") {
+		t.Fatalf("err = %v, want the protocol refused", err)
+	}
+	if _, err := os.Stat(ExeDest(pfx)); err == nil {
+		t.Error("an exe was copied for a refused install")
+	}
+}
+
+// The autostart entry an install writes carries -protocol 2, so an agent
+// installed for a clonecast set to 2 starts at 2 (Kamino 275).
+func TestInstallWritesTheProtocol(t *testing.T) {
+	pfx := fakePrefix(t)
+	cfg := Config{Prefix: pfx, ExePath: fakeExe(t), Protocol: 2, Route: RouteFile, AssumeIdle: true}
+	if _, err := Install(cfg); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Describe(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(st.Value, " -protocol 2") {
+		t.Errorf("autostart value = %q, want it to end in -protocol 2", st.Value)
+	}
+}
+
 func TestValidateRejectsNonPrefixes(t *testing.T) {
 	if err := Validate(""); err == nil {
 		t.Error("empty prefix accepted")

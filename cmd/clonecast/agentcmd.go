@@ -6,7 +6,7 @@ package main
 //
 //	clonecast agent list
 //	clonecast agent install   --prefix <path> [--exe file] [--port N] [--title T]
-//	                          [--wine "<cmd>"] [--route auto|file|reg] [--assume-idle]
+//	                          [--protocol 3|2] [--wine "<cmd>"] [--route auto|file|reg] [--assume-idle]
 //	clonecast agent uninstall --prefix <path> [--wine "<cmd>"] [--keep-exe]
 //	clonecast agent status    --prefix <path>
 //
@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/malahmen/clonecast/internal/agentwire"
 	"github.com/malahmen/clonecast/internal/platform/agent"
 	"github.com/malahmen/clonecast/internal/prefix"
 )
@@ -118,8 +119,12 @@ func agentInstall(args []string, out io.Writer) error {
 	a.fs.StringVar(&a.cfg.ExePath, "exe", "", "built clonecast-agent.exe (default: next to this binary, or in the bin/ beside it)")
 	a.fs.IntVar(&a.cfg.Port, "port", defaultAgentPort(), "clonecast's listening port for the agent to dial (CLONECAST_PORT in the prefix's environment overrides it)")
 	a.fs.StringVar(&a.cfg.Title, "title", "", `window title the agent delivers to (default: none, the prefix's own game window, whatever its caption)`)
+	a.fs.IntVar(&a.cfg.Protocol, "protocol", agentwire.DefaultProtocol, "agent protocol, 3 or 2; it must match clonecast's --agent-protocol (Kamino 275)")
 	if err := a.parse(args); err != nil {
 		return err
+	}
+	if !agentwire.ValidProtocol(a.cfg.Protocol) {
+		return fmt.Errorf("--protocol %d: want %d or %d", a.cfg.Protocol, agentwire.Version, agentwire.MinVersion)
 	}
 	token, err := agentToken()
 	if err != nil {

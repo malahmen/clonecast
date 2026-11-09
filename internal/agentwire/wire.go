@@ -20,12 +20,18 @@
 //
 //	agent -> clonecast
 //	  H <ver> <key>=<value> ...   hello; the first line after connecting
+//	  R <mac>                     v3: the agent's answer to the challenge
 //	  K                           keepalive (also the answer to a P)
 //
 //	clonecast -> agent
+//	  C <nonce> <mac>             v3: clonecast's proof and challenge
+//	  V <ver>                     the hello's version is not the one clonecast
+//	                              is set to; <ver> is the one it is set to
 //	  D <evdev-code>              key down
 //	  U <evdev-code>              key up
 //	  P                           ping (liveness probe; answered with K)
+//
+// The v3 handshake (H, C, R) is in auth.go.
 //
 // Hello fields, all optional and order-independent:
 //
@@ -36,8 +42,9 @@
 //	exe=     the agent's own image path (diagnostics only)
 //	pid=     the agent's Windows process id, decimal (diagnostics only)
 //	hwnd=    the resolved game window handle, hex without 0x (diagnostics)
-//	token=   the secret `clonecast agent install` left beside the agent;
-//	         clonecast refuses an agent without the right one
+//	token=   v2 only: the secret `clonecast agent install` left beside the
+//	         agent; clonecast refuses an agent without the right one
+//	nonce=   v3 only: the agent's challenge, 16 random bytes in hex
 //
 // Values are percent-encoded (net/url query escaping), so a title or a path
 // may contain spaces, '=' or non-ASCII and still survive a space-separated,
@@ -47,7 +54,10 @@
 //
 // The hello carries the protocol version so a future change is detectable: a
 // peer that is handed a version it does not implement refuses the connection
-// and says so, rather than guessing at the fields. Within a version, unknown
+// and says so, rather than guessing at the fields. This build implements 2 and
+// 3, but each side speaks only the one it is set to (Kamino 275): there is no
+// fallback, because a fake clonecast could otherwise just ask for v2 and be
+// sent the token. Within a version, unknown
 // hello fields and unknown line kinds are ignored, so additive changes (a new
 // field, a new message kind such as the foreground report research §C1
 // sketches) do not need a version bump and do not break an older peer.
@@ -68,8 +78,14 @@ import (
 //
 // 1 was the original static-port protocol: clonecast dialled the agent and the
 // stream carried nothing but D/U frames. 2 reverses the connection and adds
-// the hello and the keepalive.
-const Version = 2
+// the hello and the keepalive. 3 replaces the token in the hello with a
+// challenge-response, so the agent never sends its secret to whatever answers
+// on clonecast's port (Kamino 275).
+const Version = 3
+
+// MinVersion is the oldest protocol this build still implements. 2 is kept so
+// agents installed before 3 keep working when both sides are set to 2.
+const MinVersion = 2
 
 // Keepalive timings. The agent sends a K every KeepaliveInterval; clonecast
 // drops a connection that has been silent for DeadAfter, which is what makes a
@@ -95,6 +111,9 @@ const (
 	KindHello
 	KindKeepalive
 	KindPing
+	KindChallenge // v3: C, clonecast -> agent
+	KindResponse  // v3: R, agent -> clonecast
+	KindVersion   // V, clonecast -> agent: the hello's version was refused
 )
 
 func (k Kind) String() string {
@@ -107,6 +126,12 @@ func (k Kind) String() string {
 		return "keepalive"
 	case KindPing:
 		return "ping"
+	case KindChallenge:
+		return "challenge"
+	case KindResponse:
+		return "response"
+	case KindVersion:
+		return "version refusal"
 	}
 	return "unknown"
 }
@@ -139,7 +164,8 @@ type Hello struct {
 	Exe     string // the agent binary's own path
 	PID     int    // the agent's *Windows* pid — never a host pid
 	HWND    uint64 // the resolved game window handle
-	Token   string // the install's shared secret; never logged
+	Token   string // v2: the install's shared secret; never logged, never sent in v3
+	Nonce   string // v3: the agent's challenge (auth.go)
 }
 
 // AnnouncedTitle is the title an agent puts in its hello: the caption of the
@@ -181,6 +207,9 @@ func (h Hello) Write(w io.Writer) error {
 	if h.Token != "" {
 		fmt.Fprintf(&b, " token=%s", url.QueryEscape(h.Token))
 	}
+	if h.Nonce != "" {
+		fmt.Fprintf(&b, " nonce=%s", url.QueryEscape(h.Nonce))
+	}
 	b.WriteByte('\n')
 	_, err := io.WriteString(w, b.String())
 	return err
@@ -201,9 +230,12 @@ func (h Hello) Describe() string {
 
 // Message is one decoded line. Only the field matching Kind is meaningful.
 type Message struct {
-	Kind  Kind
-	Frame Frame
-	Hello Hello
+	Kind      Kind
+	Frame     Frame
+	Hello     Hello
+	Challenge Challenge
+	Response  Response
+	Version   int // KindVersion: the version clonecast is set to
 }
 
 // ErrUnsupportedVersion is returned by Decode for a hello whose protocol
@@ -255,6 +287,25 @@ func Decode(line string) (Message, error) {
 		return Message{Kind: KindKeepalive}, nil
 	case "P":
 		return Message{Kind: KindPing}, nil
+	case "C":
+		if len(fields) != 3 || !validNonce(fields[1]) || !validMAC(fields[2]) {
+			return Message{}, fmt.Errorf("malformed challenge %q: want %q", line, "C <nonce> <mac>")
+		}
+		return Message{Kind: KindChallenge, Challenge: Challenge{Nonce: fields[1], MAC: fields[2]}}, nil
+	case "R":
+		if len(fields) != 2 || !validMAC(fields[1]) {
+			return Message{}, fmt.Errorf("malformed response %q: want %q", line, "R <mac>")
+		}
+		return Message{Kind: KindResponse, Response: Response{MAC: fields[1]}}, nil
+	case "V":
+		if len(fields) != 2 {
+			return Message{}, fmt.Errorf("malformed version refusal %q: want %q", line, "V <ver>")
+		}
+		v, err := strconv.Atoi(fields[1])
+		if err != nil {
+			return Message{}, fmt.Errorf("malformed version refusal %q: %w", line, err)
+		}
+		return Message{Kind: KindVersion, Version: v}, nil
 	}
 	return Message{Kind: KindUnknown}, nil
 }
@@ -267,8 +318,10 @@ func parseHello(fields []string) (Hello, error) {
 	if err != nil {
 		return Hello{}, fmt.Errorf("bad version %q", fields[0])
 	}
-	if ver != Version {
-		return Hello{Version: ver}, fmt.Errorf("%w: peer speaks %d, this build speaks %d", ErrUnsupportedVersion, ver, Version)
+	// Both versions this build implements parse; which one a side accepts
+	// is its setting, checked by the caller (Kamino 275).
+	if ver < MinVersion || ver > Version {
+		return Hello{Version: ver}, fmt.Errorf("%w: peer speaks %d, this build speaks %d to %d", ErrUnsupportedVersion, ver, MinVersion, Version)
 	}
 	h := Hello{Version: ver}
 	for _, kv := range fields[1:] {
@@ -277,7 +330,7 @@ func parseHello(fields []string) (Hello, error) {
 			return Hello{}, fmt.Errorf("field %q has no '='", kv)
 		}
 		switch key {
-		case "prefix", "title", "exe", "token":
+		case "prefix", "title", "exe", "token", "nonce":
 			val, err := url.QueryUnescape(raw)
 			if err != nil {
 				return Hello{}, fmt.Errorf("field %s: %w", key, err)
@@ -291,6 +344,8 @@ func parseHello(fields []string) (Hello, error) {
 				h.Exe = val
 			case "token":
 				h.Token = val
+			case "nonce":
+				h.Nonce = val
 			}
 		case "pid":
 			n, err := strconv.Atoi(raw)
@@ -317,7 +372,13 @@ func parseHello(fields []string) (Hello, error) {
 // keystroke). Callers that need to see the malformed ones — clonecast's
 // registry, which must diagnose a bad hello — use Decode directly.
 func Read(r io.Reader, handle func(Message)) error {
-	sc := bufio.NewScanner(r)
+	return ReadFrom(bufio.NewScanner(r), handle)
+}
+
+// ReadFrom is Read on a scanner the caller already reads from: the agent's
+// v3 handshake reads its first lines through it, and a second scanner on the
+// same connection would lose whatever the first had buffered.
+func ReadFrom(sc *bufio.Scanner, handle func(Message)) error {
 	for sc.Scan() {
 		msg, err := Decode(sc.Text())
 		if err != nil || msg.Kind == KindUnknown {

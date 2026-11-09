@@ -51,6 +51,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/malahmen/clonecast/internal/agentwire"
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/keys"
 )
@@ -89,6 +90,14 @@ type Agents interface {
 	Listen(addr string) error
 }
 
+// AgentProtocol is implemented by Agents whose agent protocol can change
+// while clonecast runs (*agent.Registry): the Settings pane's "agent proto"
+// row (Kamino 275). The change applies to new connections.
+type AgentProtocol interface {
+	Protocol() int
+	SetProtocol(p int) error
+}
+
 // AgentMark is the Targets-list marker for "this window has a live agent".
 const AgentMark = "●"
 
@@ -112,6 +121,7 @@ const (
 	setGate
 	setToggle
 	setListen
+	setProtocol
 	setMasterAgent
 	setXsend
 	settingCount
@@ -576,6 +586,23 @@ func (m *Model) changeSetting() tea.Cmd {
 			return nil
 		}
 		return m.startEdit(editListen, m.agents.Addr(), "host:port agents dial, e.g. 127.0.0.1:48800")
+	case setProtocol:
+		ap, ok := m.agents.(AgentProtocol)
+		if !ok {
+			m.appendLog("the agent protocol cannot be changed in this build", true)
+			return nil
+		}
+		// Two values, so space flips between them. No fallback either way:
+		// agents must be installed with the same one (Kamino 275).
+		next := agentwire.Version
+		if ap.Protocol() == agentwire.Version {
+			next = agentwire.MinVersion
+		}
+		if err := ap.SetProtocol(next); err != nil {
+			m.appendLog("agent protocol: "+err.Error(), true)
+			return nil
+		}
+		m.appendLog(fmt.Sprintf("agent protocol: %d, for new connections; agents must be installed with --protocol %d (i in the Prefixes pane installs with it)", next, next), false)
 	case setMasterAgent:
 		m.engine.SetMasterByAgent(!m.engine.Config().MasterByAgent)
 	case setXsend:
@@ -909,11 +936,16 @@ func (m Model) viewSettings(w int) string {
 	if xm, ok := m.backends.(XsendMap); ok {
 		xsend = orNone(xm.XsendSpec())
 	}
+	proto := dimStyle.Render("—")
+	if ap, ok := m.agents.(AgentProtocol); ok {
+		proto = protocolLabel(ap.Protocol())
+	}
 	rows := [settingCount]struct{ label, value string }{
 		setDelivery:    {"delivery", backend},
 		setGate:        {"origin gate", gate},
 		setToggle:      {"toggle key", toggleName(cfg.ToggleKey)},
 		setListen:      {"listen", listen},
+		setProtocol:    {"agent proto", proto},
 		setMasterAgent: {"master→agent", masterAgent},
 		setXsend:       {"xsend map", xsend},
 	}
@@ -938,6 +970,15 @@ func (m Model) viewSettings(w int) string {
 		b.WriteString("\n" + dimStyle.Render(truncate("space: change  e: edit", w)))
 	}
 	return b.String()
+}
+
+// protocolLabel is the agent protocol row's value: 2 is marked, because an
+// agent at 2 sends its token to whatever answers on clonecast's port.
+func protocolLabel(p int) string {
+	if p < agentwire.Version {
+		return offStyle.Render(fmt.Sprintf("%d", p)) + dimStyle.Render(" (token in the hello)")
+	}
+	return onStyle.Render(fmt.Sprintf("%d", p))
 }
 
 func toggleName(c keys.Code) string {

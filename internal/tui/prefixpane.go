@@ -40,7 +40,12 @@ type PrefixPaneConfig struct {
 	Port    func() int
 	Title   string // target window title ("" = agent default)
 	WineCmd string // wine command for prefixes that are already booted
-	Token   string // the secret installed agents must send clonecast
+	Token   string // the secret installed agents must prove to clonecast
+	// Protocol resolves the agent protocol to install with, at INSTALL time
+	// like Port: the Settings pane changes clonecast's live, and an agent
+	// installed at the other one is refused (Kamino 275). nil, or 0, means
+	// the agent's default.
+	Protocol func() int
 
 	// The rest of `agent install`/`uninstall`'s flags, changeable in the pane
 	// like the ones above (Kamino item 45).
@@ -168,6 +173,7 @@ func (p PrefixPane) config(path, wineCmd string) prefix.Config {
 		Title:      p.cfg.Title,
 		WineCmd:    wineCmd,
 		Token:      p.cfg.Token,
+		Protocol:   p.protocol(),
 		Route:      p.cfg.Route,
 		ValueName:  p.cfg.ValueName,
 		AssumeIdle: p.cfg.AssumeIdle,
@@ -212,6 +218,14 @@ func (p PrefixPane) port() int {
 		return 0
 	}
 	return p.cfg.Port()
+}
+
+// protocol is the agent protocol to write into the install, resolved now.
+func (p PrefixPane) protocol() int {
+	if p.cfg.Protocol == nil {
+		return 0
+	}
+	return p.cfg.Protocol()
 }
 
 // Target is the prefix install/uninstall/status act on: a manually entered
