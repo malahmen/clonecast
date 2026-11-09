@@ -56,15 +56,12 @@ func ScanProc(root string) ([]Running, error) {
 		}
 		p, ok := envValue(string(blob), "WINEPREFIX")
 		if !ok || p == "" {
-			// Plain `wine` with no WINEPREFIX runs in $HOME/.wine, and so
-			// does everything it starts, wineserver included. Missing those
-			// made Busy call a live ~/.wine idle, and the offline registry
-			// edit was overwritten when its wineserver exited (Kamino 202).
-			home, _ := envValue(string(blob), "HOME")
-			if home == "" || !isWineProcess(root, e.Name()) {
+			// Missing these made Busy call a live ~/.wine idle, and the
+			// offline registry edit was overwritten when its wineserver
+			// exited (Kamino 202).
+			if p, ok = defaultPrefix(root, e.Name(), string(blob)); !ok {
 				continue
 			}
-			p = filepath.Join(home, ".wine")
 		}
 		out = append(out, Running{
 			PID:     pid,
@@ -81,7 +78,8 @@ func ScanProc(root string) ([]Running, error) {
 	return out, nil
 }
 
-// PrefixOfPIDIn reads one process's WINEPREFIX out of a procfs root. It is the
+// PrefixOfPIDIn reads one process's WINEPREFIX out of a procfs root, or
+// places a Wine process with none in the default $HOME/.wine as ScanProc does. It is the
 // join that lets clonecast pair a KWin window with a registered agent
 // (REFERENCE.md 4.17): KWin reports a window's *host* pid (it asks the X
 // server through XRes, which derives it from the socket peer credentials, so
@@ -107,9 +105,27 @@ func PrefixOfPIDIn(root string, pid int) (string, error) {
 	}
 	p, ok := envValue(string(blob), "WINEPREFIX")
 	if !ok || strings.TrimSpace(p) == "" {
-		return "", fmt.Errorf("pid %d has no WINEPREFIX", pid)
+		// A plain-`wine` game sets no WINEPREFIX and runs in $HOME/.wine,
+		// which is also what its agent announces (it derives the prefix
+		// from its own path). Without the default here such a window fell
+		// to the title match only (Kamino 276).
+		if p, ok = defaultPrefix(root, name, string(blob)); !ok {
+			return "", fmt.Errorf("pid %d has no WINEPREFIX", pid)
+		}
 	}
 	return CleanPrefix(p), nil
+}
+
+// defaultPrefix is the prefix of a process with no WINEPREFIX: plain `wine`
+// runs in $HOME/.wine, and so does everything it starts, wineserver and the
+// game included. Only a Wine process (isWineProcess) with HOME set is placed
+// there; anything else has no prefix. blob is the process's environ.
+func defaultPrefix(root, pid, blob string) (string, bool) {
+	home, _ := envValue(blob, "HOME")
+	if home == "" || !isWineProcess(root, pid) {
+		return "", false
+	}
+	return filepath.Join(home, ".wine"), true
 }
 
 // GroupByPrefix collapses a process list into one entry per prefix.

@@ -218,3 +218,52 @@ func TestPrefixOfPIDIn(t *testing.T) {
 		}
 	}
 }
+
+// Kamino 276: pairing reads one window's pid with PrefixOfPIDIn, and a
+// plain-`wine` game has no WINEPREFIX, so it must land in $HOME/.wine exactly
+// as ScanProc places it. Before, it was an error and the window could only be
+// title-matched.
+func TestPrefixOfPIDInPlacesWineWithNoPrefixInTheDefault(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".wine"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := fakeProc(t, map[string][]string{
+		"301": {"HOME=" + home, "DISPLAY=:0"},  // wineserver, by cmdline
+		"302": {"HOME=" + home},                // the game, by its Windows argv[0]
+		"303": {"HOME=" + home},                // wine64-preloader, by comm alone
+		"304": {"HOME=" + home},                // bash: not Wine
+		"305": {"DISPLAY=:0"},                  // wineserver with no HOME: nowhere to place it
+		"306": {"HOME=" + home, "WINEPREFIX="}, // set but blank: still the default
+	}, map[string]string{
+		"301": "/usr/bin/wineserver\x00",
+		"302": "C:\\Program Files\\WoW\\Wow.EXE\x00",
+		"304": "/bin/bash\x00",
+		"305": "/usr/bin/wineserver\x00",
+		"306": "C:\\Program Files\\WoW\\Wow.exe\x00",
+	})
+	if err := os.WriteFile(filepath.Join(root, "303", "comm"), []byte("wine64-preloade\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := CleanPrefix(filepath.Join(home, ".wine"))
+	for _, pid := range []int{301, 302, 303, 306} {
+		got, err := PrefixOfPIDIn(root, pid)
+		if err != nil {
+			t.Errorf("pid %d: %v, want %s", pid, err, want)
+		} else if got != want {
+			t.Errorf("pid %d: prefix = %q, want %q", pid, got, want)
+		}
+	}
+	for _, pid := range []int{304, 305} {
+		if p, err := PrefixOfPIDIn(root, pid); err == nil {
+			t.Errorf("pid %d: want an error, got prefix %q", pid, p)
+		}
+	}
+	// An explicit WINEPREFIX still wins over the default.
+	other := t.TempDir()
+	root = fakeProc(t, map[string][]string{"401": {"HOME=" + home, "WINEPREFIX=" + other}},
+		map[string]string{"401": "/usr/bin/wineserver\x00"})
+	if got, err := PrefixOfPIDIn(root, 401); err != nil || got != CleanPrefix(other) {
+		t.Fatalf("explicit WINEPREFIX: got %q, %v, want %s", got, err, other)
+	}
+}
