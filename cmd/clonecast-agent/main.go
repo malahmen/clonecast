@@ -9,7 +9,7 @@
 // under Wine; this installs none).
 //
 // It dials clonecast; clonecast does not dial it (REFERENCE.md 4.17). On
-// connect it announces its WINEPREFIX, its window title, its Windows pid and
+// connect it announces its WINEPREFIX, its window's caption, its Windows pid and
 // the resolved HWND, and clonecast pairs that announcement with a window in
 // the compositor's list — so the user ticks a window in the TUI and nothing
 // else. Before this, every agent listened on a hand-picked port and the user
@@ -66,6 +66,8 @@ import (
 
 	"golang.org/x/sys/windows/registry"
 
+	"github.com/malahmen/clonecast/internal/agentkeys"
+	"github.com/malahmen/clonecast/internal/agentwin"
 	"github.com/malahmen/clonecast/internal/agentwire"
 	"github.com/malahmen/clonecast/internal/logcap"
 	"github.com/malahmen/clonecast/internal/lookup"
@@ -80,7 +82,9 @@ var (
 	procPostMessageW     = user32.NewProc("PostMessageW")
 	procIsWindow         = user32.NewProc("IsWindow")
 	procIsWindowVisible  = user32.NewProc("IsWindowVisible")
+	procIsIconic         = user32.NewProc("IsIconic")
 	procGetWindowRect    = user32.NewProc("GetWindowRect")
+	procGetWindowLongW   = user32.NewProc("GetWindowLongW")
 
 	kernel32        = syscall.NewLazyDLL("kernel32.dll")
 	procCreateMutex = kernel32.NewProc("CreateMutexW")
@@ -96,10 +100,11 @@ const processWineMakeProcessSystem = 1000
 
 const (
 	gwHWNDNEXT = 2
+	gwOWNER    = 4
 	gwCHILD    = 5
 
-	wmKEYDOWN = 0x0100
-	wmKEYUP   = 0x0101
+	gwlEXSTYLE     = ^uintptr(19) // GWL_EXSTYLE, -20
+	wsExTOOLWINDOW = 0x00000080
 
 	errAlreadyExists = syscall.Errno(183) // ERROR_ALREADY_EXISTS
 
@@ -128,6 +133,13 @@ var noWindowOnce sync.Once
 // nothing, so keys arriving while the game is gone do not each walk the whole
 // window tree (Kamino item 39).
 const searchEvery = time.Second
+
+// recheckEvery is how often a window that is still valid is compared with the
+// others again, so a launcher or a dialog chosen before the game's window
+// existed gives way to it (Kamino 202). The keepalive ticker calls current()
+// every agentwire.KeepaliveInterval, so a recheck happens at least that often
+// without a key.
+const recheckEvery = agentwire.KeepaliveInterval
 
 func logf(format string, a ...any) {
 	fmt.Fprintf(out, "%s [clonecast-agent] "+format+"\n",
@@ -264,14 +276,14 @@ func findByTitle(want string) uintptr {
 //
 // The prefix is the right unit of addressing, and it needs no cooperation: each
 // Wine prefix has its own wineserver and therefore its own window list, so the
-// windows this agent can see are by construction its own prefix's. The game is
-// the largest visible top-level window among them. The agent itself has no
-// window (-H windowsgui, no console), so there is nothing of its own to exclude.
-func findGameWindow() uintptr {
+// windows this agent can see are by construction its own prefix's. The agent
+// itself has no window (-H windowsgui, no console), so there is nothing of its
+// own to exclude. Which of them is the game is agentwin.Choose's call: the
+// largest visible unowned one, keeping current on a tie.
+func findGameWindow(current uintptr) uintptr {
 	desktop, _, _ := procGetDesktopWindow.Call()
-	var best uintptr
-	var bestArea int64
-	seen, considered := 0, 0
+	var cands []agentwin.Candidate
+	seen := 0
 
 	// Recursive, like findByTitle: a game window is not necessarily a direct
 	// child of the desktop — Wine nests it under its own desktop/explorer
@@ -285,26 +297,21 @@ func findGameWindow() uintptr {
 		child, _, _ := procGetWindow.Call(hwnd, gwCHILD)
 		for child != 0 {
 			seen++
-			var r struct{ Left, Top, Right, Bottom int32 }
-			visible, _, _ := procIsWindowVisible.Call(child)
-			if ok, _, _ := procGetWindowRect.Call(child, uintptr(unsafe.Pointer(&r))); ok != 0 && visible != 0 {
-				w, h := int64(r.Right-r.Left), int64(r.Bottom-r.Top)
-				// 100x100 keeps out the IME and helper popups Wine creates,
-				// the same floor the launcher's own window search uses.
-				if w >= 100 && h >= 100 {
-					considered++
-					if w*h > bestArea {
-						bestArea, best = w*h, child
-					}
-				}
-			}
+			cands = append(cands, describe(child))
 			walk(child, depth+1)
 			child, _, _ = procGetWindow.Call(child, gwHWNDNEXT)
 		}
 	}
 	walk(desktop, 0)
 
+	best := agentwin.Choose(cands, current)
 	if best == 0 {
+		considered := 0
+		for _, c := range cands {
+			if c.Usable() {
+				considered++
+			}
+		}
 		// Said once rather than on every dropped key: without it a failure here
 		// is indistinguishable from the window genuinely being gone, which cost
 		// a lot of guessing.
@@ -316,18 +323,39 @@ func findGameWindow() uintptr {
 	return best
 }
 
+// describe reads what agentwin.Choose needs to know about a window.
+func describe(h uintptr) agentwin.Candidate {
+	c := agentwin.Candidate{Handle: h}
+	visible, _, _ := procIsWindowVisible.Call(h)
+	c.Visible = visible != 0
+	var r struct{ Left, Top, Right, Bottom int32 }
+	if ok, _, _ := procGetWindowRect.Call(h, uintptr(unsafe.Pointer(&r))); ok != 0 {
+		c.W, c.H = int64(r.Right-r.Left), int64(r.Bottom-r.Top)
+	}
+	owner, _, _ := procGetWindow.Call(h, gwOWNER)
+	c.Owned = owner != 0
+	ex, _, _ := procGetWindowLongW.Call(h, gwlEXSTYLE)
+	c.Tool = ex&wsExTOOLWINDOW != 0
+	iconic, _, _ := procIsIconic.Call(h)
+	c.Minimized = iconic != 0
+	return c
+}
+
 // resolver caches the game window's HWND but re-resolves it when it goes
 // stale. WoW recreates its top-level window across state changes (login ->
 // char-select -> world, loading screens), so a once-cached HWND becomes a dead
 // handle and PostMessage silently goes nowhere. Validity is checked cheaply
 // (IsWindow + the title still matches) on every send; only when that fails is
 // the full GetWindow tree-walk re-run, and while it finds nothing, at most
-// every searchEvery.
+// every searchEvery. A valid window is also compared with the others every
+// recheckEvery, because valid only says it is alive: a launcher found before
+// the game's window existed stayed valid, and kept every key (Kamino 202).
 type resolver struct {
-	title string
-	mu    sync.Mutex
-	hwnd  uintptr
-	pace  lookup.Pacer
+	title   string
+	mu      sync.Mutex
+	hwnd    uintptr
+	pace    lookup.Pacer
+	recheck agentwin.Recheck
 }
 
 func (r *resolver) valid(h uintptr) bool {
@@ -352,10 +380,18 @@ func (r *resolver) valid(h uintptr) bool {
 func (r *resolver) current() uintptr {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 	if r.valid(r.hwnd) {
+		// An explicit -title names the window; only the prefix-wide choice
+		// can have picked the wrong one.
+		if r.title == "" && r.recheck.Due(now) {
+			if h := findGameWindow(r.hwnd); h != 0 && h != r.hwnd {
+				logf("a better game window appeared (hwnd=0x%x, was 0x%x); delivering there", h, r.hwnd)
+				r.hwnd = h
+			}
+		}
 		return r.hwnd
 	}
-	now := time.Now()
 	if !r.pace.Due(now) {
 		r.hwnd = 0
 		return 0
@@ -372,15 +408,16 @@ func (r *resolver) current() uintptr {
 			systemOnce.Do(exitWithThePrefix)
 		}
 	}()
+	r.recheck.Done(now)
 	if r.title == "" {
-		r.hwnd = findGameWindow()
+		r.hwnd = findGameWindow(0)
 	} else {
 		// An explicit title still wins, for a prefix with more than one
 		// window where the operator knows which. Falling back to the
 		// prefix-wide search means a wrong or stale title degrades to
 		// "deliver to this prefix's game" instead of to nothing at all.
 		if r.hwnd = findByTitle(r.title); r.hwnd == 0 {
-			r.hwnd = findGameWindow()
+			r.hwnd = findGameWindow(0)
 		}
 	}
 	return r.hwnd
@@ -394,21 +431,20 @@ func (r *resolver) dropped() bool {
 	return r.pace.Drop()
 }
 
-func lparam(scan uint16, extended, up bool) uintptr {
-	lp := uint32(1) | uint32(scan)<<16 // repeat count 1, scancode
-	if extended {
-		lp |= 1 << 24
-	}
-	if up {
-		lp |= 1<<30 | 1<<31 // previous-down + transition (key release)
-	}
-	return uintptr(lp)
-}
+// unmapped remembers the codes already reported as unmapped, so a key the
+// agent cannot post is logged once and not once per press: the log is not a
+// record of what was typed (REFERENCE.md 8). clonecast no longer sends such a
+// key (Kamino 185); this is for an older one.
+var unmapped sync.Map
 
-func post(r *resolver, f agentwire.Frame) {
-	vk, scan, ext, ok := agentwire.WinKey(f.Code)
-	if !ok {
-		logf("unmapped evdev code %d, ignored", f.Code)
+// post delivers one frame to the game window. st is the session's key state:
+// it sets the repeat bit on a held key's repeats and remembers what is down,
+// for release (Kamino 136).
+func post(r *resolver, st *agentkeys.State, f agentwire.Frame) {
+	if !agentwire.Mappable(f.Code) {
+		if _, seen := unmapped.LoadOrStore(f.Code, true); !seen {
+			logf("unmapped evdev code %d, ignored", f.Code)
+		}
 		return
 	}
 	hwnd := r.current()
@@ -418,11 +454,27 @@ func post(r *resolver, f agentwire.Frame) {
 		}
 		return
 	}
-	msg := uintptr(wmKEYUP)
-	if f.Down {
-		msg = wmKEYDOWN
+	m, _ := st.Frame(f)
+	procPostMessageW.Call(hwnd, uintptr(m.Msg), uintptr(m.VK), uintptr(m.LParam))
+}
+
+// release posts a key-up for every key this session still holds down. When
+// the session ends no Up is coming for them from clonecast, and the game would
+// keep them held: autorun, a character walking into a wall (Kamino 136).
+func release(r *resolver, st *agentkeys.State) {
+	ups := st.Release()
+	if len(ups) == 0 {
+		return
 	}
-	procPostMessageW.Call(hwnd, msg, uintptr(vk), lparam(scan, ext, !f.Down))
+	hwnd := r.current()
+	if hwnd == 0 {
+		logf("connection ended with %d key(s) down and no game window to release them in", len(ups))
+		return
+	}
+	for _, m := range ups {
+		procPostMessageW.Call(hwnd, uintptr(m.Msg), uintptr(m.VK), uintptr(m.LParam))
+	}
+	logf("connection ended with %d key(s) down; released them", len(ups))
 }
 
 // conn wraps the connection to clonecast so the keepalive goroutine and the
@@ -514,8 +566,18 @@ func readToken() string {
 // token is this install's secret, sent in every hello.
 var token string
 
-// hello is what this agent announces on every (re)connection.
-func hello(title string, hwnd uintptr) agentwire.Hello {
+// caption is hwnd's window text, or "" for no window.
+func caption(hwnd uintptr) string {
+	if hwnd == 0 {
+		return ""
+	}
+	return getWindowText(hwnd)
+}
+
+// hello is what this agent announces on every (re)connection. The title is the
+// found window's caption (agentwire.AnnouncedTitle): it is what tells the game
+// from a launcher in the same prefix when clonecast pairs (Kamino 137).
+func hello(title string, hwnd uintptr, caption string) agentwire.Hello {
 	self, _ := os.Executable()
 	return agentwire.Hello{
 		Token:   token,
@@ -525,7 +587,7 @@ func hello(title string, hwnd uintptr) agentwire.Hello {
 		// Windows processes unchanged, so this is set under every launcher
 		// that sets it — and when it is not, clonecast falls back to Title.
 		Prefix: os.Getenv("WINEPREFIX"),
-		Title:  title,
+		Title:  agentwire.AnnouncedTitle(title, caption),
 		Exe:    self,
 		PID:    os.Getpid(),
 		HWND:   uint64(hwnd),
@@ -539,8 +601,14 @@ func session(c net.Conn, res *resolver, title string) {
 	defer c.Close()
 	w := &conn{c: c}
 
+	// Whatever ends the session, its keys still down are released: deferred
+	// after c.Close, so it runs first.
+	var st agentkeys.State
+	defer release(res, &st)
+
 	announced := res.current()
-	if err := w.writeHello(hello(title, announced)); err != nil {
+	announcedCaption := caption(announced)
+	if err := w.writeHello(hello(title, announced, announcedCaption)); err != nil {
 		logf("hello: %v", err)
 		return
 	}
@@ -556,16 +624,19 @@ func session(c net.Conn, res *resolver, title string) {
 			case <-done:
 				return
 			case <-t.C:
-				// Re-announce when the game recreated its window, so
-				// clonecast's view of the HWND stays true (it is diagnostic,
-				// but a stale one sends people hunting the wrong problem).
-				if h := res.current(); h != 0 && h != announced {
-					announced = h
-					if err := w.writeHello(hello(title, h)); err != nil {
-						return // the read loop will see the same failure
+				// Re-announce when the game recreated its window or its
+				// caption changed: clonecast pairs on the caption (Kamino
+				// 137), and the HWND, though diagnostic, sends people hunting
+				// the wrong problem when stale.
+				if h := res.current(); h != 0 {
+					if text := caption(h); h != announced || text != announcedCaption {
+						announced, announcedCaption = h, text
+						if err := w.writeHello(hello(title, h, text)); err != nil {
+							return // the read loop will see the same failure
+						}
+						logf("window changed, re-announced hwnd=0x%x", h)
+						continue
 					}
-					logf("window changed, re-announced hwnd=0x%x", h)
-					continue
 				}
 				if err := w.writeKeepalive(); err != nil {
 					return
@@ -579,7 +650,7 @@ func session(c net.Conn, res *resolver, title string) {
 	// keystroke after it.
 	err := agentwire.Read(c, func(m agentwire.Message) {
 		if m.Kind == agentwire.KindFrame {
-			post(res, m.Frame)
+			post(res, &st, m.Frame)
 		}
 	})
 	if err != nil {

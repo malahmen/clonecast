@@ -117,7 +117,7 @@ func agentInstall(args []string, out io.Writer) error {
 	a.writeFlags()
 	a.fs.StringVar(&a.cfg.ExePath, "exe", "", "built clonecast-agent.exe (default: next to this binary, or in the bin/ beside it)")
 	a.fs.IntVar(&a.cfg.Port, "port", defaultAgentPort(), "clonecast's listening port for the agent to dial (CLONECAST_PORT in the prefix's environment overrides it)")
-	a.fs.StringVar(&a.cfg.Title, "title", "", `window title the agent delivers to (default: the agent's own, "World of Warcraft")`)
+	a.fs.StringVar(&a.cfg.Title, "title", "", `window title the agent delivers to (default: none, the prefix's own game window, whatever its caption)`)
 	if err := a.parse(args); err != nil {
 		return err
 	}

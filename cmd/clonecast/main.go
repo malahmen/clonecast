@@ -135,7 +135,7 @@ func run() error {
 	masterByAgent := flag.Bool("master-by-agent", false, "while broadcasting, send the focused game's own keys through its agent too, so a game that takes the X keyboard focus gets nothing (experimental)")
 	logPath := flag.String("log", defaultLogPath(), "log file (stdout is the TUI)")
 	agentExe := flag.String("agent-exe", "", "built clonecast-agent.exe for the TUI's Prefixes pane to install (default: next to this binary, or in the bin/ beside it; never the current directory)")
-	agentTitle := flag.String("agent-title", "", `window title an agent installed from the TUI delivers to ("" = agent default, "World of Warcraft")`)
+	agentTitle := flag.String("agent-title", "", `window title an agent installed from the TUI delivers to ("" = the default: the prefix's own game window, whatever its caption)`)
 	agentWine := flag.String("agent-wine", "", `wine command for the TUI's Prefixes pane to install into an already-booted prefix, e.g. "flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<prefix> com.usebottles.bottles"`)
 	kbdSpec := flag.String("keyboard", "", "comma-separated evdev paths to capture, e.g. /dev/input/event20 (default: every discovered keyboard)")
 	listKbd := flag.Bool("list-keyboards", false, "list the keyboards discovery would capture and whether each can be grabbed, then exit")

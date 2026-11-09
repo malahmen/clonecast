@@ -30,7 +30,7 @@
 // Hello fields, all optional and order-independent:
 //
 //	prefix=  the agent's WINEPREFIX, as the agent's environment reports it
-//	title=   the window title the agent delivers to
+//	title=   the caption of the window the agent delivers to
 //	exe=     the agent's own image path (diagnostics only)
 //	pid=     the agent's Windows process id, decimal (diagnostics only)
 //	hwnd=    the resolved game window handle, hex without 0x (diagnostics)
@@ -133,11 +133,24 @@ func (f Frame) Write(w io.Writer) error {
 type Hello struct {
 	Version int
 	Prefix  string // WINEPREFIX inside the prefix's environment
-	Title   string // the window title the agent posts keys to
+	Title   string // the caption of the window the agent posts keys to (AnnouncedTitle)
 	Exe     string // the agent binary's own path
 	PID     int    // the agent's *Windows* pid — never a host pid
 	HWND    uint64 // the resolved game window handle
 	Token   string // the install's shared secret; never logged
+}
+
+// AnnouncedTitle is the title an agent puts in its hello: the caption of the
+// window it actually found, and only while it has found none, the -title it
+// was given. Announcing the flag instead (Kamino 137) left the title empty for
+// every agent installed with the defaults, which pass no -title, so clonecast
+// paired on the prefix alone and gave the agent the first window of that
+// prefix in KWin's order: a launcher or a dialog could get the keys.
+func AnnouncedTitle(flagTitle, caption string) string {
+	if caption != "" {
+		return caption
+	}
+	return flagTitle
 }
 
 // Write encodes h as the hello line.

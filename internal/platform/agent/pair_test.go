@@ -301,3 +301,60 @@ func TestPairingMatchesEachAgentToItsOwnTitle(t *testing.T) {
 		t.Errorf("the Marx window paired with agent %d (ok=%v), want agent 2", id, ok)
 	}
 }
+
+// An agent installed with the defaults has no -title (install.go passes
+// none), so its hello's title must be the caption of the window it found, or
+// the tiebreak above never runs and the first window of the prefix in KWin's
+// order - here the launcher - takes the agent (Kamino 137).
+func TestPairingDefaultInstallAnnouncesTheFoundCaption(t *testing.T) {
+	bottle := t.TempDir()
+	root := fakeProc(t, map[int][]string{
+		7100: {"WINEPREFIX=" + bottle}, // the launcher
+		7200: {"WINEPREFIX=" + bottle}, // the game
+	})
+	wins := []broadcast.Window{
+		{ID: "launcher", Title: "Battle.net", PID: 7100},
+		{ID: "game", Title: "World of Warcraft", PID: 7200},
+	}
+	p := newTestPairing(t, func() ([]broadcast.Window, error) { return wins, nil }, root, nil)
+	// No -title; the agent found the game's window and announces its caption.
+	h := agentwire.Hello{Prefix: bottle, Title: agentwire.AnnouncedTitle("", "World of Warcraft")}
+	p.recompute(context.Background(), agentsFor(h))
+
+	if id, ok := p.agentFor("game"); !ok || id != 1 {
+		t.Errorf("the game paired with agent %d (ok=%v), want agent 1", id, ok)
+	}
+	if id, ok := p.agentFor("launcher"); ok {
+		t.Errorf("the launcher took agent %d", id)
+	}
+}
+
+// A title-less hello - no -title, and no window found yet, as at prefix boot -
+// still pairs on the prefix, and the re-announcement that carries the caption
+// once the game's window exists moves the agent to it.
+func TestPairingTitlelessHelloThenTheCaption(t *testing.T) {
+	bottle := t.TempDir()
+	root := fakeProc(t, map[int][]string{
+		7100: {"WINEPREFIX=" + bottle},
+		7200: {"WINEPREFIX=" + bottle},
+	})
+	wins := []broadcast.Window{
+		{ID: "launcher", Title: "Battle.net", PID: 7100},
+		{ID: "game", Title: "World of Warcraft", PID: 7200},
+	}
+	p := newTestPairing(t, func() ([]broadcast.Window, error) { return wins, nil }, root, nil)
+	agents := agentsFor(agentwire.Hello{Prefix: bottle, Title: agentwire.AnnouncedTitle("", "")})
+	if got := agents[0].Hello().Title; got != "" {
+		t.Fatalf("a title-less hello announces %q", got)
+	}
+	p.recompute(context.Background(), agents)
+	if _, ok := p.windowFor(1); !ok {
+		t.Fatal("a title-less hello did not pair at all; the prefix alone must pair it")
+	}
+
+	agents[0].setHello(agentwire.Hello{Prefix: bottle, Title: agentwire.AnnouncedTitle("", "World of Warcraft")})
+	p.recompute(context.Background(), agents)
+	if w, ok := p.windowFor(1); !ok || w != "game" {
+		t.Errorf("after the caption arrived the agent serves %q (ok=%v), want the game", w, ok)
+	}
+}

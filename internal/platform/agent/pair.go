@@ -132,8 +132,12 @@ func (p *pairing) recompute(ctx context.Context, agents []*Agent) {
 	// HAVE SEVERAL WINDOWS — the game, the Battle.net launcher, a crash
 	// dialog. The first prefix match won, so the agent could be handed to the
 	// launcher and the game left unpaired: broadcasting then types into a
-	// window nobody is playing. The title is what tells them apart, and the
-	// agent announces the title of the window it actually found.
+	// window nobody is playing. The title is what tells them apart: the
+	// agent announces the caption of the window it actually found
+	// (agentwire.AnnouncedTitle), not its -title flag, which a default
+	// install leaves empty (Kamino 137). Until it has found one its hello has
+	// no title, and the prefix alone pairs it below; the re-announcement
+	// that follows the window's appearance re-pairs it here.
 	//
 	// Both sub-passes run over every window before the next begins. Doing it
 	// per window instead would let a title-less match on an early window take

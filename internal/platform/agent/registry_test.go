@@ -709,3 +709,44 @@ func TestRefusedConnectionsHaveADeadline(t *testing.T) {
 		return len(reg.held) == 0
 	})
 }
+
+// A key no agent can post is not sent and not reported reached: the agent
+// would log it and drop it while clonecast counted it delivered (Kamino 185).
+// The Deliverer says so up front, which is what sends it by passthrough to a
+// master fed by its agent.
+func TestDeliverSkipsAKeyTheAgentCannotPost(t *testing.T) {
+	wins := []broadcast.Window{{ID: "w1", Title: "Game"}}
+	reg, _ := startRegistry(t, wins, t.TempDir())
+	c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game"})
+	waitFor(t, "the agent", func() bool { return reg.Paired("w1") })
+
+	d := New(reg)
+	pause, _ := keys.Parse("pause")
+	a, _ := keys.Parse("a")
+	if d.Carries(pause) {
+		t.Fatal("Carries(PAUSE) = true; it has no Win32 mapping")
+	}
+	if !d.Carries(a) {
+		t.Fatal("Carries(A) = false")
+	}
+	for _, code := range []keys.Code{pause, a} {
+		reached, err := d.Deliver(context.Background(), broadcast.Delivery{
+			Event:   keys.Event{Code: code, State: keys.Down},
+			Targets: []broadcast.WindowID{"w1"},
+			Notify:  func(string, bool) {},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code == pause && len(reached) != 0 {
+			t.Errorf("PAUSE reached %v, want nothing", reached)
+		}
+		if code == a && len(reached) != 1 {
+			t.Errorf("A reached %v, want [w1]", reached)
+		}
+	}
+	// The first frame on the wire is A's: PAUSE never went out.
+	if got := c.nextFrame(); got.Code != uint16(a) {
+		t.Errorf("the agent's first frame is %+v, want A", got)
+	}
+}

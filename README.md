@@ -295,6 +295,8 @@ cmd/clonecast-agent/      the in-prefix agent; cross-compiled to windows/386
 cmd/kwindiag/            KWin scripting probe; `kwindiag watch` logs KWin's active window and the X focus
 internal/keys/           key codes, names, and the allowlist (Set)
 internal/agentwire/      the clonecast <-> agent protocol: hello, keepalive, key frames (tested)
+internal/agentkeys/      the agent's key state: repeat bit, release at session end (tested)
+internal/agentwin/       how the agent picks its prefix's game window (tested)
 internal/broadcast/      the engine: passthrough + per-window delivery through a pluggable backend (tested)
 internal/redial/         the agent's reconnect backoff — reset by a session, not a dial (tested)
 internal/lookup/         the agent's pacing of window searches while its game window is gone (tested)
