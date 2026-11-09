@@ -158,7 +158,40 @@ func configSet(key, val string) error {
 	}
 	body := strings.Join(out, "\n")
 	body = strings.TrimRight(body, "\n") + "\n"
-	return os.WriteFile(p, []byte(body), 0o644)
+	return writeFileAtomic(p, []byte(body), 0o644)
+}
+
+// writeFileAtomic replaces p with data through a temp file in the same
+// directory, synced and renamed over it, so a crash or a full disk mid-write
+// leaves the old config rather than a truncated one (Kamino 202): the file
+// holds the saved keyboard choice and whatever the user wrote in it by hand.
+// An existing file keeps its mode; a new one gets mode.
+func writeFileAtomic(p string, data []byte, mode os.FileMode) error {
+	if info, err := os.Stat(p); err == nil {
+		mode = info.Mode().Perm()
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name) // a no-op once renamed
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, p)
 }
 
 // resolveKeyboards decides which devices to capture, in this order:

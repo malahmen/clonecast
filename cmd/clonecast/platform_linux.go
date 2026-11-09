@@ -101,9 +101,11 @@ const xsendAvailable = true
 // setupXsend wires the experimental xsend backend (Technique A): XSendEvent to
 // each target's X window. spec optionally maps a target's KWin title to the X
 // window title to aim at ("KWin Title=X Title,..."); unmapped targets aim at a
-// window whose title equals their own KWin title. See REFERENCE.md 4.12/7.9 —
-// requires the client in Wine virtual-desktop mode and has an unsolved
-// stuck-key caveat, so it is opt-in only.
+// window whose title equals their own KWin title. Either way the window is
+// looked for only under the target's own client, by the pid KWin reports
+// (x11.Sender.Find). See REFERENCE.md 4.12/7.9 — requires the client in Wine
+// virtual-desktop mode and has an unsolved stuck-key caveat, so it is opt-in
+// only.
 func setupXsend(wm broadcast.WindowManager, spec string) (broadcast.Deliverer, func(), error) {
 	xmap, err := parseTitleMap(spec)
 	if err != nil {
@@ -113,57 +115,62 @@ func setupXsend(wm broadcast.WindowManager, spec string) (broadcast.Deliverer, f
 	if err != nil {
 		return nil, nil, fmt.Errorf("xsend: %w", err)
 	}
-	tc := newTitleCache(wm)
-	titles := func(id broadcast.WindowID) string {
-		kt := tc.title(id)
-		if xt, ok := xmap[kt]; ok {
-			return xt
+	wc := newWindowCache(wm)
+	lookup := func(id broadcast.WindowID) x11.Target {
+		w, ok := wc.window(id)
+		if !ok {
+			return x11.Target{}
 		}
-		return kt
+		t := x11.Target{Title: w.Title, PID: w.PID}
+		if xt, ok := xmap[w.Title]; ok {
+			t.Title = xt
+		}
+		return t
 	}
-	d := x11.NewDeliverer(s, titles)
+	d := x11.NewDeliverer(s, lookup)
 	return d, func() { _ = d.Close() }, nil
 }
 
-// titleCache resolves a WindowID to its current title via the WindowManager,
-// cached briefly so per-key delivery doesn't do a compositor round-trip each
-// time. Refreshed on a miss or when older than ttl.
-type titleCache struct {
+// windowCache resolves a WindowID to its current window (title and pid) via
+// the WindowManager, cached briefly so per-key delivery doesn't do a
+// compositor round-trip each time. Refreshed on a miss or when older than ttl.
+type windowCache struct {
 	wm  broadcast.WindowManager
 	ttl time.Duration
 
 	mu sync.Mutex
 	at time.Time
-	m  map[broadcast.WindowID]string
+	m  map[broadcast.WindowID]broadcast.Window
 }
 
-func newTitleCache(wm broadcast.WindowManager) *titleCache {
-	return &titleCache{wm: wm, ttl: 2 * time.Second}
+func newWindowCache(wm broadcast.WindowManager) *windowCache {
+	return &windowCache{wm: wm, ttl: 2 * time.Second}
 }
 
-func (t *titleCache) title(id broadcast.WindowID) string {
+func (t *windowCache) window(id broadcast.WindowID) (broadcast.Window, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.m == nil || time.Since(t.at) > t.ttl {
 		t.refresh()
 	}
-	if s, ok := t.m[id]; ok {
-		return s
+	if w, ok := t.m[id]; ok {
+		return w, true
 	}
 	t.refresh() // a miss may just be a stale cache
-	return t.m[id]
+	w, ok := t.m[id]
+	return w, ok
 }
 
-func (t *titleCache) refresh() {
+func (t *windowCache) refresh() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	wins, err := t.wm.List(ctx)
 	if err != nil {
 		return
 	}
-	m := make(map[broadcast.WindowID]string, len(wins))
+	m := make(map[broadcast.WindowID]broadcast.Window, len(wins))
 	for _, w := range wins {
-		m[w.ID] = w.Title
+		m[w.ID] = w
 	}
 	t.m = m
 	t.at = time.Now()

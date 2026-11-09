@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -64,5 +66,58 @@ func TestSavedIDFollowsARenumberedDevice(t *testing.T) {
 	got, why := resolveIDs(moved, saved)
 	if why != "" || !reflect.DeepEqual(got, []string{"/dev/input/event7"}) {
 		t.Fatalf("resolveIDs = %v (why %q), want [/dev/input/event7]", got, why)
+	}
+}
+
+// Kamino 202: configSet replaces the file by rename, never by rewriting it in
+// place, so a crash or a full disk mid-write cannot leave half a config. The
+// lines it does not own and the file's mode survive.
+func TestConfigSetReplacesTheFileWhole(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	p := configPath()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("# mine\nKEYBOARD=old\nOTHER=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o600); err != nil { // past the umask
+		t.Fatal(err)
+	}
+	before, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configSet(kbdKey, "new"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Error("the config was rewritten in place, not replaced by rename")
+	}
+	if after.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want the file's own 0600 kept", after.Mode().Perm())
+	}
+	b, _ := os.ReadFile(p)
+	if string(b) != "# mine\n"+kbdKey+"=new\nOTHER=1\n" {
+		t.Errorf("config = %q", b)
+	}
+	left, _ := os.ReadDir(filepath.Dir(p))
+	if len(left) != 1 {
+		t.Errorf("the directory holds %d files, want just the config (no temp left)", len(left))
+	}
+
+	// A first write creates the file with the default mode.
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := configSet(kbdKey, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(p); err != nil || info.Mode().Perm() != 0o644 {
+		t.Errorf("new config: %v, %v; want mode 0644", info, err)
 	}
 }

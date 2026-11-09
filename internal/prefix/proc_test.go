@@ -103,6 +103,52 @@ func TestScanProcFindsWinePrefixes(t *testing.T) {
 	}
 }
 
+// Kamino 202: plain `wine` sets no WINEPREFIX and runs in $HOME/.wine, so its
+// processes are that prefix's. Without them a live ~/.wine looked idle to
+// Busy, and the offline registry edit was lost when its wineserver exited.
+func TestScanProcPlacesWineWithNoPrefixInTheDefault(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".wine"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := fakeProc(t, map[string][]string{
+		"301": {"HOME=" + home, "DISPLAY=:0"}, // wineserver, by cmdline
+		"302": {"HOME=" + home},               // the game, by its Windows argv[0]
+		"303": {"HOME=" + home},               // wine64-preloader, by comm alone
+		"304": {"HOME=" + home},               // bash: not Wine
+		"305": {"DISPLAY=:0"},                 // wineserver with no HOME: nowhere to place it
+	}, map[string]string{
+		"301": "/usr/bin/wineserver\x00",
+		"302": "C:\\Program Files\\WoW\\Wow.EXE\x00",
+		"304": "/bin/bash\x00",
+		"305": "/usr/bin/wineserver\x00",
+	})
+	if err := os.WriteFile(filepath.Join(root, "303", "comm"), []byte("wine64-preloade\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ScanProc(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []int
+	for _, r := range got {
+		if r.Prefix != CleanPrefix(filepath.Join(home, ".wine")) {
+			t.Errorf("pid %d prefix = %q, want %s/.wine", r.PID, r.Prefix, home)
+		}
+		pids = append(pids, r.PID)
+	}
+	if len(pids) != 3 || pids[0] != 301 || pids[1] != 302 || pids[2] != 303 {
+		t.Fatalf("found pids %v, want [301 302 303]", pids)
+	}
+	// An explicit WINEPREFIX still wins over the default.
+	other := t.TempDir()
+	root = fakeProc(t, map[string][]string{"401": {"HOME=" + home, "WINEPREFIX=" + other}},
+		map[string]string{"401": "/usr/bin/wineserver\x00"})
+	if got, _ := ScanProc(root); len(got) != 1 || got[0].Prefix != CleanPrefix(other) {
+		t.Fatalf("explicit WINEPREFIX: got %+v, want %s", got, other)
+	}
+}
+
 func TestScanProcEmptyAndMissingRoot(t *testing.T) {
 	got, err := ScanProc(fakeProc(t, nil, nil))
 	if err != nil {

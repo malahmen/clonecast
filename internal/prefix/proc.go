@@ -27,7 +27,8 @@ type Proc struct {
 }
 
 // ScanProc lists the Wine processes visible under a procfs root by reading
-// WINEPREFIX out of /proc/<pid>/environ.
+// WINEPREFIX out of /proc/<pid>/environ. A Wine process with no WINEPREFIX is
+// listed under the default prefix, $HOME/.wine from its own environment.
 //
 // Why this works across launchers: environ is readable for the user's own
 // processes, and a Flatpak app's children (Bottles' wine, wineserver and the
@@ -55,7 +56,15 @@ func ScanProc(root string) ([]Running, error) {
 		}
 		p, ok := envValue(string(blob), "WINEPREFIX")
 		if !ok || p == "" {
-			continue
+			// Plain `wine` with no WINEPREFIX runs in $HOME/.wine, and so
+			// does everything it starts, wineserver included. Missing those
+			// made Busy call a live ~/.wine idle, and the offline registry
+			// edit was overwritten when its wineserver exited (Kamino 202).
+			home, _ := envValue(string(blob), "HOME")
+			if home == "" || !isWineProcess(root, e.Name()) {
+				continue
+			}
+			p = filepath.Join(home, ".wine")
 		}
 		out = append(out, Running{
 			PID:     pid,
@@ -129,6 +138,35 @@ func envValue(blob, name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// wineNames are the host programs of a Wine prefix, by base name.
+var wineNames = map[string]bool{
+	"wine": true, "wine64": true, "wineserver": true,
+	"wine-preloader": true, "wine64-preloader": true,
+	"wine64-preloade": true, // comm is cut at 15 bytes
+}
+
+// isWineProcess reports whether a process is Wine's: a wine/wineserver binary,
+// or a Windows program, whose argv[0] Wine sets to its Windows path
+// (`C:\windows\system32\explorer.exe`). It is asked only of processes
+// with no WINEPREFIX, to place them in the default prefix.
+func isWineProcess(root, pid string) bool {
+	var names []string
+	if b, err := os.ReadFile(filepath.Join(root, pid, "cmdline")); err == nil {
+		argv0, _, _ := strings.Cut(string(b), "\x00")
+		names = append(names, argv0)
+	}
+	if b, err := os.ReadFile(filepath.Join(root, pid, "comm")); err == nil {
+		names = append(names, strings.TrimSpace(string(b)))
+	}
+	for _, n := range names {
+		base := n[strings.LastIndexAny(n, `/\`)+1:]
+		if wineNames[base] || (len(base) > 4 && strings.EqualFold(base[len(base)-4:], ".exe")) {
+			return true
+		}
+	}
+	return false
 }
 
 // procCommand is a human-readable label for a process: argv[0] if cmdline can
