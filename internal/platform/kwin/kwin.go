@@ -69,6 +69,18 @@ type WM struct {
 
 	// watch is what the persistent script last pushed; see watch.go.
 	watch watcher
+
+	// object returns KWin's object at path; nil means w.conn's. Tests set it
+	// to a fake KWin that answers late or never.
+	object func(path dbus.ObjectPath) dbus.BusObject
+}
+
+// kwinObject is KWin's D-Bus object at path.
+func (w *WM) kwinObject(path dbus.ObjectPath) dbus.BusObject {
+	if w.object != nil {
+		return w.object(path)
+	}
+	return w.conn.Object(kwinService, path)
 }
 
 // kwinReply is one script's answer, with the call it answers.
@@ -238,7 +250,7 @@ func (w *WM) Active(ctx context.Context) (broadcast.WindowID, error) {
 		}
 		return pickActive(st, focusPID, xPIDs), nil
 	}
-	w.rewatch()
+	w.rewatch(ctx)
 	if xfocus == nil {
 		out, err := w.run(ctx, `
 			const a = workspace.activeWindow;
@@ -504,18 +516,28 @@ func (w *WM) run(ctx context.Context, body string) (string, error) {
 		}
 	}
 
-	scripting := w.conn.Object(kwinService, scriptingPath)
+	scripting := w.kwinObject(scriptingPath)
 	var id int32
 	if err := scripting.CallWithContext(ctx, scriptingIfce+".loadScript", 0, path, plugin).Store(&id); err != nil {
 		return "", fmt.Errorf("kwin loadScript: %w", err)
 	}
-	defer scripting.Call(scriptingIfce+".unloadScript", 0, plugin)
+	// The unload runs on its own, with its own deadline: by now ctx may be
+	// spent, and waiting on it would stall the caller (the engine goroutine,
+	// for Active) for the D-Bus timeout when KWin is not answering (Kamino
+	// 139). The plugin name is never reused, so nothing waits for it.
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.Background(), kwinCallTimeout)
+		go func() {
+			defer cancel()
+			scripting.CallWithContext(uctx, scriptingIfce+".unloadScript", 0, plugin)
+		}()
+	}()
 	if id < 0 {
 		return "", fmt.Errorf("kwin refused script (id %d)", id)
 	}
 
 	// Plasma 6 exposes the loaded script at /Scripting/Script<id>.
-	scriptObj := w.conn.Object(kwinService, dbus.ObjectPath(fmt.Sprintf("%s/Script%d", scriptingPath, id)))
+	scriptObj := w.kwinObject(dbus.ObjectPath(fmt.Sprintf("%s/Script%d", scriptingPath, id)))
 	if err := scriptObj.CallWithContext(ctx, scriptIfce+".run", 0).Err; err != nil {
 		return "", fmt.Errorf("kwin run: %w", err)
 	}

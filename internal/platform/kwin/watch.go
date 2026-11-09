@@ -3,6 +3,7 @@
 package kwin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,12 +45,21 @@ workspace.windowRemoved.connect(push);
 push();
 `
 
+// kwinCallTimeout bounds a KWin call no caller deadline covers: the first
+// watch load in New, run's cleanup unload and Close's.
+// A var so tests can shorten it.
+var kwinCallTimeout = 2 * time.Second
+
 // watcher is the cache the persistent script fills.
 type watcher struct {
-	mu      sync.Mutex
-	st      activeState
-	ok      bool      // a push arrived since the script was (re)loaded
-	tried   time.Time // the last load attempt
+	mu    sync.Mutex
+	st    activeState
+	ok    bool      // a push arrived since the script was (re)loaded
+	tried time.Time // the last load attempt
+	// loaded is set by the first push that decodes, not by loadScript
+	// succeeding: a script that loads but never pushes (callDBus failing,
+	// say) has to be tried again, or Active loads a script per call for the
+	// whole run (Kamino 139).
 	loaded  bool
 	signals chan *dbus.Signal
 }
@@ -62,6 +72,9 @@ func (c *watcher) update(payload string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.st, c.ok = st, err == nil
+	if err == nil {
+		c.loaded = true
+	}
 }
 
 // state is the cached answer, and whether there is one.
@@ -97,12 +110,16 @@ func (w *WM) startWatch() {
 			}
 		}()
 	}
-	w.rewatch()
+	ctx, cancel := context.WithTimeout(context.Background(), kwinCallTimeout)
+	defer cancel()
+	w.rewatch(ctx)
 }
 
 // rewatch loads the persistent script unless it is loaded, or was tried less
-// than rewatchEvery ago.
-func (w *WM) rewatch() {
+// than rewatchEvery ago. Active calls it on the engine goroutine, so its
+// KWin calls take Active's context: a KWin that is restarting costs that
+// deadline, not the D-Bus timeout (Kamino 139).
+func (w *WM) rewatch(ctx context.Context) {
 	w.watch.mu.Lock()
 	if w.watch.loaded || time.Since(w.watch.tried) < rewatchEvery {
 		w.watch.mu.Unlock()
@@ -111,38 +128,36 @@ func (w *WM) rewatch() {
 	w.watch.tried = time.Now()
 	w.watch.mu.Unlock()
 
-	if err := w.loadWatch(); err != nil {
-		return
-	}
-	w.watch.mu.Lock()
-	w.watch.loaded = true
-	w.watch.mu.Unlock()
+	_ = w.loadWatch(ctx) // loaded waits for the first push; see watcher
 }
 
-func (w *WM) loadWatch() error {
+func (w *WM) loadWatch(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	scripting := w.conn.Object(kwinService, scriptingPath)
-	scripting.Call(scriptingIfce+".unloadScript", 0, watchPlugin) // a leftover from a crashed run
+	scripting := w.kwinObject(scriptingPath)
+	// A leftover from a crashed run, or this run's script that never pushed.
+	scripting.CallWithContext(ctx, scriptingIfce+".unloadScript", 0, watchPlugin)
 	path := filepath.Join(w.tmpDir, watchPlugin+".js")
 	src := fmt.Sprintf(watchScript, busName, objPath, ifce, watchSeq)
 	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
 		return err
 	}
 	var id int32
-	if err := scripting.Call(scriptingIfce+".loadScript", 0, path, watchPlugin).Store(&id); err != nil {
+	if err := scripting.CallWithContext(ctx, scriptingIfce+".loadScript", 0, path, watchPlugin).Store(&id); err != nil {
 		return err
 	}
 	if id < 0 {
 		return fmt.Errorf("kwin refused the watch script (id %d)", id)
 	}
-	obj := w.conn.Object(kwinService, dbus.ObjectPath(fmt.Sprintf("%s/Script%d", scriptingPath, id)))
-	return obj.Call(scriptIfce+".run", 0).Err
+	obj := w.kwinObject(dbus.ObjectPath(fmt.Sprintf("%s/Script%d", scriptingPath, id)))
+	return obj.CallWithContext(ctx, scriptIfce+".run", 0).Err
 }
 
 // stopWatch unloads the persistent script.
 func (w *WM) stopWatch() {
 	// The signal channel is left to the connection: closing it, Close
 	// closes the channel and the goroutine reading it ends.
-	w.conn.Object(kwinService, scriptingPath).Call(scriptingIfce+".unloadScript", 0, watchPlugin)
+	ctx, cancel := context.WithTimeout(context.Background(), kwinCallTimeout)
+	defer cancel()
+	w.kwinObject(scriptingPath).CallWithContext(ctx, scriptingIfce+".unloadScript", 0, watchPlugin)
 }
