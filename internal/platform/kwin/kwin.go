@@ -377,8 +377,8 @@ func (w *WM) activateViaKWin(ctx context.Context, id broadcast.WindowID) error {
 // windowactivate goes through the window manager instead of around it, on
 // the theory that only the WM can actually move that compositor-level
 // routing. Verified against realActiveTitle (_NET_ACTIVE_WINDOW), the exact
-// property windowactivate sets — not realFocusedTitle, which is the wrong
-// signal per the above.
+// property windowactivate sets — not the X input focus (`xdotool
+// getwindowfocus`), which is the wrong signal per the above.
 func activateViaXdotool(ctx context.Context, xid, wantCaption string) error {
 	const maxAttempts = 5
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -393,24 +393,11 @@ func activateViaXdotool(ctx context.Context, xid, wantCaption string) error {
 		xid, wantCaption, maxAttempts)
 }
 
-// realFocusedTitle shells out to `xdotool getwindowfocus getwindowname` —
-// the real XSetInputFocus target, not the window-manager-level
-// _NET_ACTIVE_WINDOW hint getactivewindow reads (see REFERENCE.md 4.11 for
-// why that distinction turned out to matter). Empty on any failure (no
-// window focused, no xdotool, etc.).
-func realFocusedTitle() string {
-	out, err := exec.Command("xdotool", "getwindowfocus", "getwindowname").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 // realActiveTitle shells out to `xdotool getactivewindow getwindowname` —
-// the window-manager-level _NET_ACTIVE_WINDOW hint. Kept separate from
-// realFocusedTitle (see REFERENCE.md 4.11): the two can disagree, and
-// verifying activateViaXdotool needs the real focus target specifically,
-// not this hint.
+// the window-manager-level _NET_ACTIVE_WINDOW hint, which windowactivate
+// sets. The X input focus (`getwindowfocus`) can disagree with it (REFERENCE.md
+// 4.11); its helper, realFocusedTitle, had no caller left and was removed
+// (Kamino 139). Empty on any failure (nothing active, no xdotool, etc.).
 func realActiveTitle() string {
 	out, err := exec.Command("xdotool", "getactivewindow", "getwindowname").Output()
 	if err != nil {

@@ -78,7 +78,6 @@ var (
 	procGetWindow        = user32.NewProc("GetWindow")
 	procGetWindowTextW   = user32.NewProc("GetWindowTextW")
 	procPostMessageW     = user32.NewProc("PostMessageW")
-	procPeekMessageW     = user32.NewProc("PeekMessageW")
 	procIsWindow         = user32.NewProc("IsWindow")
 	procIsWindowVisible  = user32.NewProc("IsWindowVisible")
 	procGetWindowRect    = user32.NewProc("GetWindowRect")

@@ -468,7 +468,7 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.setCursor++
 			}
 		case paneLog:
-			m.logVP.LineDown(1)
+			m.logVP.ScrollDown(1)
 		}
 	case "k", "up":
 		switch m.pane {
@@ -481,7 +481,7 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.setCursor--
 			}
 		case paneLog:
-			m.logVP.LineUp(1)
+			m.logVP.ScrollUp(1)
 		}
 	case " ", "enter":
 		switch m.pane {
