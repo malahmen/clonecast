@@ -11,12 +11,17 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	evdev "github.com/holoplot/go-evdev"
 )
 
+//go:generate go run gen_codes.go
+
 // Code is a Linux evdev key code (KEY_A, KEY_F1, ...).
-type Code = evdev.EvCode
+//
+// It is its own type, not an alias of go-evdev's EvCode, and the name table
+// is a generated copy of go-evdev's (codes_table.go): go-evdev does not build
+// for Windows, and importing it here made `GOOS=windows go vet` fail in every
+// package that uses keys, though only the evdev backend needs it (Kamino 278).
+type Code uint16
 
 // State is the value of an EV_KEY event.
 type State int32
@@ -51,7 +56,7 @@ func (s State) String() string {
 
 // Name returns the short kernel name for a code ("A", "F1", "LEFTSHIFT").
 func Name(c Code) string {
-	if n, ok := evdev.KEYNames[c]; ok {
+	if n, ok := keyNames[c]; ok {
 		return strings.TrimPrefix(n, "KEY_")
 	}
 	return fmt.Sprintf("KEY_%d", uint16(c))
@@ -66,7 +71,7 @@ func Parse(name string) (Code, error) {
 	if !strings.HasPrefix(n, "KEY_") {
 		n = "KEY_" + n
 	}
-	c, ok := evdev.KEYFromString[n]
+	c, ok := keyFromString[n]
 	if !ok {
 		return 0, fmt.Errorf("unknown key %q", name)
 	}

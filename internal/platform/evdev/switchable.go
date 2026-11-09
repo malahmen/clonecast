@@ -10,8 +10,6 @@ import (
 
 	"github.com/charmbracelet/log"
 
-	ev "github.com/holoplot/go-evdev"
-
 	"github.com/malahmen/clonecast/internal/keys"
 )
 
@@ -60,7 +58,7 @@ type feed struct {
 	stop    chan struct{}
 	mu      sync.Mutex
 	retired bool
-	down    map[ev.EvCode]bool
+	down    map[keys.Code]bool
 }
 
 // OpenSwitchable grabs an initial set of devices, with Open's semantics: a
@@ -167,7 +165,7 @@ func (s *Switchable) Switch(paths ...string) error {
 }
 
 func (s *Switchable) start(src capture) *feed {
-	f := &feed{src: src, stop: make(chan struct{}), down: map[ev.EvCode]bool{}}
+	f := &feed{src: src, stop: make(chan struct{}), down: map[keys.Code]bool{}}
 	go s.pump(f)
 	return f
 }

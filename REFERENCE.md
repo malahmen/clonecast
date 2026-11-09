@@ -38,6 +38,7 @@ The Elm-style update loop maps cleanly onto "engine emits notices, UI subscribes
 
 **2.3 One input library: holoplot/go-evdev for both capture and injection.** (2026-09-07)
 During bootstrap we found go-evdev already implements uinput, including `CloneDevice`, which copies a physical keyboard's capabilities and vendor/product IDs into the virtual device. That is exactly what we want (see 3.2), so bendahl/uinput was dropped before writing any code against it.
+Only the evdev backend imports it (2026-11-09, Kamino 278). `internal/keys` has its own `Code` type and a copy of go-evdev's `KEY_*` name tables (`codes_table.go`, written by `go generate ./internal/keys` from the go-evdev version in go.sum; a linux test checks the copy still matches). go-evdev does not build for Windows, and while keys aliased its codes, `GOOS=windows go vet` failed in every package that imports keys. CI now vets for windows/386 too. After bumping go-evdev, run `go generate ./internal/keys`.
 *Revisit if.* go-evdev's uinput support proves buggy on real hardware.
 
 **2.4 godbus/dbus for KWin.** (2026-09-07)
