@@ -58,7 +58,7 @@ Consequence: once grabbed, nobody else gets the keys, so clonecast must replay e
 *Revisit if.* A portal for input capture (the `InputCapture` xdg-desktop-portal) becomes usable for this; today it targets Synergy-style edge crossing, not full capture.
 
 **3.2 Inject through a uinput virtual keyboard cloned from the first physical keyboard.** (2026-09-07)
-A cloned device is indistinguishable from real hardware to KWin and to applications, including games using SDL or Wine. Device name is `clonecast virtual keyboard`, and discovery skips it so clonecast never grabs itself.
+A cloned device is indistinguishable from real hardware to KWin and to applications, including games using SDL or Wine. Device name is `clonecast virtual keyboard`, and discovery skips it so clonecast never grabs itself. It takes the first keyboard's identity and event types, and the keys of every captured or discovered keyboard (mouse buttons excepted), so a key that only another keyboard has, or one switched to later in the Keyboards pane, can still be passed through (Kamino 202).
 *Alternatives.* ydotool: also uinput, but a separate daemon and one more moving part. XTest: X11 only, synthetic events are ignored by many games. wlroots virtual-keyboard protocol: not implemented by KWin.
 *Revisit if.* An application whitelists input devices (some anti-cheat). Nothing we can do about it either way.
 
@@ -328,7 +328,7 @@ All under `/etc`, which is writable on rpm-ostree systems. Requires a re-login f
 
 **7.4 Per-target key sets.** Not planned for v1. One global set.
 
-**7.5 Multiple keyboards.** All are grabbed and merged; the injector clones only the first. Fine unless the first is an odd device.
+**7.5 Multiple keyboards.** All are grabbed and merged; the injector takes the first one's identity and every candidate's keys (3.2). A keyboard plugged in after startup can have keys the virtual keyboard lacks. One that goes away (unplugged, or a Bluetooth keyboard asleep) is a notice in the Log pane, its held keys are released, and choosing it again in the Keyboards pane re-grabs it.
 
 **7.6 Performance of per-operation KWin scripts.** Measured on real Bazzite hardware (2026-09-08): `List` ~3ms, `Active` ~1ms, `Activate` ~5-10ms per call — not the bottleneck. See 4.9 for what actually was (passthrough blocking on the dance) and for a related, separate finding (an intermittent KWin/XWayland focus desync). See 3.3 for the scripting-overhead fallback plan, now lower priority given these numbers.
 

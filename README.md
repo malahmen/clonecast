@@ -212,9 +212,13 @@ what this exists to avoid.
 
 Re-grabbing releases the old devices before taking the new ones, because the
 sets usually overlap, and restores the previous capture if the new one fails —
-a mistyped device must not leave the engine with no keyboard. Passthrough is
-untouched by a switch: the virtual keyboard was cloned once at startup and does
-not depend on which device is currently grabbed.
+a mistyped device must not leave the engine with no keyboard. The old devices
+are released only once no key is down on them (the `space` that switched
+included); a key held for 3 s refuses the switch. Passthrough is untouched by a
+switch: the virtual keyboard was made once at startup with the keys of every
+device listed here, and does not depend on which one is currently grabbed. A
+device that goes away (unplugged, or a Bluetooth keyboard asleep) is reported in
+the Log pane; choose it again here once it is back.
 
 `--keyboard` names the devices explicitly, for a run or a script, by path,
 by-id link or saved name:

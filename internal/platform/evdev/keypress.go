@@ -25,8 +25,8 @@ const inputEventSize = 24
 // apart, and only a press says which one carries the typing. Choosing from a
 // list instead picked the silent node and captured nothing.
 //
-// Raw non-blocking fds and poll(2), not this package's readers: a blocking
-// ReadOne is not reliably woken by closing its fd (see Switchable.Events), and
+// Raw non-blocking fds and poll(2), as Source's readers now use too: a
+// blocking ReadOne is not reliably woken by closing its fd (Kamino 186), and
 // this must stop listening the moment it has its answer. Whatever is already
 // queued when it starts — the Enter that ran the command — is discarded first.
 func WaitForKeyPress(paths []string, timeout time.Duration) (int, error) {
