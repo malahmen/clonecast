@@ -359,7 +359,7 @@ func TestPrefixPaneAutoRefreshRefetchesTheStatusWhenTheGameStops(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("refetched the status with nothing changed")
 	}
-	p, cmd = p.Update(prefixListMsg{procs: []prefix.Proc{{Prefix: "/bottles/a"}}, auto: true})
+	_, cmd = p.Update(prefixListMsg{procs: []prefix.Proc{{Prefix: "/bottles/a"}}, auto: true})
 	if cmd == nil {
 		t.Fatal("the game stopped and the status was not refetched")
 	}

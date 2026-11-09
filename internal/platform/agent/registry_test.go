@@ -501,7 +501,7 @@ func TestAFullQueueIsRefused(t *testing.T) {
 		t.Error("a frame past the queue's length was accepted")
 	}
 	a.stop()
-	_ = <-a.out
+	<-a.out
 	if a.enqueue(agentwire.Frame{Code: 30}) {
 		t.Error("a frame was accepted for a removed agent")
 	}
