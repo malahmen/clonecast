@@ -19,7 +19,8 @@ func Discover() ([]Proc, error) {
 // install.go uses this to pick the route.
 //
 // Evidence is any live process whose WINEPREFIX is this prefix (wineserver
-// itself, the game, the launcher's wine wrapper — all carry it).
+// itself, the game, the launcher's wine wrapper — all carry it), or, for the
+// default ~/.wine, a Wine process with no WINEPREFIX at all (ScanProc).
 func Busy(path string) (bool, []Running, error) {
 	rs, err := ScanProc("/proc")
 	if err != nil {

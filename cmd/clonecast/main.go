@@ -25,6 +25,10 @@
 // and is skipped by delivery. --gate-origin=false lifts the default rule that
 // the focused window must itself be a ticked target for anything to broadcast.
 //
+// --toggle takes any key, but the toggle key is never delivered to any window,
+// so a key other than SCROLLLOCK asks for a y on the terminal before starting,
+// and is refused when stdin is not a terminal. --toggle "" disables it.
+//
 // --agent-exe/--agent-title/--agent-wine seed the TUI's Prefixes pane, which
 // is the interactive face of `clonecast agent install/uninstall/status`
 // (REFERENCE.md 4.19): install/remove the in-bottle agent in a Wine prefix
@@ -37,9 +41,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -87,6 +93,33 @@ func main() {
 	}
 }
 
+// confirmToggle asks before a --toggle key other than the default is taken
+// (Kamino 202, the owner's decision): the toggle key is consumed whenever it
+// is pressed, in every window, so --toggle ENTER would take Enter from the
+// whole desktop for as long as clonecast runs. Any key is allowed, once the
+// user says so. With no terminal to ask on it refuses rather than assume a
+// yes; clonecast's TUI needs a terminal anyway, and the Settings pane can set
+// the same key while running.
+func confirmToggle(c, def keys.Code, in io.Reader, out io.Writer, tty bool) error {
+	if c == def {
+		return nil
+	}
+	name := keys.Name(c)
+	if !tty {
+		return fmt.Errorf("--toggle %s: a toggle key other than %s must be confirmed on a terminal, "+
+			"because no window gets that key while clonecast runs; start clonecast from a terminal, "+
+			"or set the key in the TUI's Settings pane", name, keys.Name(def))
+	}
+	fmt.Fprintf(out, "The toggle key is never delivered: while clonecast runs, no window gets %s.\n"+
+		"Use %s as the toggle key? [y/N] ", name, name)
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return nil
+	}
+	return fmt.Errorf("--toggle %s not confirmed", name)
+}
+
 func run() error {
 	defBackend := "mock"
 	if runtime.GOOS == "linux" {
@@ -97,11 +130,11 @@ func run() error {
 	listen := flag.String("listen", agent.DefaultListen, "loopback address in-bottle agents connect to and register on")
 	xsendSpec := flag.String("xsend", "", `xsend X-window-title overrides by window title, e.g. "Almerinda=World of Warcraft" (with --deliver xsend)`)
 	keySpec := flag.String("keys", "", `initial key set: "all" or names like "a b c f1" (default: none)`)
-	toggle := flag.String("toggle", "SCROLLLOCK", "key that toggles broadcasting on/off")
+	toggle := flag.String("toggle", "SCROLLLOCK", "key that toggles broadcasting on/off; any key, but it is taken from every window, so a key other than SCROLLLOCK asks for a y/N on the terminal first (\"\" = no toggle key)")
 	gateOrigin := flag.Bool("gate-origin", true, "only broadcast while the focused window is itself a ticked target")
 	masterByAgent := flag.Bool("master-by-agent", false, "while broadcasting, send the focused game's own keys through its agent too, so a game that takes the X keyboard focus gets nothing (experimental)")
 	logPath := flag.String("log", defaultLogPath(), "log file (stdout is the TUI)")
-	agentExe := flag.String("agent-exe", "", "built clonecast-agent.exe for the TUI's Prefixes pane to install (default: look next to this binary or in ./bin)")
+	agentExe := flag.String("agent-exe", "", "built clonecast-agent.exe for the TUI's Prefixes pane to install (default: next to this binary, or in the bin/ beside it; never the current directory)")
 	agentTitle := flag.String("agent-title", "", `window title an agent installed from the TUI delivers to ("" = agent default, "World of Warcraft")`)
 	agentWine := flag.String("agent-wine", "", `wine command for the TUI's Prefixes pane to install into an already-booted prefix, e.g. "flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<prefix> com.usebottles.bottles"`)
 	kbdSpec := flag.String("keyboard", "", "comma-separated evdev paths to capture, e.g. /dev/input/event20 (default: every discovered keyboard)")
@@ -128,6 +161,12 @@ func run() error {
 		c, err := keys.Parse(*toggle)
 		if err != nil {
 			return fmt.Errorf("--toggle: %w", err)
+		}
+		// The mock backend grabs nothing, so there is nothing to lose.
+		if *backend != "mock" {
+			if err := confirmToggle(c, cfg.ToggleKey, os.Stdin, os.Stderr, isTerminal(os.Stdin)); err != nil {
+				return err
+			}
 		}
 		cfg.ToggleKey = c
 	} else {

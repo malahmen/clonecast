@@ -374,7 +374,7 @@ func (p PrefixPane) Update(msg tea.Msg) (PrefixPane, tea.Cmd) {
 		case "w":
 			return p.startEdit(optWine, p.cfg.WineCmd, "wine command for a running prefix (empty: worked out from its processes)")
 		case "x":
-			return p.startEdit(optExe, p.cfg.ExePath, "built clonecast-agent.exe (empty: next to clonecast, or ./bin)")
+			return p.startEdit(optExe, p.cfg.ExePath, "built clonecast-agent.exe (empty: next to clonecast, or its bin/)")
 		case "n":
 			return p.startEdit(optName, p.cfg.ValueName, "registry value name (empty: "+prefix.DefaultValueName+")")
 		case "o":

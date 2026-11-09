@@ -122,7 +122,7 @@ clonecast --master-by-agent       # recommended for Wine games: the game you pla
 clonecast --deliver xsend         # experimental XSendEvent backend (Wine virtual desktop only)
 clonecast --keys "a b c"          # start with an explicit key set
 clonecast --keys all              # broadcast every key
-clonecast --toggle PAUSE          # change the on/off hotkey (default SCROLLLOCK)
+clonecast --toggle PAUSE          # change the on/off hotkey (default SCROLLLOCK; any other key asks y/N first)
 clonecast --gate-origin=false     # broadcast even when the focused window is not a target
 clonecast --agent-exe ./bin/clonecast-agent.exe --agent-wine "flatpak run --command=... com.usebottles.bottles"
                                   # install defaults for the TUI's Prefixes pane
@@ -155,7 +155,7 @@ The Settings panel holds the runtime-tunable options: delivery backend (agent or
 In the Targets list, `M` marks the master, `[x]` a ticked target and `●` a window that has a live in-bottle agent. A ticked window with no agent says `no agent` on its own row: tick it and nothing will reach it until an agent for that prefix registers. \
 The Prefixes panel is where that agent gets there in the first place: install, uninstall and status for a Wine prefix, without leaving the TUI (see "The in-bottle agent" above).
 
-The toggle hotkey (`SCROLLLOCK` by default) works from any window and is never delivered anywhere.
+The toggle hotkey (`SCROLLLOCK` by default) works from any window and is never delivered anywhere. Any key can be the toggle, in the Settings pane or with `--toggle`, but that key is then taken from every window while clonecast runs (`--toggle ENTER` takes Enter from the whole desktop). So `--toggle` with a key other than `SCROLLLOCK` asks you to confirm with `y` on the terminal, and refuses to start when there is no terminal to ask on.
 
 Logs go to `~/.cache/clonecast/clonecast.log` (`--log` to change): agent registrations and how each was paired, the origin gate, broadcast on/off and delivery errors — everything the Log pane shows except the per-key `A down -> 2 target(s)` lines, which are kept off disk (see "Security and privacy" in REFERENCE.md 8). The log is capped at 10 MB, and each agent's at 1 MB: at the cap the file becomes `<log>.1`, replacing the previous one, and a new one starts.
 

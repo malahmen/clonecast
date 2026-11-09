@@ -497,8 +497,23 @@ func shellQuote(s string) string {
 }
 
 // FindAgentExe resolves the built agent binary: the explicit path if given,
-// else the usual spots next to the clonecast binary and in the repo's bin/.
+// else next to the clonecast binary or in a bin/ beside it.
+//
+// Never the current directory (Kamino 202): the exe found is copied into a
+// Wine prefix and run there, so whatever clonecast-agent.exe sat in the
+// directory clonecast was started from - a download folder, a checkout of
+// someone else's tree - would have been installed as the agent.
 func FindAgentExe(explicit string) (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		self = ""
+	}
+	return findAgentExe(explicit, self)
+}
+
+// findAgentExe is FindAgentExe with the clonecast binary's path given, "" if
+// unknown, so tests can place it.
+func findAgentExe(explicit, self string) (string, error) {
 	if explicit != "" {
 		if _, err := os.Stat(explicit); err != nil {
 			return "", fmt.Errorf("--exe %s: %w", explicit, err)
@@ -506,22 +521,17 @@ func FindAgentExe(explicit string) (string, error) {
 		return explicit, nil
 	}
 	var candidates []string
-	if self, err := os.Executable(); err == nil {
+	if self != "" {
 		dir := filepath.Dir(self)
 		candidates = append(candidates, filepath.Join(dir, ExeName), filepath.Join(dir, "bin", ExeName))
 	}
-	candidates = append(candidates, ExeName, filepath.Join("bin", ExeName))
 	for _, c := range candidates {
 		if info, err := os.Stat(c); err == nil && !info.IsDir() {
-			abs, err := filepath.Abs(c)
-			if err != nil {
-				return c, nil
-			}
-			return abs, nil
+			return c, nil
 		}
 	}
 	return "", fmt.Errorf("could not find %s (looked in %s); build it with "+
-		"`GOOS=windows GOARCH=386 CGO_ENABLED=0 go build -o bin/%s ./cmd/clonecast-agent` or pass --exe",
+		"`GOOS=windows GOARCH=386 CGO_ENABLED=0 go build -o bin/%s ./cmd/clonecast-agent` next to clonecast, or pass --exe",
 		ExeName, strings.Join(candidates, ", "), ExeName)
 }
 

@@ -169,6 +169,54 @@ func TestFindAgentExeReportsWhereItLooked(t *testing.T) {
 	}
 }
 
+// Kamino 202: an exe in the current directory is not the agent. Only the
+// clonecast binary's own directory and the bin/ beside it are looked in.
+func TestFindAgentExeIgnoresTheCurrentDirectory(t *testing.T) {
+	cwd := t.TempDir()
+	for _, p := range []string{filepath.Join(cwd, ExeName), filepath.Join(cwd, "bin", ExeName)} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("MZ"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(cwd)
+	// The test binary's directory holds no agent, so anything found came
+	// from the current directory.
+	if p, err := FindAgentExe(""); err == nil {
+		t.Fatalf("found %s in the current directory", p)
+	}
+	if p, err := findAgentExe("", ""); err == nil {
+		t.Fatalf("with no executable path found %s", p)
+	}
+}
+
+func TestFindAgentExeLooksBesideClonecast(t *testing.T) {
+	dir := t.TempDir()
+	self := filepath.Join(dir, "clonecast")
+	if _, err := findAgentExe("", self); err == nil {
+		t.Fatal("found an exe in an empty directory")
+	}
+	inBin := filepath.Join(dir, "bin", ExeName)
+	if err := os.MkdirAll(filepath.Dir(inBin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inBin, []byte("MZ"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := findAgentExe("", self); err != nil || p != inBin {
+		t.Fatalf("bin/ beside clonecast: got %q, %v; want %s", p, err, inBin)
+	}
+	beside := filepath.Join(dir, ExeName)
+	if err := os.WriteFile(beside, []byte("MZ"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := findAgentExe("", self); err != nil || p != beside {
+		t.Fatalf("beside clonecast: got %q, %v; want %s (it wins over bin/)", p, err, beside)
+	}
+}
+
 func TestShellQuote(t *testing.T) {
 	for in, want := range map[string]string{
 		`plain`:              `'plain'`,
