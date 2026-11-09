@@ -95,13 +95,28 @@ works its prefix out from the path it is installed at. So there is no per-instan
 port and no title→port map: a window with a live agent is marked `●` in the
 Targets list, and ticking it is the only action.
 
-**Only your agents can register.** `install` also writes a secret beside the
-agent (`drive_c/clonecast/token`, readable by you only), the same one clonecast
-keeps in `~/.config/clonecast/agent-token`, created on first use. An agent that
-does not send it is refused, and the log says to install it again. clonecast
-listens on loopback addresses only, and refuses any other `--listen`. An agent
-installed with v1.0.0 or earlier has no token: install it again (the game must
-restart for the new agent to start).
+**Only your agents can register, and they only talk to your clonecast.**
+`install` also writes a secret beside the agent (`drive_c/clonecast/token`,
+readable by you only), the same one clonecast keeps in
+`~/.config/clonecast/agent-token`, created on first use. With agent protocol 3,
+the default, the secret never goes over the connection: clonecast proves it
+holds it before the agent sends anything, and the agent proves it back
+(challenge-response, REFERENCE.md 4.33). An agent that cannot is refused, and
+the log says to install it again; an agent that meets a clonecast that cannot
+prove the token hangs up and logs it. clonecast listens on loopback addresses
+only, and refuses any other `--listen`. An agent installed with v1.0.0 or
+earlier has no token: install it again (the game must restart for the new agent
+to start).
+
+**Upgrading: agents installed before protocol 3 speak protocol 2.** After the
+upgrade, install them again (`clonecast agent install`, or `i` in the Prefixes
+pane, then restart the game), or set both sides to 2: `clonecast
+--agent-protocol 2` (or the `agent proto` row in Settings) with agents installed
+by `clonecast agent install --protocol 2`. There is no automatic fallback: each
+side speaks only the protocol it is set to, and a mismatch is refused with a
+message saying which side to change, in clonecast's log and in the agent's.
+Protocol 2 sends the token in the hello to whatever answers on clonecast's port,
+which is what protocol 3 fixes.
 
 The agent retries the connection with backoff forever, so it does not matter
 whether clonecast or the game starts first. `agent install --port N` is
@@ -121,6 +136,7 @@ Run on the Bazzite box with three Bottles prefixes since 2026-10-18 (REFERENCE.m
 ```sh
 clonecast                         # agent backend (default): agents register themselves
 clonecast --listen 127.0.0.1:48800  # where agents connect (this is the default)
+clonecast --agent-protocol 2      # accept agents installed before protocol 3 (default 3; see the upgrade note)
 clonecast --master-by-agent       # recommended for Wine games: the game you play gets its keys through its agent while broadcasting
 clonecast --deliver xsend         # experimental XSendEvent backend (Wine virtual desktop only)
 clonecast --keys "a b c"          # start with an explicit key set
@@ -131,7 +147,7 @@ clonecast --agent-exe ./bin/clonecast-agent.exe --agent-wine "flatpak run --comm
                                   # install defaults for the TUI's Prefixes pane
 ```
 
-Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the toggle hotkey, the agent listen address, master by agent and the xsend map are all editable at runtime in the TUI's Settings pane.
+Broadcasting always starts **off** and the key set starts **empty**. Flags are only the starting values: the delivery backend, the origin gate, the toggle hotkey, the agent listen address, the agent protocol, master by agent and the xsend map are all editable at runtime in the TUI's Settings pane.
 
 Key names are Linux `KEY_*` names without the prefix, case insensitive: `a`, `F1`, `LEFTSHIFT`, `SPACE`, `KP1`.
 
@@ -154,7 +170,7 @@ Inside the TUI:
 | `r`                 | in Targets/Keys/Settings: refresh the window list; in Prefixes: rescan running prefixes (both also auto-refresh) |
 | `q`                 | quit                                                                          |
 
-The Settings panel holds the runtime-tunable options: delivery backend (agent or xsend; the row says `(no agents: skipped)` while the agent backend has nobody to deliver to), origin gate, toggle hotkey, the address agents connect to, master by agent (`space` switches it) and the xsend title map (`e`) — and shows how many agents are registered. \
+The Settings panel holds the runtime-tunable options: delivery backend (agent or xsend; the row says `(no agents: skipped)` while the agent backend has nobody to deliver to), origin gate, toggle hotkey, the address agents connect to, the agent protocol (`space` switches between 3 and 2, for new connections; the Prefixes pane installs agents with it), master by agent (`space` switches it) and the xsend title map (`e`) — and shows how many agents are registered. \
 In the Targets list, `M` marks the master, `[x]` a ticked target and `●` a window that has a live in-bottle agent. A ticked window with no agent says `no agent` on its own row: tick it and nothing will reach it until an agent for that prefix registers. \
 The Prefixes panel is where that agent gets there in the first place: install, uninstall and status for a Wine prefix, without leaving the TUI (see "The in-bottle agent" above).
 
@@ -301,7 +317,7 @@ cmd/clonecast/           entrypoint, flags, backend selection (build tags)
 cmd/clonecast-agent/      the in-prefix agent; cross-compiled to windows/386
 cmd/kwindiag/            KWin scripting probe; `kwindiag watch` logs KWin's active window and the X focus
 internal/keys/           key codes, names, and the allowlist (Set)
-internal/agentwire/      the clonecast <-> agent protocol: hello, keepalive, key frames (tested)
+internal/agentwire/      the clonecast <-> agent protocol: hello, v3 handshake, keepalive, key frames (tested)
 internal/agentkeys/      the agent's key state: repeat bit, release at session end (tested)
 internal/agentwin/       how the agent picks its prefix's game window (tested)
 internal/broadcast/      the engine: passthrough + per-window delivery through a pluggable backend (tested)

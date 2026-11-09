@@ -216,9 +216,9 @@ func TestTUIKeysStillWork(t *testing.T) {
 	tm.waitUntil("the origin gate to flip", func() bool { return engine.GateOrigin() != gate })
 
 	// The Settings pane still changes settings: tab twice to it, move to the
-	// master→agent row and flip it.
+	// master→agent row (below the agent protocol's, Kamino 275) and flip it.
 	before := engine.Config().MasterByAgent
-	tm.typeKeys("\t\tjjjj ")
+	tm.typeKeys("\t\tjjjjj ")
 	tm.waitUntil("master by agent to flip", func() bool { return engine.Config().MasterByAgent != before })
 }
 

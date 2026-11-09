@@ -57,6 +57,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/log"
 
+	"github.com/malahmen/clonecast/internal/agentwire"
 	"github.com/malahmen/clonecast/internal/broadcast"
 	"github.com/malahmen/clonecast/internal/keys"
 	"github.com/malahmen/clonecast/internal/logcap"
@@ -136,6 +137,7 @@ func run() error {
 	logPath := flag.String("log", defaultLogPath(), "log file (stdout is the TUI)")
 	agentExe := flag.String("agent-exe", "", "built clonecast-agent.exe for the TUI's Prefixes pane to install (default: next to this binary, or in the bin/ beside it; never the current directory)")
 	agentTitle := flag.String("agent-title", "", `window title an agent installed from the TUI delivers to ("" = the default: the prefix's own game window, whatever its caption)`)
+	agentProto := flag.Int("agent-protocol", agentwire.DefaultProtocol, "agent protocol, 3 or 2; agents must be installed with the same one (3 proves clonecast to the agent; 2 is for agents installed before it, Kamino 275)")
 	agentWine := flag.String("agent-wine", "", `wine command for the TUI's Prefixes pane to install into an already-booted prefix, e.g. "flatpak run --command=<runner>/bin/wine --env=WINEPREFIX=<prefix> com.usebottles.bottles"`)
 	kbdSpec := flag.String("keyboard", "", "comma-separated evdev paths to capture, e.g. /dev/input/event20 (default: every discovered keyboard)")
 	listKbd := flag.Bool("list-keyboards", false, "list the keyboards discovery would capture and whether each can be grabbed, then exit")
@@ -152,6 +154,10 @@ func run() error {
 
 	if err := setupLog(*logPath); err != nil {
 		return err
+	}
+
+	if !agentwire.ValidProtocol(*agentProto) {
+		return fmt.Errorf("--agent-protocol %d: want %d or %d", *agentProto, agentwire.Version, agentwire.MinVersion)
 	}
 
 	cfg := broadcast.DefaultConfig()
@@ -223,9 +229,10 @@ func run() error {
 		return err
 	}
 	agents := agent.NewRegistry(agent.Options{
-		Windows: p.wm.List,
-		Notify:  engine.Notify,
-		Token:   token,
+		Windows:  p.wm.List,
+		Notify:   engine.Notify,
+		Token:    token,
+		Protocol: *agentProto,
 	})
 	defer agents.Close()
 	if err := agents.Listen(*listen); err != nil {
@@ -275,6 +282,8 @@ func run() error {
 		Title:   *agentTitle,
 		WineCmd: *agentWine,
 		Token:   token,
+		// Asked at install time too: the Settings pane changes it live.
+		Protocol: agents.Protocol,
 	}
 	prog := tea.NewProgram(tui.New(engine, p.wm, bs, agents, prefixCfg, p.devCtl), tea.WithAltScreen())
 	go func() {

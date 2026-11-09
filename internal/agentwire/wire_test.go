@@ -73,8 +73,8 @@ func TestHelloOmitsEmptyFields(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	got := strings.TrimSpace(b.String())
-	if got != "H 2 title=Game" {
-		t.Fatalf("hello = %q, want %q", got, "H 2 title=Game")
+	if got != "H 3 title=Game" {
+		t.Fatalf("hello = %q, want %q", got, "H 3 title=Game")
 	}
 	msg, err := Decode(got)
 	if err != nil {
@@ -135,6 +135,64 @@ func TestDecodeVersionMismatch(t *testing.T) {
 	_ = msg
 	if _, err := Decode("H 1 prefix=x"); !errors.Is(err, ErrUnsupportedVersion) {
 		t.Fatalf("v1 hello: err = %v, want ErrUnsupportedVersion", err)
+	}
+	if _, err := Decode("H 4 prefix=x"); !errors.Is(err, ErrUnsupportedVersion) {
+		t.Fatalf("v4 hello: err = %v, want ErrUnsupportedVersion", err)
+	}
+}
+
+// Both protocols this build implements parse (Kamino 275); which one a side
+// accepts is its setting (CheckVersion).
+func TestDecodeV2AndV3Hellos(t *testing.T) {
+	for _, line := range []string{"H 2 title=Game token=t", "H 3 title=Game nonce=" + strings.Repeat("0a", 16)} {
+		m, err := Decode(line)
+		if err != nil || m.Kind != KindHello || m.Hello.Title != "Game" {
+			t.Fatalf("decode %q = %+v, %v", line, m, err)
+		}
+	}
+}
+
+// The v3 lines round-trip, and a malformed one is an error, not a line to
+// skip: the handshake must not mistake garbage for a proof.
+func TestHandshakeLinesRoundTrip(t *testing.T) {
+	nonce, mac := strings.Repeat("0a", 16), strings.Repeat("b1", 32)
+	var b strings.Builder
+	_ = Challenge{Nonce: nonce, MAC: mac}.Write(&b)
+	_ = Response{MAC: mac}.Write(&b)
+	_ = WriteVersionRefusal(&b, 2)
+	_ = (Hello{Version: 3, Title: "G", Nonce: nonce}).Write(&b)
+	lines := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("lines = %q", lines)
+	}
+	want := []Message{
+		{Kind: KindChallenge, Challenge: Challenge{Nonce: nonce, MAC: mac}},
+		{Kind: KindResponse, Response: Response{MAC: mac}},
+		{Kind: KindVersion, Version: 2},
+		{Kind: KindHello, Hello: Hello{Version: 3, Title: "G", Nonce: nonce}},
+	}
+	for i, l := range lines {
+		m, err := Decode(l)
+		if err != nil {
+			t.Fatalf("decode %q: %v", l, err)
+		}
+		if m != want[i] {
+			t.Errorf("decode %q = %+v, want %+v", l, m, want[i])
+		}
+	}
+	for _, bad := range []string{
+		"C " + nonce,                        // no mac
+		"C " + nonce + " " + mac + " extra", // too many fields
+		"C zz " + mac,                       // nonce not hex
+		"C " + nonce + " " + mac[:10],       // short mac
+		"R",                                 // no mac
+		"R " + nonce,                        // a nonce where the mac belongs
+		"V",
+		"V two",
+	} {
+		if _, err := Decode(bad); err == nil {
+			t.Errorf("decode %q: want an error", bad)
+		}
 	}
 }
 

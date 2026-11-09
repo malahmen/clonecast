@@ -3,6 +3,10 @@ package agent
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -52,17 +56,82 @@ type testClient struct {
 	sc   *bufio.Scanner
 }
 
+// testToken is the token startRegistry's registry holds.
+const testToken = "t3st-token"
+
+// dialAgent connects as a genuine agent at h.Version: a v2 hello is sent as
+// it is (with whatever token it carries), and a v3 one runs the agent's own
+// handshake (agentwire.AgentAuth) with testToken, failing the test if that
+// does not complete.
 func dialAgent(t *testing.T, addr string, h agentwire.Hello) *testClient {
+	t.Helper()
+	c := dialRaw(t, addr)
+	if h.Version == 2 {
+		if err := h.Write(c.conn); err != nil {
+			t.Fatalf("hello: %v", err)
+		}
+		return c
+	}
+	auth, err := agentwire.NewAgentAuth(testToken, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Version, h.Token, h.Nonce = 3, "", auth.Nonce()
+	if err := h.Write(c.conn); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	_ = c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if err := auth.Run(c.sc, c.conn); err != nil {
+		t.Fatalf("v3 handshake: %v", err)
+	}
+	_ = c.conn.SetReadDeadline(time.Time{})
+	return c
+}
+
+func dialRaw(t *testing.T, addr string) *testClient {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial %s: %v", addr, err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	if err := h.Write(c); err != nil {
+	return &testClient{t: t, conn: c, sc: bufio.NewScanner(c)}
+}
+
+// dialFakeV3 is a v3 agent with the wrong token. It cannot check the
+// challenge, so it answers it with the MAC its token gives, computed here
+// from the documented format rather than through agentwire. It returns the
+// challenge it was sent.
+func dialFakeV3(t *testing.T, addr, token string, h agentwire.Hello) (*testClient, agentwire.Challenge) {
+	t.Helper()
+	c := dialRaw(t, addr)
+	nonce, _ := agentwire.NewNonce(rand.Reader)
+	h.Version, h.Nonce = 3, nonce
+	if err := h.Write(c.conn); err != nil {
 		t.Fatalf("hello: %v", err)
 	}
-	return &testClient{t: t, conn: c, sc: bufio.NewScanner(c)}
+	ch := c.challenge()
+	m := hmac.New(sha256.New, []byte(token))
+	m.Write([]byte("agent|" + ch.Nonce + "|" + nonce))
+	if err := (agentwire.Response{MAC: hex.EncodeToString(m.Sum(nil))}).Write(c.conn); err != nil {
+		t.Fatalf("response: %v", err)
+	}
+	return c, ch
+}
+
+// challenge reads the registry's C line.
+func (c *testClient) challenge() agentwire.Challenge {
+	c.t.Helper()
+	_ = c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if !c.sc.Scan() {
+		c.t.Fatalf("no challenge: %v", c.sc.Err())
+	}
+	m, err := agentwire.Decode(c.sc.Text())
+	if err != nil || m.Kind != agentwire.KindChallenge {
+		c.t.Fatalf("want a challenge, got %q (%v)", c.sc.Text(), err)
+	}
+	_ = c.conn.SetReadDeadline(time.Time{})
+	return m.Challenge
 }
 
 // nextFrame reads one frame, failing the test if none arrives.
@@ -108,6 +177,7 @@ func startRegistryNotify(t *testing.T, wins []broadcast.Window, procRoot string,
 		},
 		PrefixOf: func(pid int) (string, error) { return prefix.PrefixOfPIDIn(procRoot, pid) },
 		Notify:   notify,
+		Token:    testToken,
 	})
 	if err := reg.Listen("127.0.0.1:0"); err != nil { // :0 — never collide with a real clonecast
 		t.Fatalf("listen: %v", err)
@@ -512,7 +582,7 @@ func TestAFullQueueIsRefused(t *testing.T) {
 func TestRegistryRefusesAnAgentWithoutTheToken(t *testing.T) {
 	var mu sync.Mutex
 	var lines []string
-	reg := NewRegistry(Options{Token: "s3cret", Notify: func(s string, _ bool) {
+	reg := NewRegistry(Options{Token: "s3cret", Protocol: 2, Notify: func(s string, _ bool) {
 		mu.Lock()
 		defer mu.Unlock()
 		lines = append(lines, s)
@@ -524,7 +594,7 @@ func TestRegistryRefusesAnAgentWithoutTheToken(t *testing.T) {
 
 	var held []*testClient
 	for _, tok := range []string{"", "", "b4d-t0ken"} {
-		c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game", Token: tok})
+		c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: 2, Title: "Game", Token: tok})
 		held = append(held, c)
 		if reg.Count() != 0 {
 			t.Fatalf("token %q: the agent registered", tok)
@@ -535,7 +605,7 @@ func TestRegistryRefusesAnAgentWithoutTheToken(t *testing.T) {
 		defer mu.Unlock()
 		return len(lines) >= 2
 	})
-	dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game", Token: "s3cret"})
+	dialAgent(t, reg.Addr(), agentwire.Hello{Version: 2, Title: "Game", Token: "s3cret"})
 	waitFor(t, "the agent with the token", func() bool { return reg.Count() == 1 })
 
 	// Held open, not closed: an agent built before 2026-10-09 redials at
@@ -617,10 +687,16 @@ func TestCloseSendsWhatIsQueued(t *testing.T) {
 	<-closed
 }
 
-// refusedClient dials with no token and waits for the registry to take it in.
-func refusedClient(t *testing.T, reg *Registry) *testClient {
+// refusedClient dials as an agent the registry refuses for its token, at
+// protocol proto: a v2 hello without one, or a v3 agent with the wrong one
+// (Kamino 275: the cap and the deadline hold for both).
+func refusedClient(t *testing.T, reg *Registry, proto int) *testClient {
 	t.Helper()
-	return dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game"})
+	if proto == 2 {
+		return dialAgent(t, reg.Addr(), agentwire.Hello{Version: 2, Title: "Game"})
+	}
+	c, _ := dialFakeV3(t, reg.Addr(), "b4d-t0ken", agentwire.Hello{Title: "Game"})
+	return c
 }
 
 // closedWithin reports whether the registry closes c within d.
@@ -639,20 +715,26 @@ func isTimeout(err error) bool {
 // and a socket each for as long as the peer liked. Past the cap a refusal is
 // closed at once; the ones held stay held.
 func TestRefusedConnectionsAreCapped(t *testing.T) {
-	reg := NewRegistry(Options{Token: "s3cret"})
+	for _, proto := range []int{2, 3} {
+		t.Run(fmt.Sprintf("v%d", proto), func(t *testing.T) { testRefusedConnectionsAreCapped(t, proto) })
+	}
+}
+
+func testRefusedConnectionsAreCapped(t *testing.T, proto int) {
+	reg := NewRegistry(Options{Token: "s3cret", Protocol: proto})
 	reg.maxHeld = 2
 	if err := reg.Listen("127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reg.Close() })
 
-	first := []*testClient{refusedClient(t, reg), refusedClient(t, reg)}
+	first := []*testClient{refusedClient(t, reg, proto), refusedClient(t, reg, proto)}
 	waitFor(t, "two refusals held", func() bool {
 		reg.mu.Lock()
 		defer reg.mu.Unlock()
 		return len(reg.held) == 2
 	})
-	extra := refusedClient(t, reg)
+	extra := refusedClient(t, reg, proto)
 	if !closedWithin(extra, 2*time.Second) {
 		t.Fatal("a refusal past the cap was held open")
 	}
@@ -672,15 +754,21 @@ func TestRefusedConnectionsAreCapped(t *testing.T) {
 // Kamino 139: a held refusal has a deadline. A peer that never closes, or
 // streams bytes at the registry, is closed when it passes.
 func TestRefusedConnectionsHaveADeadline(t *testing.T) {
-	reg := NewRegistry(Options{Token: "s3cret"})
+	for _, proto := range []int{2, 3} {
+		t.Run(fmt.Sprintf("v%d", proto), func(t *testing.T) { testRefusedConnectionsHaveADeadline(t, proto) })
+	}
+}
+
+func testRefusedConnectionsHaveADeadline(t *testing.T, proto int) {
+	reg := NewRegistry(Options{Token: "s3cret", Protocol: proto})
 	reg.holdFor = 300 * time.Millisecond
 	if err := reg.Listen("127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reg.Close() })
 
-	quiet := refusedClient(t, reg)
-	chatty := refusedClient(t, reg)
+	quiet := refusedClient(t, reg, proto)
+	chatty := refusedClient(t, reg, proto)
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -749,4 +837,256 @@ func TestDeliverSkipsAKeyTheAgentCannotPost(t *testing.T) {
 	if got := c.nextFrame(); got.Code != uint16(a) {
 		t.Errorf("the agent's first frame is %+v, want A", got)
 	}
+}
+
+// logLines collects a registry's notices for a test.
+type logLines struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logLines) notify(s string, _ bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, s)
+}
+
+func (l *logLines) count(sub string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, s := range l.lines {
+		if strings.Contains(s, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+func (l *logLines) all() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
+func listen(t *testing.T, opts Options) *Registry {
+	t.Helper()
+	reg := NewRegistry(opts)
+	if err := reg.Listen("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+	return reg
+}
+
+// heldOpen reports whether the registry keeps c open (a refusal is held,
+// Kamino 139) and sends nothing on it.
+func heldOpen(c *testClient) bool {
+	_ = c.conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	n, err := c.conn.Read(make([]byte, 1))
+	return n == 0 && isTimeout(err)
+}
+
+// Kamino 275: in v3 the agent proves the token by challenge-response. One
+// with the wrong token is refused through refuse (held, logged once), and
+// the token reaches neither the wire nor the log.
+func TestRegistryV3RefusesAnAgentThatCannotProveTheToken(t *testing.T) {
+	var log logLines
+	reg := listen(t, Options{Token: "s3cret", Notify: log.notify})
+
+	var held []*testClient
+	for i := 0; i < 2; i++ {
+		c, _ := dialFakeV3(t, reg.Addr(), "b4d-t0ken", agentwire.Hello{Title: "Game"})
+		held = append(held, c)
+	}
+	waitFor(t, "the refusal", func() bool { return log.count("does not prove") == 1 })
+	for i, c := range held {
+		if !heldOpen(c) {
+			t.Fatalf("refusal %d was closed or written to; want it held open", i)
+		}
+	}
+	if reg.Count() != 0 {
+		t.Fatal("an agent with the wrong token registered")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := log.count("refused"); n != 1 {
+		t.Errorf("%d refusals logged for one agent, want 1:\n%s", n, log.all())
+	}
+	if strings.Contains(log.all(), "s3cret") || strings.Contains(log.all(), "b4d-t0ken") {
+		t.Errorf("a token reached the log:\n%s", log.all())
+	}
+}
+
+// A recorded R is worth nothing on the next connection: the challenge is
+// fresh each time, even for a replayed hello.
+func TestRegistryV3RefusesAReplayedResponse(t *testing.T) {
+	var log logLines
+	reg := listen(t, Options{Token: "s3cret", Notify: log.notify})
+	hello := agentwire.Hello{Version: 3, Title: "Game", Nonce: strings.Repeat("5a", 16)}
+
+	// The genuine exchange, recorded.
+	c1 := dialRaw(t, reg.Addr())
+	_ = hello.Write(c1.conn)
+	ch1 := c1.challenge()
+	m := hmac.New(sha256.New, []byte("s3cret"))
+	m.Write([]byte("agent|" + ch1.Nonce + "|" + hello.Nonce))
+	recorded := agentwire.Response{MAC: hex.EncodeToString(m.Sum(nil))}
+	_ = recorded.Write(c1.conn)
+	waitFor(t, "the genuine agent", func() bool { return reg.Count() == 1 })
+
+	// The replay.
+	c2 := dialRaw(t, reg.Addr())
+	_ = hello.Write(c2.conn)
+	if ch2 := c2.challenge(); ch2.Nonce == ch1.Nonce {
+		t.Fatal("the registry reused its nonce")
+	}
+	_ = recorded.Write(c2.conn)
+	waitFor(t, "the refusal", func() bool { return log.count("does not prove") == 1 })
+	if reg.Count() != 1 {
+		t.Fatalf("the replay registered (count %d)", reg.Count())
+	}
+}
+
+// An agent that hangs up on the challenge (what a genuine agent with another
+// token does) is logged once, saying what to do, however often it redials.
+func TestRegistryV3AgentHangingUpOnTheChallenge(t *testing.T) {
+	var log logLines
+	reg := listen(t, Options{Token: "s3cret", Notify: log.notify})
+	for i := 0; i < 3; i++ {
+		c := dialRaw(t, reg.Addr())
+		_ = (agentwire.Hello{Version: 3, Title: "Game", Nonce: strings.Repeat("5a", 16)}).Write(c.conn)
+		c.challenge()
+		_ = c.conn.Close()
+	}
+	waitFor(t, "the refusal", func() bool { return log.count("did not answer the challenge") >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	if n := log.count("did not answer the challenge"); n != 1 {
+		t.Errorf("logged %d times, want once:\n%s", n, log.all())
+	}
+}
+
+// Each side accepts only the protocol it is set to, with no fallback, and
+// the refusal says what to change: in clonecast's log, and to the agent as a
+// V line its log can show (Kamino 275).
+func TestRegistryRefusesTheOtherProtocol(t *testing.T) {
+	for _, c := range []struct {
+		setting int
+		hello   agentwire.Hello
+		want    string
+	}{
+		{3, agentwire.Hello{Version: 2, Title: "Game", Token: "s3cret"}, "this agent speaks protocol 2: reinstall it, or set the agent protocol to 2"},
+		{2, agentwire.Hello{Version: 3, Title: "Game", Nonce: strings.Repeat("5a", 16)}, "this agent speaks protocol 3: set the agent protocol to 3, or reinstall it with --protocol 2"},
+	} {
+		var log logLines
+		reg := listen(t, Options{Token: "s3cret", Protocol: c.setting, Notify: log.notify})
+		cl := dialRaw(t, reg.Addr())
+		_ = c.hello.Write(cl.conn)
+		_ = cl.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if !cl.sc.Scan() {
+			t.Fatalf("set to %d: no version refusal: %v", c.setting, cl.sc.Err())
+		}
+		m, err := agentwire.Decode(cl.sc.Text())
+		if err != nil || m.Kind != agentwire.KindVersion || m.Version != c.setting {
+			t.Fatalf("set to %d: the agent was sent %q, want V %d", c.setting, cl.sc.Text(), c.setting)
+		}
+		waitFor(t, "the refusal", func() bool { return log.count(c.want) == 1 })
+		if !heldOpen(cl) {
+			t.Errorf("set to %d: the refusal was closed; want it held (Kamino 139)", c.setting)
+		}
+		if reg.Count() != 0 {
+			t.Errorf("set to %d: the other protocol registered", c.setting)
+		}
+	}
+}
+
+// Both sides set to 2: v2 still pairs end to end, the token in the hello.
+func TestRegistryV2StillPairs(t *testing.T) {
+	wins := []broadcast.Window{{ID: "w1", Title: "Game"}}
+	reg := listen(t, Options{
+		Token:    "s3cret",
+		Protocol: 2,
+		Windows:  func(context.Context) ([]broadcast.Window, error) { return wins, nil },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go reg.Run(ctx)
+	c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: 2, Title: "Game", Token: "s3cret"})
+	waitFor(t, "the v2 agent", func() bool { return reg.Paired("w1") })
+	if !reg.agentFor("w1").enqueue(agentwire.Frame{Code: 30, Down: true}) {
+		t.Fatal("enqueue refused")
+	}
+	if got := c.nextFrame(); got != (agentwire.Frame{Code: 30, Down: true}) {
+		t.Fatalf("frame = %+v", got)
+	}
+}
+
+// v3 proves the token, so a registry without one cannot run it: it refuses
+// to be set to 3 and turns every v3 agent away, saying why.
+func TestRegistryV3NeedsAToken(t *testing.T) {
+	var log logLines
+	reg := listen(t, Options{Notify: log.notify})
+	if err := reg.SetProtocol(3); !errors.Is(err, agentwire.ErrNoToken) {
+		t.Errorf("SetProtocol(3) with no token: err = %v", err)
+	}
+	c := dialRaw(t, reg.Addr())
+	_ = (agentwire.Hello{Version: 3, Title: "Game", Nonce: strings.Repeat("5a", 16)}).Write(c.conn)
+	waitFor(t, "the notice", func() bool { return log.count("token") == 1 })
+	if !closedWithin(c, 2*time.Second) {
+		t.Error("the connection stayed open")
+	}
+	if reg.Count() != 0 {
+		t.Error("a v3 agent registered with a registry that has no token")
+	}
+}
+
+// A v3 hello without a nonce cannot be challenged: refused, not registered.
+func TestRegistryV3RefusesAHelloWithoutANonce(t *testing.T) {
+	var log logLines
+	reg := listen(t, Options{Token: "s3cret", Notify: log.notify})
+	c := dialRaw(t, reg.Addr())
+	_ = (agentwire.Hello{Version: 3, Title: "Game", Token: "s3cret"}).Write(c.conn)
+	waitFor(t, "the refusal", func() bool { return log.count("no valid nonce") == 1 })
+	if reg.Count() != 0 {
+		t.Error("registered without the handshake")
+	}
+}
+
+// The setting applies to new connections: an agent already registered keeps
+// its session, and the next one must speak the new protocol.
+func TestRegistrySetProtocolAppliesToNewConnections(t *testing.T) {
+	reg, _ := startRegistry(t, nil, t.TempDir())
+	dialAgent(t, reg.Addr(), agentwire.Hello{Version: 3, Title: "Game"})
+	waitFor(t, "the v3 agent", func() bool { return reg.Count() == 1 })
+	if err := reg.SetProtocol(2); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Protocol() != 2 {
+		t.Fatalf("Protocol() = %d", reg.Protocol())
+	}
+	c := dialRaw(t, reg.Addr())
+	_ = (agentwire.Hello{Version: 3, Title: "Game 2", Nonce: strings.Repeat("5a", 16)}).Write(c.conn)
+	_ = c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if !c.sc.Scan() || c.sc.Text() != "V 2" {
+		t.Fatalf("a v3 agent after the switch got %q, want V 2", c.sc.Text())
+	}
+	dialAgent(t, reg.Addr(), agentwire.Hello{Version: 2, Title: "Game 3", Token: testToken})
+	waitFor(t, "the v2 agent", func() bool { return reg.Count() == 2 })
+	for _, bad := range []int{0, 1, 4} {
+		if err := reg.SetProtocol(bad); err == nil {
+			t.Errorf("SetProtocol(%d) accepted", bad)
+		}
+	}
+}
+
+// In v3 a re-announce carries no token and no nonce, and is taken: the
+// session was proven by the handshake.
+func TestRegistryV3ReannounceWithoutAToken(t *testing.T) {
+	reg, _ := startRegistry(t, nil, t.TempDir())
+	c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: 3, Title: "Launcher"})
+	waitFor(t, "the agent", func() bool { return reg.Count() == 1 })
+	_ = (agentwire.Hello{Version: 3, Title: "World of Warcraft", HWND: 0x42}).Write(c.conn)
+	waitFor(t, "the re-announce", func() bool {
+		a := reg.Agents()
+		return len(a) == 1 && a[0].Title == "World of Warcraft" && a[0].HWND == 0x42
+	})
 }
