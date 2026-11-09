@@ -1,3 +1,5 @@
+//go:build linux
+
 // Command kwindiag is a standalone debugging tool for clonecast's KWin
 // backend (internal/platform/kwin). It talks to KWin's scripting D-Bus
 // interface directly — the same mechanism kwin.WM uses — without going
