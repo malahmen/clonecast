@@ -11,6 +11,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/constant"
@@ -24,20 +25,25 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 )
 
 const module = "github.com/holoplot/go-evdev"
 
 func main() {
-	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}} {{.Version}}", module).Output()
+	// go mod download fetches the go.sum version if it is not in the module
+	// cache yet, and names its directory either way.
+	out, err := exec.Command("go", "mod", "download", "-json", module).Output()
 	if err != nil {
-		log.Fatalf("go list %s: %v", module, err)
+		log.Fatalf("go mod download %s: %v", module, err)
 	}
-	dir, version, _ := strings.Cut(strings.TrimSpace(string(out)), " ")
-	if dir == "" {
-		log.Fatalf("go list %s: module not in the module cache (run go mod download)", module)
+	var mod struct{ Dir, Version, Error string }
+	if err := json.Unmarshal(out, &mod); err != nil {
+		log.Fatalf("go mod download %s: %v", module, err)
 	}
+	if mod.Error != "" || mod.Dir == "" {
+		log.Fatalf("go mod download %s: no module directory %s", module, mod.Error)
+	}
+	dir, version := mod.Dir, mod.Version
 	path := filepath.Join(dir, "codes.go")
 
 	fset := token.NewFileSet()
