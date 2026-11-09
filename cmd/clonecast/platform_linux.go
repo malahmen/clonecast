@@ -35,7 +35,7 @@ func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 	for _, s := range src.Skipped() {
 		log.Infof("keyboard capture: skipped %s", s)
 	}
-	inj, err := evdev.NewInjector(src.Devices()[0])
+	inj, err := evdev.NewInjector(src.Paths())
 	if err != nil {
 		_ = src.Close()
 		return nil, fmt.Errorf("virtual keyboard: %w", err)
@@ -77,6 +77,14 @@ func newLinuxPlatform(kbdPaths ...string) (*platform, error) {
 		}
 	} else {
 		log.Infof("focus guard unavailable (%v); a game may take the keyboard from the one you clicked", err)
+	}
+	// A keyboard going away is a notice too (Kamino 202), alongside the guard's.
+	guardNotify := setNotify
+	setNotify = func(n func(string, bool)) {
+		src.SetNotify(n)
+		if guardNotify != nil {
+			guardNotify(n)
+		}
 	}
 	return &platform{
 		src:       src,
@@ -282,11 +290,14 @@ func (d deviceController) Devices() ([]tui.Device, error) {
 func (d deviceController) Captured() []string { return d.src.Paths() }
 
 // Capture re-grabs. The Injector is deliberately NOT rebuilt: it created its own
-// uinput device by cloning a template at startup and does not depend on that
-// template staying open, so passthrough survives a switch untouched. Rebuilding
-// it would make the compositor re-detect a new input device mid-session, which
-// costs the first keystrokes after every change (the 500ms sleep above exists
-// for exactly that reason at startup).
+// uinput device at startup and does not depend on any captured device staying
+// open, so passthrough survives a switch untouched. Rebuilding it would make
+// the compositor re-detect a new input device mid-session, which costs the
+// first keystrokes after every change (the 500ms sleep above exists for
+// exactly that reason at startup), and would drop any key passthrough holds
+// down on it. Its keys were taken from every candidate this pane lists, so a
+// keyboard switched to has none it lacks (Kamino 202); only one plugged in
+// after startup can.
 func (d deviceController) Capture(paths []string) error { return d.src.Switch(paths...) }
 
 // Save remembers the choice by ID, as the startup picker does.

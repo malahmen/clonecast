@@ -11,13 +11,15 @@ import (
 )
 
 // fakeDev reports the held keys from a script, one entry per State call
-// (the last entry repeats), and records grabs.
+// (the last entry repeats), and records grabs: ungrabAt is how many State
+// calls had been made at the last Ungrab.
 type fakeDev struct {
-	held    []int
-	calls   int
-	grabbed bool
-	grabs   int
-	ungrabs int
+	held     []int
+	calls    int
+	grabbed  bool
+	grabs    int
+	ungrabs  int
+	ungrabAt int
 }
 
 func (f *fakeDev) State(ev.EvType) (ev.StateMap, error) {
@@ -29,8 +31,13 @@ func (f *fakeDev) State(ev.EvType) (ev.StateMap, error) {
 	}
 	return st, nil
 }
-func (f *fakeDev) Grab() error   { f.grabbed = true; f.grabs++; return nil }
-func (f *fakeDev) Ungrab() error { f.grabbed = false; f.ungrabs++; return nil }
+func (f *fakeDev) Grab() error { f.grabbed = true; f.grabs++; return nil }
+func (f *fakeDev) Ungrab() error {
+	f.grabbed = false
+	f.ungrabs++
+	f.ungrabAt = f.calls
+	return nil
+}
 
 // The Shift pressed for the picker is still down when the grab comes: the
 // grab must wait for it, or the compositor never sees it released.
