@@ -46,6 +46,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/log"
@@ -224,7 +225,8 @@ func run() error {
 		engine.Notify(warn, true) // to the log file too, through the sink
 	}
 	engineErr := make(chan error, 1)
-	go func() { engineErr <- engine.Run(ctx) }()
+	engineDone := make(chan struct{})
+	go func() { engineErr <- engine.Run(ctx); close(engineDone) }()
 
 	prefixCfg := tui.PrefixPaneConfig{
 		ExePath: *agentExe,
@@ -244,6 +246,17 @@ func run() error {
 	}()
 
 	_, err = prog.Run()
+	// Stop the engine and let it release what it holds while the backends,
+	// the agents' connections and the virtual keyboard are still open (the
+	// defers above close them): quitting with W held left every character
+	// walking (Kamino 202). Bounded: a wedged delivery must not stop the quit.
+	cancel()
+	select {
+	case <-engineDone:
+		engine.Close()
+	case <-time.After(3 * time.Second):
+		log.Warn("engine did not stop; held keys not released")
+	}
 	return err
 }
 

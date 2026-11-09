@@ -55,6 +55,10 @@ type Agent struct {
 	out      chan agentwire.Frame // frames waiting for this agent's writer
 	done     chan struct{}        // closed when the agent is removed
 	doneOnce sync.Once
+	// unsent counts frames queued and not yet written (or failed), so Close
+	// can let the writers finish: the Ups the engine sends at quit are the
+	// last frames queued, and closing the socket under them lost them.
+	unsent atomic.Int32
 }
 
 func newAgent(id int64, c net.Conn) *Agent {
@@ -70,10 +74,12 @@ func (a *Agent) enqueue(f agentwire.Frame) bool {
 		return false
 	default:
 	}
+	a.unsent.Add(1)
 	select {
 	case a.out <- f:
 		return true
 	default:
+		a.unsent.Add(-1)
 		return false
 	}
 }
@@ -86,7 +92,9 @@ func (a *Agent) run(fail func(error)) {
 		case <-a.done:
 			return
 		case f := <-a.out:
-			if err := a.send(f); err != nil {
+			err := a.send(f)
+			a.unsent.Add(-1)
+			if err != nil {
 				fail(err)
 				return
 			}
@@ -354,8 +362,26 @@ func (r *Registry) Repair(ctx context.Context) {
 	r.pair.recompute(ctx, r.snapshot())
 }
 
-// Close stops listening and drops every agent.
+// flushWait bounds how long Close waits for the agents' writers to send what
+// is queued. A writer's own deadline is 2 s; an agent that slow is dropped
+// anyway.
+const flushWait = time.Second
+
+// Close stops listening and drops every agent, once their writers have sent
+// what is queued, or flushWait has passed: the engine releases held keys at
+// quit just before this (Kamino 202).
 func (r *Registry) Close() error {
+	deadline := time.Now().Add(flushWait)
+	for _, a := range r.snapshot() {
+	wait:
+		for a.unsent.Load() > 0 && time.Now().Before(deadline) {
+			select {
+			case <-a.done:
+				break wait // its writer is gone; nothing more will be sent
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()

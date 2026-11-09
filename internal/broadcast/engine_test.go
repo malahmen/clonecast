@@ -98,18 +98,18 @@ type focusMover struct{ rec *recorder }
 
 func (f *focusMover) MovesFocus() bool { return true }
 func (f *focusMover) Close() error     { return nil }
-func (f *focusMover) Deliver(ctx context.Context, req Delivery) (int, error) {
-	n := 0
+func (f *focusMover) Deliver(ctx context.Context, req Delivery) ([]WindowID, error) {
+	var reached []WindowID
 	for _, t := range req.Targets {
 		if t == req.Origin {
 			continue
 		}
 		_ = f.rec.Activate(ctx, t)
 		_ = f.rec.Emit(req.Event)
-		n++
+		reached = append(reached, t)
 	}
 	_ = f.rec.Activate(ctx, req.Origin)
-	return n, nil
+	return reached, nil
 }
 
 func newEngine(rec *recorder, src *fakeSource) *Engine {
@@ -295,6 +295,9 @@ func TestToggleKeyIsConsumed(t *testing.T) {
 type fakeDeliverer struct {
 	mu    sync.Mutex
 	calls []deliverCall
+	// unreachable targets are skipped, as the agent backend skips a window
+	// with no agent or a full queue, and left out of what Deliver reports.
+	unreachable map[WindowID]bool
 }
 
 type deliverCall struct {
@@ -307,18 +310,28 @@ type deliverCall struct {
 func (f *fakeDeliverer) MovesFocus() bool { return false }
 func (f *fakeDeliverer) Close() error     { return nil }
 
-func (f *fakeDeliverer) Deliver(_ context.Context, req Delivery) (int, error) {
+func (f *fakeDeliverer) Deliver(_ context.Context, req Delivery) ([]WindowID, error) {
 	var delivered []WindowID
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, t := range req.Targets {
-		if t == req.Origin {
+		if t == req.Origin || f.unreachable[t] {
 			continue
 		}
 		delivered = append(delivered, t)
 	}
-	f.mu.Lock()
 	f.calls = append(f.calls, deliverCall{ev: req.Event, origin: req.Origin, targets: append([]WindowID(nil), req.Targets...), delivered: delivered})
-	f.mu.Unlock()
-	return len(delivered), nil
+	return delivered, nil
+}
+
+// setUnreachable marks a target unreachable (on) or reachable again.
+func (f *fakeDeliverer) setUnreachable(id WindowID, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.unreachable == nil {
+		f.unreachable = map[WindowID]bool{}
+	}
+	f.unreachable[id] = on
 }
 
 func (f *fakeDeliverer) snapshot() []deliverCall {
@@ -583,13 +596,13 @@ type blockingDeliverer struct {
 
 func (b *blockingDeliverer) MovesFocus() bool { return false }
 func (b *blockingDeliverer) Close() error     { return nil }
-func (b *blockingDeliverer) Deliver(_ context.Context, req Delivery) (int, error) {
+func (b *blockingDeliverer) Deliver(_ context.Context, req Delivery) ([]WindowID, error) {
 	select {
 	case b.entered <- struct{}{}:
 	default:
 	}
 	<-b.release
-	return len(req.Targets), nil
+	return req.Targets, nil
 }
 
 // --- held keys (REFERENCE.md: stuck keys) ------------------------------------
