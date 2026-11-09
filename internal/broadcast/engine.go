@@ -859,6 +859,20 @@ func (e *Engine) noteDelivered(ev keys.Event, targets []WindowID) {
 	}
 }
 
+// Forget drops what held records for windows that no longer exist. An Up
+// that never reached a window keeps the key in held so the next release tries
+// again (noteDelivered); for a window that is gone for good that retry came
+// on every later Up of the code, forever (Kamino 278). Only the caller knows a
+// window is gone rather than untargeted: an untargeted window that still
+// exists keeps its entry, since its key really is still down.
+func (e *Engine) Forget(gone []WindowID) {
+	e.heldMu.Lock()
+	defer e.heldMu.Unlock()
+	for _, id := range gone {
+		delete(e.held, id)
+	}
+}
+
 // heldTargets lists the targets holding one code down.
 func (e *Engine) heldTargets(c keys.Code) []WindowID {
 	e.heldMu.Lock()

@@ -153,8 +153,11 @@ type Model struct {
 
 	windows  []broadcast.Window
 	selected map[broadcast.WindowID]bool
-	cursor   int
-	pane     pane
+	// listed is the window list pushTargets last saw, so the next one can
+	// tell which windows are gone (Kamino 278).
+	listed map[broadcast.WindowID]bool
+	cursor int
+	pane   pane
 
 	// master is the focused window as of the last poll — the window that is
 	// currently playing the keys live and is skipped by delivery.
@@ -603,7 +606,11 @@ func (m *Model) toggleAllTargets() {
 }
 
 // pushTargets sends the checked windows, in list order, to the engine. Windows
-// that vanished since the last refresh are dropped from the selection.
+// that vanished since the last refresh are dropped from the selection, and
+// the engine forgets the keys it still had down in them: an Up that missed a
+// window that then closed was otherwise retried on every later Up of that key
+// (Kamino 278). Whether ticked or not: the window may have been unticked while
+// a key was down and the release not got through.
 func (m *Model) pushTargets() {
 	ids := make([]broadcast.WindowID, 0, len(m.selected))
 	present := map[broadcast.WindowID]bool{}
@@ -619,6 +626,16 @@ func (m *Model) pushTargets() {
 		}
 	}
 	m.engine.SetTargets(ids)
+	var gone []broadcast.WindowID
+	for id := range m.listed {
+		if !present[id] {
+			gone = append(gone, id)
+		}
+	}
+	if len(gone) > 0 {
+		m.engine.Forget(gone)
+	}
+	m.listed = present
 }
 
 func (m *Model) appendLog(text string, isErr bool) {

@@ -96,7 +96,7 @@ type device interface {
 }
 
 type dupKey struct {
-	code  ev.EvCode
+	code  keys.Code
 	state keys.State
 }
 
@@ -408,7 +408,7 @@ func (s *Source) start() error {
 // the compositor (Kamino 186).
 func (s *Source) read(c captured) {
 	defer s.wg.Done()
-	down := map[ev.EvCode]bool{} // what this device has pressed and not released
+	down := map[keys.Code]bool{} // what this device has pressed and not released
 	buf := make([]byte, inputEventSize*64)
 	fds := []unix.PollFd{
 		{Fd: int32(c.fd), Events: unix.POLLIN},
@@ -450,7 +450,7 @@ func (s *Source) read(c captured) {
 				continue
 			}
 			e := keys.Event{
-				Code:  ev.EvCode(binary.LittleEndian.Uint16(buf[off+18:])),
+				Code:  keys.Code(binary.LittleEndian.Uint16(buf[off+18:])),
 				State: keys.State(int32(binary.LittleEndian.Uint32(buf[off+20:]))),
 			}
 			if s.duplicate(c.fd, dupKey{code: e.Code, state: e.State}) {
@@ -473,7 +473,7 @@ func (s *Source) read(c captured) {
 // Bluetooth keyboard gone to sleep. Its held keys are released, since their
 // releases will never come, and the loss is reported: silence looked exactly
 // like clonecast ignoring the keyboard (Kamino 202).
-func (s *Source) gone(c captured, down map[ev.EvCode]bool, err error) {
+func (s *Source) gone(c captured, down map[keys.Code]bool, err error) {
 	for code := range down {
 		if !s.send(keys.Event{Code: code, State: keys.Up}) {
 			break
@@ -645,7 +645,7 @@ func keyboardKey(c ev.EvCode) bool {
 // Emit writes the key transition followed by the SYN_REPORT that tells the
 // kernel the event is complete.
 func (i *Injector) Emit(e keys.Event) error {
-	if err := i.dev.WriteOne(&ev.InputEvent{Type: ev.EV_KEY, Code: e.Code, Value: int32(e.State)}); err != nil {
+	if err := i.dev.WriteOne(&ev.InputEvent{Type: ev.EV_KEY, Code: ev.EvCode(e.Code), Value: int32(e.State)}); err != nil {
 		return err
 	}
 	return i.dev.WriteOne(&ev.InputEvent{Type: ev.EV_SYN, Code: ev.SYN_REPORT, Value: 0})

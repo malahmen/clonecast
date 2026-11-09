@@ -18,39 +18,6 @@ import (
 	"github.com/malahmen/clonecast/internal/platform/mock"
 )
 
-// fakeAgents is a registry stand-in: one agent, covering the window whose id
-// is in paired. cmd/clonecast passes the real *agent.Registry.
-type fakeAgents struct {
-	mu     sync.Mutex
-	addr   string
-	paired map[broadcast.WindowID]bool
-}
-
-func (f *fakeAgents) Addr() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.addr
-}
-
-func (f *fakeAgents) Count() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.paired)
-}
-
-func (f *fakeAgents) Paired(id broadcast.WindowID) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.paired[id]
-}
-
-func (f *fakeAgents) Listen(addr string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.addr = addr
-	return nil
-}
-
 // terminal is the TUI running on a real pseudo-terminal: Bubble Tea renders as
 // it would for a user (it checks for a TTY), and the test types into it.
 type terminal struct {

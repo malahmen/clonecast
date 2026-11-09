@@ -448,3 +448,48 @@ func TestADownInFlightIsReleasedWhenBroadcastGoesOff(t *testing.T) {
 		t.Fatalf("Ups to %v, want one, to g2", u)
 	}
 }
+
+// Kamino 278: an Up that never reached a window keeps its key in held, so a
+// window gone for good was retried on every later Up of that code. Forget
+// drops it; a window that was only untargeted, and still exists, keeps its
+// entry and is still released.
+func TestAForgottenWindowIsNotRetried(t *testing.T) {
+	rec := &recorder{active: "g1"}
+	e, src, d, a := focusFreeEngine(rec, "g1", "g2", "g3", "g4")
+
+	before := 0
+	runLive(t, e, src, func(send func(keys.Event)) {
+		send(keys.Event{Code: a, State: keys.Down})
+		// g3 closes and g4 is unticked, both before the release reaches them.
+		d.setUnreachable("g3", true)
+		d.setUnreachable("g4", true)
+		e.SetTargets([]WindowID{"g1", "g2"})
+		time.Sleep(40 * time.Millisecond)
+		if got := e.heldTargets(a); !sameSet(got, []WindowID{"g2", "g3", "g4"}) {
+			t.Errorf("A held on %v, want [g2 g3 g4]", got)
+		}
+		e.Forget([]WindowID{"g3"})
+		d.setUnreachable("g4", false)
+		before = len(ups(d))
+		send(keys.Event{Code: a, State: keys.Up})
+	})
+	var sent []deliverCall
+	for _, c := range d.snapshot() {
+		if c.ev.State == keys.Up {
+			sent = append(sent, c)
+		}
+	}
+	if len(sent) != before+1 {
+		t.Fatalf("%d Up(s) after the user's, want exactly one", len(sent)-before)
+	}
+	last := sent[before]
+	if contains(last.targets, "g3") {
+		t.Errorf("the Up was sent to %v: g3 is gone and must not be retried", last.targets)
+	}
+	if !contains(last.targets, "g4") {
+		t.Errorf("the Up was sent to %v: g4 still exists and still holds A", last.targets)
+	}
+	if got := e.heldTargets(a); len(got) != 0 {
+		t.Fatalf("A still held on %v", got)
+	}
+}

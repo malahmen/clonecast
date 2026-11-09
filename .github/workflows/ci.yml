@@ -32,6 +32,13 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: go vet for windows
+        # Every package not tagged linux must also vet for Windows, the agent's
+        # platform. internal/keys used to alias go-evdev's codes, which do not
+        # build there, so vet failed in every package importing keys (Kamino 278).
+        # Linux-only packages are left out by their build tags, not by a list.
+        run: GOOS=windows GOARCH=386 go vet ./...
+
       - name: go test -race
         # -race because three of the defects this suite was written for were
         # data races or orderings, not wrong values.
