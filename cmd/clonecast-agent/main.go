@@ -344,86 +344,53 @@ func describe(h uintptr) agentwin.Candidate {
 	return c
 }
 
-// resolver caches the game window's HWND but re-resolves it when it goes
-// stale. WoW recreates its top-level window across state changes (login ->
-// char-select -> world, loading screens), so a once-cached HWND becomes a dead
-// handle and PostMessage silently goes nowhere. Validity is checked cheaply
-// (IsWindow + the title still matches) on every send; only when that fails is
-// the full GetWindow tree-walk re-run, and while it finds nothing, at most
-// every searchEvery. A valid window is also compared with the others every
-// recheckEvery, because valid only says it is alive: a launcher found before
-// the game's window existed stayed valid, and kept every key (Kamino 202).
+// resolver caches the game window's HWND. Which window, and when to look
+// again, is agentwin.Tracker's call (tested there): the cached window is
+// checked cheaply on every key, the tree re-walked only when it goes stale,
+// at most every searchEvery while that finds nothing, and a valid
+// prefix-wide choice compared with the others every recheckEvery, because
+// valid only says it is alive: a launcher found before the game's window
+// existed stayed valid, and kept every key (Kamino 202). With -title set and
+// no window of that title, the prefix-wide fallback is kept the same way and
+// the title looked for on the recheck, not on every key (Kamino 278).
 type resolver struct {
-	title   string
-	mu      sync.Mutex
-	hwnd    uintptr
-	pace    lookup.Pacer
-	recheck agentwin.Recheck
+	mu sync.Mutex
+	t  agentwin.Tracker
 }
 
-func (r *resolver) valid(h uintptr) bool {
-	if h == 0 {
-		return false
-	}
-	if ok, _, _ := procIsWindow.Call(h); ok == 0 {
-		return false
-	}
-	if r.title == "" {
-		// Addressing by prefix: any live, visible window of a usable size is
-		// still the one we found. Re-walking on every key would be wasteful,
-		// and WoW keeps one top-level window per state.
-		visible, _, _ := procIsWindowVisible.Call(h)
-		return visible != 0
-	}
-	return getWindowText(h) == r.title
+// win32 is agentwin.Windows over the Win32 calls.
+type win32 struct{}
+
+func (win32) Alive(h uintptr) bool {
+	ok, _, _ := procIsWindow.Call(h)
+	return ok != 0
 }
+
+func (win32) Visible(h uintptr) bool {
+	v, _, _ := procIsWindowVisible.Call(h)
+	return v != 0
+}
+
+func (win32) Title(h uintptr) string       { return getWindowText(h) }
+func (win32) ByTitle(title string) uintptr { return findByTitle(title) }
+func (win32) Game(current uintptr) uintptr { return findGameWindow(current) }
 
 // current returns a live HWND for the target window, re-walking if the cached
 // one is stale. Returns 0 if the window can't be found right now.
 func (r *resolver) current() uintptr {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	now := time.Now()
-	if r.valid(r.hwnd) {
-		// An explicit -title names the window; only the prefix-wide choice
-		// can have picked the wrong one.
-		if r.title == "" && r.recheck.Due(now) {
-			if h := findGameWindow(r.hwnd); h != 0 && h != r.hwnd {
-				logf("a better game window appeared (hwnd=0x%x, was 0x%x); delivering there", h, r.hwnd)
-				r.hwnd = h
-			}
-		}
-		return r.hwnd
+	res := r.t.Current(time.Now(), win32{})
+	if res.Replaced != 0 {
+		logf("a better game window appeared (hwnd=0x%x, was 0x%x); delivering there", res.HWND, res.Replaced)
 	}
-	if !r.pace.Due(now) {
-		r.hwnd = 0
-		return 0
+	if res.Searched && res.HWND != 0 {
+		if res.Dropped > 0 {
+			logf("game window found (hwnd=0x%x); %d key(s) were dropped while it was missing", res.HWND, res.Dropped)
+		}
+		systemOnce.Do(exitWithThePrefix)
 	}
-	defer func() {
-		if r.hwnd == 0 {
-			r.pace.Missed(now)
-		} else if n := r.pace.Found(); n > 0 {
-			logf("game window found (hwnd=0x%x); %d key(s) were dropped while it was missing", r.hwnd, n)
-		}
-	}()
-	defer func() {
-		if r.hwnd != 0 {
-			systemOnce.Do(exitWithThePrefix)
-		}
-	}()
-	r.recheck.Done(now)
-	if r.title == "" {
-		r.hwnd = findGameWindow(0)
-	} else {
-		// An explicit title still wins, for a prefix with more than one
-		// window where the operator knows which. Falling back to the
-		// prefix-wide search means a wrong or stale title degrades to
-		// "deliver to this prefix's game" instead of to nothing at all.
-		if r.hwnd = findByTitle(r.title); r.hwnd == 0 {
-			r.hwnd = findGameWindow(0)
-		}
-	}
-	return r.hwnd
+	return res.HWND
 }
 
 // dropped counts a key that had no window to go to, and reports whether it is
@@ -431,7 +398,7 @@ func (r *resolver) current() uintptr {
 func (r *resolver) dropped() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.pace.Drop()
+	return r.t.Pace.Drop()
 }
 
 // unmapped remembers the codes already reported as unmapped, so a key the
@@ -809,7 +776,14 @@ func main() {
 	// clonecast reported "no agent" for a prefix running a perfectly good one.
 	// resolver.current() already re-walks on demand and returns 0 while there
 	// is nothing to find, so starting from 0 is exactly what it expects.
-	res := &resolver{title: *title, pace: lookup.Pacer{Every: searchEvery}}
+	//
+	// Recheck.Every was never set before Kamino 278, so the "every 5 s"
+	// recheck ran on every key: a full tree walk per key in prefix mode too.
+	res := &resolver{t: agentwin.Tracker{
+		Title:   *title,
+		Pace:    lookup.Pacer{Every: searchEvery},
+		Recheck: agentwin.Recheck{Every: recheckEvery},
+	}}
 	// Look for the game window with or without clonecast, so the agent
 	// becomes a system process (exitWithThePrefix) and never keeps the prefix
 	// up after the game, even when clonecast never ran.

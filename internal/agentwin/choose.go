@@ -12,7 +12,11 @@
 // and an owned window (a dialog, a popup) loses to any unowned one.
 package agentwin
 
-import "time"
+import (
+	"time"
+
+	"github.com/malahmen/clonecast/internal/lookup"
+)
 
 // MinSide keeps out the IME and helper popups Wine creates, the same floor the
 // launcher's own window search uses.
@@ -106,3 +110,115 @@ func (r *Recheck) Due(now time.Time) bool {
 // Done records a full walk made for another reason (the window was gone), so
 // the next recheck is an interval after it.
 func (r *Recheck) Done(now time.Time) { r.last = now }
+
+// Windows is what a Tracker asks of the window system. The agent implements
+// it with Win32 calls; the tests with a fake.
+type Windows interface {
+	// Alive reports whether h is still a window (IsWindow).
+	Alive(h uintptr) bool
+	// Visible reports whether h is visible.
+	Visible(h uintptr) bool
+	// Title is h's caption.
+	Title(h uintptr) string
+	// ByTitle walks the window tree for a window with this caption, or 0.
+	ByTitle(title string) uintptr
+	// Game walks the window tree for the prefix's game window (Choose), with
+	// current the window in use, or 0.
+	Game(current uintptr) uintptr
+}
+
+// Tracker keeps the window the agent delivers to. It caches it and checks
+// it cheaply on every key; the tree is walked only when it goes stale (at
+// most every Pace.Every while nothing is found) and, while it is valid, every
+// Recheck.Every. WoW recreates its top-level window across state changes
+// (login, character select, world, loading screens), so a cached handle
+// does go stale. Not safe for concurrent use; the agent's resolver holds its
+// own lock around it.
+type Tracker struct {
+	// Title, when set, names the window to deliver to. When no window has it
+	// the prefix-wide choice (Windows.Game) is used instead, so a wrong or
+	// stale title degrades to "this prefix's game" and not to nothing.
+	Title   string
+	Pace    lookup.Pacer
+	Recheck Recheck
+
+	hwnd uintptr
+	// fallback is a window found by the prefix-wide search although Title is
+	// set. It is checked as a prefix-wide window is (alive and visible), not
+	// against Title: it never had the title, so that check failed on every
+	// key and walked the whole tree for every key (Kamino 278). Title is
+	// looked for again on the recheck instead.
+	fallback bool
+}
+
+// Result is what Current did, for the agent's log lines.
+type Result struct {
+	// HWND is the window to deliver to, or 0 when there is none.
+	HWND uintptr
+	// Replaced is the window a recheck moved away from, or 0.
+	Replaced uintptr
+	// Searched is set when the cached window was stale and the tree walked.
+	Searched bool
+	// Dropped is, when a search found a window after some found nothing, how
+	// many keys were dropped in between.
+	Dropped int
+}
+
+// prefixWide reports whether the window in use was chosen by the prefix-wide
+// search: always without a title, and for the fallback with one.
+func (t *Tracker) prefixWide() bool { return t.Title == "" || t.fallback }
+
+func (t *Tracker) valid(w Windows) bool {
+	if t.hwnd == 0 || !w.Alive(t.hwnd) {
+		return false
+	}
+	if t.prefixWide() {
+		// Any live, visible window is still the one we found: WoW keeps one
+		// top-level window per state, and the recheck finds a better one.
+		return w.Visible(t.hwnd)
+	}
+	return w.Title(t.hwnd) == t.Title
+}
+
+// Current returns the window to deliver to at now.
+func (t *Tracker) Current(now time.Time, w Windows) Result {
+	if t.valid(w) {
+		res := Result{HWND: t.hwnd}
+		// An explicit -title names the window; only the prefix-wide choice
+		// can have picked the wrong one.
+		if t.prefixWide() && t.Recheck.Due(now) {
+			h := uintptr(0)
+			if t.fallback {
+				if h = w.ByTitle(t.Title); h != 0 {
+					t.fallback = false
+				}
+			}
+			if h == 0 {
+				h = w.Game(t.hwnd)
+			}
+			if h != 0 && h != t.hwnd {
+				res.Replaced, res.HWND, t.hwnd = t.hwnd, h, h
+			}
+		}
+		return res
+	}
+	t.fallback = false
+	if !t.Pace.Due(now) {
+		t.hwnd = 0
+		return Result{}
+	}
+	t.Recheck.Done(now)
+	if t.Title == "" {
+		t.hwnd = w.Game(0)
+	} else if t.hwnd = w.ByTitle(t.Title); t.hwnd == 0 {
+		t.hwnd = w.Game(0)
+		t.fallback = t.hwnd != 0
+	}
+	res := Result{HWND: t.hwnd, Searched: true}
+	if t.hwnd == 0 {
+		t.Pace.Missed(now)
+	} else {
+		res.Dropped = t.Pace.Found()
+	}
+	return res
+}
