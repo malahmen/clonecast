@@ -3,6 +3,7 @@ package prefix
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -28,6 +29,22 @@ func runnerWith(t *testing.T, names ...string) string {
 func serverPath(dir string) string {
 	// The form Bottles actually launches, so the cleaning is exercised.
 	return filepath.Join(dir, "runner", "lib", "wine", "..", "..", "bin", "wineserver")
+}
+
+// sandboxed makes pid look like a process in the Flatpak app named app, as
+// flatpakApp reads it.
+func sandboxed(t *testing.T, pid int, app string) {
+	t.Helper()
+	procRoot = t.TempDir()
+	t.Cleanup(func() { procRoot = "/proc" })
+	root := filepath.Join(procRoot, strconv.Itoa(pid), "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info := "[Application]\nname=" + app + "\nruntime=runtime/org.gnome.Platform\n\n[Instance]\ninstance-id=1\n"
+	if err := os.WriteFile(filepath.Join(root, ".flatpak-info"), []byte(info), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestWineCmdFromProcesses(t *testing.T) {
@@ -71,19 +88,24 @@ func TestWineCmdFromProcesses(t *testing.T) {
 	// prefix instead of reaching the game's.
 	t.Run("a sandboxed wineserver gets its wine through flatpak", func(t *testing.T) {
 		dir := runnerWith(t, "wine", "wineserver")
-		procRoot = t.TempDir()
-		t.Cleanup(func() { procRoot = "/proc" })
-		root := filepath.Join(procRoot, "4242", "root")
-		if err := os.MkdirAll(root, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		info := "[Application]\nname=com.usebottles.bottles\nruntime=runtime/org.gnome.Platform\n\n[Instance]\ninstance-id=1\n"
-		if err := os.WriteFile(filepath.Join(root, ".flatpak-info"), []byte(info), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		sandboxed(t, 4242, "com.usebottles.bottles")
 		p := Proc{Prefix: "/bottles/dp-Marx", Processes: []Running{{PID: 4242, Command: serverPath(dir)}}}
 		want := "flatpak run --command='" + filepath.Join(dir, "runner", "bin", "wine") +
-			"' --env=WINEPREFIX='/bottles/dp-Marx' com.usebottles.bottles"
+			"' --env=WINEPREFIX='/bottles/dp-Marx' 'com.usebottles.bottles'"
+		if got := WineCmdFromProcesses(p); got != want {
+			t.Fatalf("WineCmdFromProcesses =\n %q\nwant\n %q", got, want)
+		}
+	})
+
+	// Kamino 139: the app name comes from a file inside the sandbox, which the
+	// sandboxed process can write, and the command runs under sh -c. Quoted,
+	// it is one word whatever it holds.
+	t.Run("the flatpak app name is quoted for the shell", func(t *testing.T) {
+		dir := runnerWith(t, "wine", "wineserver")
+		sandboxed(t, 4243, "x'; touch pwned #")
+		p := Proc{Prefix: "/bottles/dp-Marx", Processes: []Running{{PID: 4243, Command: serverPath(dir)}}}
+		want := "flatpak run --command='" + filepath.Join(dir, "runner", "bin", "wine") +
+			"' --env=WINEPREFIX='/bottles/dp-Marx' 'x'\\''; touch pwned #'"
 		if got := WineCmdFromProcesses(p); got != want {
 			t.Fatalf("WineCmdFromProcesses =\n %q\nwant\n %q", got, want)
 		}
