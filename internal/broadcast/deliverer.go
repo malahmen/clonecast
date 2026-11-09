@@ -54,13 +54,18 @@ type Deliverer interface {
 	// REFERENCE.md 7.6) rather than having every backend re-query it, and
 	// never calls Deliver at all when it could not be resolved.
 	//
-	// Per-target failures are reported through req.Notify; the returned count
-	// is how many targets actually received the event. A returned error is a
-	// whole-delivery failure, not a per-target one.
+	// Per-target failures are reported through req.Notify; the returned slice
+	// is the targets the event actually reached, in req.Targets order, the
+	// origin never among them. The engine's held-key record is built from it
+	// (Kamino 136): a Down that reached a window is held there, and an Up
+	// releases only the windows it reached, so an Up lost to a window with no
+	// agent or a full queue is tried again instead of being forgotten. It used
+	// to be a count, which made the engine record every target as reached. A
+	// returned error is a whole-delivery failure, not a per-target one.
 	//
 	// Implementations must be safe for concurrent use only to the extent the
-	// engine needs: it calls Deliver from a single worker goroutine.
-	Deliver(ctx context.Context, req Delivery) (int, error)
+	// engine needs: it calls Deliver from a single goroutine at a time.
+	Deliver(ctx context.Context, req Delivery) ([]WindowID, error)
 
 	// MovesFocus reports whether Deliver moves real OS input focus. When true
 	// the engine runs Deliver under its focus lock, blocking passthrough for
@@ -87,10 +92,10 @@ const NoDelivererNotice = "no delivery backend selected: broadcast keys go nowhe
 func (d *noDeliverer) MovesFocus() bool { return false }
 func (d *noDeliverer) Close() error     { return nil }
 
-func (d *noDeliverer) Deliver(_ context.Context, req Delivery) (int, error) {
+func (d *noDeliverer) Deliver(_ context.Context, req Delivery) ([]WindowID, error) {
 	if !d.warned {
 		d.warned = true
 		req.Notify(NoDelivererNotice, true)
 	}
-	return 0, nil
+	return nil, nil
 }

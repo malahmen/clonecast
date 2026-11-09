@@ -57,9 +57,13 @@ func (d *Deliverer) Close() error { return nil }
 // what makes the master dynamic (REFERENCE.md 7.10): the focused window has
 // already had the key replayed into it by passthrough, and posting it again
 // here would make that client see every broadcast key twice.
-func (d *Deliverer) Deliver(_ context.Context, req broadcast.Delivery) (int, error) {
+//
+// A target counts as reached once its frame is queued for its agent's writer;
+// one with no agent, or whose queue is full, is not, so the engine keeps an Up
+// for it held and tries again (Kamino 136).
+func (d *Deliverer) Deliver(_ context.Context, req broadcast.Delivery) ([]broadcast.WindowID, error) {
 	frame := agentwire.Frame{Code: uint16(req.Event.Code), Down: req.Event.State != keys.Up}
-	delivered := 0
+	var delivered []broadcast.WindowID
 	for _, t := range req.Targets {
 		if t == req.Origin {
 			continue // the master: passthrough already delivered the key there
@@ -82,7 +86,7 @@ func (d *Deliverer) Deliver(_ context.Context, req broadcast.Delivery) (int, err
 			req.Notify(fmt.Sprintf("agent %s: not reading, %d keys waiting (dropped; it will re-register)", a.Label(), queueLen), true)
 			continue
 		}
-		delivered++
+		delivered = append(delivered, t)
 	}
 	return delivered, nil
 }

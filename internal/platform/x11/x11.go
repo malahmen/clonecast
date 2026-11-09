@@ -202,9 +202,9 @@ func (d *deliverer) resolve(id broadcast.WindowID) (xproto.Window, bool) {
 // Deliver XSendEvents ev to every ticked target except origin — the focused
 // window already received it through passthrough (REFERENCE.md 7.10). An
 // empty origin matches no target, so every target is served.
-func (d *deliverer) Deliver(_ context.Context, req broadcast.Delivery) (int, error) {
+func (d *deliverer) Deliver(_ context.Context, req broadcast.Delivery) ([]broadcast.WindowID, error) {
 	down := req.Event.State != keys.Up
-	delivered := 0
+	var delivered []broadcast.WindowID
 	for _, t := range req.Targets {
 		if t == req.Origin {
 			continue // the master: passthrough already delivered the key there
@@ -215,14 +215,16 @@ func (d *deliverer) Deliver(_ context.Context, req broadcast.Delivery) (int, err
 			continue
 		}
 		if err := d.s.SendKey(w, req.Event.Code, down, 0); err != nil {
-			req.Notify("xsend "+req.Event.String()+" to "+string(t)+": "+err.Error(), true)
+			// "a key", never which: notices reach the log file, and REFERENCE.md
+			// 8 promises no record of what was typed (Kamino 202).
+			req.Notify("xsend a key to "+string(t)+": "+err.Error(), true)
 			// a stale cached window (game closed) — drop it so the next try re-resolves
 			d.mu.Lock()
 			delete(d.cache, t)
 			d.mu.Unlock()
 			continue
 		}
-		delivered++
+		delivered = append(delivered, t)
 	}
 	return delivered, nil
 }

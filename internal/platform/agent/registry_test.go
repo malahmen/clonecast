@@ -171,7 +171,7 @@ func TestRegistryPairsByPrefixAndDeliversFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := d.Deliver(context.Background(), broadcast.Delivery{
+	reached, err := d.Deliver(context.Background(), broadcast.Delivery{
 		Event:   keys.Event{Code: space, State: keys.Down},
 		Targets: []broadcast.WindowID{"w1", "w2", "w3"},
 		Origin:  "w2",
@@ -180,8 +180,8 @@ func TestRegistryPairsByPrefixAndDeliversFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("delivered to %d targets, want 1 (w3 only: w2 is the master, w1 has no agent)", n)
+	if len(reached) != 1 || reached[0] != "w3" {
+		t.Fatalf("reached %v, want [w3] (w2 is the master, w1 has no agent)", reached)
 	}
 	if len(notices) != 1 || !strings.Contains(notices[0], "no agent has registered") {
 		t.Fatalf("want one actionable notice about the agent-less target, got %q", notices)
@@ -588,4 +588,31 @@ func TestRegistryListensOnLoopbackOnly(t *testing.T) {
 			t.Errorf("%s refused: %v", addr, err)
 		}
 	}
+}
+
+// Kamino 202: the engine releases held keys at quit just before the registry
+// closes. Close used to close every socket at once, under the writers, and
+// those Ups were lost. The writer is held off (its send lock taken) so the
+// frame is certainly still queued when Close starts.
+func TestCloseSendsWhatIsQueued(t *testing.T) {
+	wins := []broadcast.Window{{ID: "w1", Title: "Game"}}
+	reg, _ := startRegistry(t, wins, t.TempDir())
+	c := dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game"})
+	waitFor(t, "the agent", func() bool { return reg.Paired("w1") })
+	a := reg.agentFor("w1")
+
+	a.mu.Lock()
+	if !a.enqueue(agentwire.Frame{Code: 17, Down: false}) {
+		a.mu.Unlock()
+		t.Fatal("enqueue refused")
+	}
+	closed := make(chan struct{})
+	go func() { _ = reg.Close(); close(closed) }()
+	time.Sleep(50 * time.Millisecond)
+	a.mu.Unlock()
+
+	if got := c.nextFrame(); got != (agentwire.Frame{Code: 17, Down: false}) {
+		t.Fatalf("agent got %+v, want the queued W up", got)
+	}
+	<-closed
 }
