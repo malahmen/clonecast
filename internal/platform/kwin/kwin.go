@@ -69,6 +69,18 @@ type WM struct {
 
 	// watch is what the persistent script last pushed; see watch.go.
 	watch watcher
+
+	// object returns KWin's object at path; nil means w.conn's. Tests set it
+	// to a fake KWin that answers late or never.
+	object func(path dbus.ObjectPath) dbus.BusObject
+}
+
+// kwinObject is KWin's D-Bus object at path.
+func (w *WM) kwinObject(path dbus.ObjectPath) dbus.BusObject {
+	if w.object != nil {
+		return w.object(path)
+	}
+	return w.conn.Object(kwinService, path)
 }
 
 // kwinReply is one script's answer, with the call it answers.
@@ -238,7 +250,7 @@ func (w *WM) Active(ctx context.Context) (broadcast.WindowID, error) {
 		}
 		return pickActive(st, focusPID, xPIDs), nil
 	}
-	w.rewatch()
+	w.rewatch(ctx)
 	if xfocus == nil {
 		out, err := w.run(ctx, `
 			const a = workspace.activeWindow;
@@ -365,8 +377,8 @@ func (w *WM) activateViaKWin(ctx context.Context, id broadcast.WindowID) error {
 // windowactivate goes through the window manager instead of around it, on
 // the theory that only the WM can actually move that compositor-level
 // routing. Verified against realActiveTitle (_NET_ACTIVE_WINDOW), the exact
-// property windowactivate sets — not realFocusedTitle, which is the wrong
-// signal per the above.
+// property windowactivate sets — not the X input focus (`xdotool
+// getwindowfocus`), which is the wrong signal per the above.
 func activateViaXdotool(ctx context.Context, xid, wantCaption string) error {
 	const maxAttempts = 5
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -381,24 +393,11 @@ func activateViaXdotool(ctx context.Context, xid, wantCaption string) error {
 		xid, wantCaption, maxAttempts)
 }
 
-// realFocusedTitle shells out to `xdotool getwindowfocus getwindowname` —
-// the real XSetInputFocus target, not the window-manager-level
-// _NET_ACTIVE_WINDOW hint getactivewindow reads (see REFERENCE.md 4.11 for
-// why that distinction turned out to matter). Empty on any failure (no
-// window focused, no xdotool, etc.).
-func realFocusedTitle() string {
-	out, err := exec.Command("xdotool", "getwindowfocus", "getwindowname").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 // realActiveTitle shells out to `xdotool getactivewindow getwindowname` —
-// the window-manager-level _NET_ACTIVE_WINDOW hint. Kept separate from
-// realFocusedTitle (see REFERENCE.md 4.11): the two can disagree, and
-// verifying activateViaXdotool needs the real focus target specifically,
-// not this hint.
+// the window-manager-level _NET_ACTIVE_WINDOW hint, which windowactivate
+// sets. The X input focus (`getwindowfocus`) can disagree with it (REFERENCE.md
+// 4.11); its helper, realFocusedTitle, had no caller left and was removed
+// (Kamino 139). Empty on any failure (nothing active, no xdotool, etc.).
 func realActiveTitle() string {
 	out, err := exec.Command("xdotool", "getactivewindow", "getwindowname").Output()
 	if err != nil {
@@ -504,18 +503,28 @@ func (w *WM) run(ctx context.Context, body string) (string, error) {
 		}
 	}
 
-	scripting := w.conn.Object(kwinService, scriptingPath)
+	scripting := w.kwinObject(scriptingPath)
 	var id int32
 	if err := scripting.CallWithContext(ctx, scriptingIfce+".loadScript", 0, path, plugin).Store(&id); err != nil {
 		return "", fmt.Errorf("kwin loadScript: %w", err)
 	}
-	defer scripting.Call(scriptingIfce+".unloadScript", 0, plugin)
+	// The unload runs on its own, with its own deadline: by now ctx may be
+	// spent, and waiting on it would stall the caller (the engine goroutine,
+	// for Active) for the D-Bus timeout when KWin is not answering (Kamino
+	// 139). The plugin name is never reused, so nothing waits for it.
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.Background(), kwinCallTimeout)
+		go func() {
+			defer cancel()
+			scripting.CallWithContext(uctx, scriptingIfce+".unloadScript", 0, plugin)
+		}()
+	}()
 	if id < 0 {
 		return "", fmt.Errorf("kwin refused script (id %d)", id)
 	}
 
 	// Plasma 6 exposes the loaded script at /Scripting/Script<id>.
-	scriptObj := w.conn.Object(kwinService, dbus.ObjectPath(fmt.Sprintf("%s/Script%d", scriptingPath, id)))
+	scriptObj := w.kwinObject(dbus.ObjectPath(fmt.Sprintf("%s/Script%d", scriptingPath, id)))
 	if err := scriptObj.CallWithContext(ctx, scriptIfce+".run", 0).Err; err != nil {
 		return "", fmt.Errorf("kwin run: %w", err)
 	}

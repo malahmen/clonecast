@@ -39,6 +39,9 @@ type backends struct {
 	wm        broadcast.WindowManager
 	agents    *agent.Registry
 	xsendSpec string
+	// setupXsend builds the xsend backend: the package's setupXsend, or a
+	// fake in tests.
+	setupXsend func(broadcast.WindowManager, string) (broadcast.Deliverer, func(), error)
 
 	mu    sync.Mutex
 	cur   string
@@ -48,12 +51,13 @@ type backends struct {
 
 func newBackends(engine *broadcast.Engine, wm broadcast.WindowManager, agents *agent.Registry, xsendSpec string) *backends {
 	return &backends{
-		engine:    engine,
-		wm:        wm,
-		agents:    agents,
-		xsendSpec: xsendSpec,
-		made:      map[string]broadcast.Deliverer{},
-		close:     map[string]func(){},
+		engine:     engine,
+		wm:         wm,
+		agents:     agents,
+		xsendSpec:  xsendSpec,
+		setupXsend: setupXsend,
+		made:       map[string]broadcast.Deliverer{},
+		close:      map[string]func(){},
 	}
 }
 
@@ -126,7 +130,7 @@ func (b *backends) use(name string) error {
 		case deliverAgent:
 			d, cl, err = b.newAgent()
 		case deliverXsend:
-			d, cl, err = setupXsend(b.wm, b.xsendSpec)
+			d, cl, err = b.setupXsend(b.wm, b.xsendSpec)
 		default:
 			err = fmt.Errorf("unknown delivery backend %q (want %s or %s)", name, deliverAgent, deliverXsend)
 		}
@@ -147,27 +151,39 @@ func (b *backends) XsendSpec() string {
 	return b.xsendSpec
 }
 
-// SetXsendSpec changes the xsend title map from the TUI. An xsend backend
-// already built is dropped so the next use builds it with the new map, and
-// rebuilt at once if it is the one delivering.
+// SetXsendSpec changes the xsend title map from the TUI. An idle xsend backend
+// is dropped so the next use builds it with the new map. The one delivering
+// is replaced: the new one is built and swapped in, and only then is the old
+// one closed, so the engine never holds a closed deliverer; if the build
+// fails, the old one and its map stay in use (Kamino 139).
 func (b *backends) SetXsendSpec(spec string) error {
 	if _, err := parseTitleMap(spec); err != nil {
 		return fmt.Errorf("xsend map: %w", err)
 	}
 	b.mu.Lock()
-	b.xsendSpec = spec
-	if cl, ok := b.close[deliverXsend]; ok {
-		cl()
+	oldClose, built := b.close[deliverXsend]
+	if b.cur != deliverXsend {
+		b.xsendSpec = spec
 		delete(b.close, deliverXsend)
 		delete(b.made, deliverXsend)
+		b.mu.Unlock()
+		if built {
+			oldClose()
+		}
+		return nil
 	}
-	inUse := b.cur == deliverXsend
-	if inUse {
-		b.cur = ""
+	d, cl, err := b.setupXsend(b.wm, spec)
+	if err != nil {
+		old := b.xsendSpec
+		b.mu.Unlock()
+		return fmt.Errorf("xsend map: %w (still using %q)", err, old)
 	}
+	b.xsendSpec = spec
+	b.made[deliverXsend], b.close[deliverXsend] = d, cl
+	b.engine.SetDeliverer(d)
 	b.mu.Unlock()
-	if inUse {
-		return b.use(deliverXsend)
+	if built {
+		oldClose()
 	}
 	return nil
 }

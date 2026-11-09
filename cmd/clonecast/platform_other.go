@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"os"
+	"time"
 
 	"github.com/malahmen/clonecast/internal/broadcast"
 )
@@ -31,7 +32,9 @@ func listCandidates() ([]candidate, error) {
 }
 
 // keypressTimeout and waitForKeyPress: the keypress picker is evdev, Linux only.
-const keypressTimeout = 0
+// keypressTimeout is a Duration here too: askByKeypress prints it with %s, and
+// a bare 0 made vet fail off Linux (Kamino 139).
+const keypressTimeout time.Duration = 0
 
 func waitForKeyPress(_ []candidate) (int, error) {
 	return -1, errors.New("picking a keyboard by keypress is only available on Linux")

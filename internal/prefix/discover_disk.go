@@ -193,8 +193,11 @@ func WineCmdFromProcesses(p Proc) string {
 			// is. It booted a second wineserver for the same prefix, whose
 			// registry writes the game's then overwrote on exit, and which
 			// outlived the game with the agent it started (2026-10-20).
+			// The app name is quoted too: it comes from a file the
+			// sandbox can write, and runWine runs this under sh -c
+			// (Kamino 139).
 			return "flatpak run --command=" + shellQuote(wine) +
-				" --env=WINEPREFIX=" + shellQuote(CleanPrefix(p.Prefix)) + " " + app
+				" --env=WINEPREFIX=" + shellQuote(CleanPrefix(p.Prefix)) + " " + shellQuote(app)
 		}
 		return wine
 	}

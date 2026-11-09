@@ -157,6 +157,15 @@ type Info struct {
 	Window broadcast.WindowID // the window it is paired with, "" if none
 }
 
+// maxHeldRefused and holdRefusedFor are refuse's bounds. A handful of
+// prefixes is the real case; the cap is for whatever else dials 127.0.0.1.
+// An old agent closed after holdRefusedFor redials once and is held again,
+// one reconnect per hold rather than 500 a second.
+const (
+	maxHeldRefused = 16
+	holdRefusedFor = 10 * time.Minute
+)
+
 // Options configures a Registry.
 type Options struct {
 	// Windows lists the compositor's windows. The registry needs it to pair
@@ -196,6 +205,11 @@ type Registry struct {
 	// already logged; see refuse.
 	held   map[net.Conn]struct{}
 	warned map[string]bool
+	// maxHeld and holdFor bound the refused connections held open: past
+	// maxHeld a refusal closes at once, and each one held is closed after
+	// holdFor (Kamino 139). Fields so tests can shrink them.
+	maxHeld int
+	holdFor time.Duration
 
 	changed chan struct{} // nudges the repair loop when the agent set changes
 }
@@ -216,6 +230,8 @@ func NewRegistry(opts Options) *Registry {
 		agents:  map[int64]*Agent{},
 		held:    map[net.Conn]struct{}{},
 		warned:  map[string]bool{},
+		maxHeld: maxHeldRefused,
+		holdFor: holdRefusedFor,
 		changed: make(chan struct{}, 1),
 	}
 }
@@ -497,6 +513,10 @@ func (r *Registry) serve(c net.Conn) {
 // 500 times a second: 50,000 refusals in 90 seconds, in both logs and on the
 // wineserver the game shares. Held open, they sit idle until the game exits.
 // The refusal is logged once per prefix.
+//
+// Holding is bounded (Kamino 139): at most maxHeld at once, a refusal past
+// that is closed at once, and each held one is closed after holdFor however
+// much it sends.
 func (r *Registry) refuse(c net.Conn, h agentwire.Hello, why string) {
 	key := h.Describe() + "\x00" + why
 	r.mu.Lock()
@@ -506,13 +526,19 @@ func (r *Registry) refuse(c net.Conn, h agentwire.Hello, why string) {
 	}
 	first := !r.warned[key]
 	r.warned[key] = true
-	r.held[c] = struct{}{}
+	full := len(r.held) >= r.maxHeld
+	if !full {
+		r.held[c] = struct{}{}
+	}
 	r.mu.Unlock()
 	if first {
 		r.opts.Notify(fmt.Sprintf("agent %s (%s): refused, it sent %s; install it again (`clonecast agent install`, or i in the Prefixes pane) and restart the game",
 			c.RemoteAddr(), h.Describe(), why), true)
 	}
-	_ = c.SetReadDeadline(time.Time{})
+	if full {
+		return // serve's deferred Close
+	}
+	_ = c.SetReadDeadline(time.Now().Add(r.holdFor))
 	_, _ = io.Copy(io.Discard, c)
 	r.mu.Lock()
 	delete(r.held, c)

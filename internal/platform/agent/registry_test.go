@@ -616,3 +616,96 @@ func TestCloseSendsWhatIsQueued(t *testing.T) {
 	}
 	<-closed
 }
+
+// refusedClient dials with no token and waits for the registry to take it in.
+func refusedClient(t *testing.T, reg *Registry) *testClient {
+	t.Helper()
+	return dialAgent(t, reg.Addr(), agentwire.Hello{Version: agentwire.Version, Title: "Game"})
+}
+
+// closedWithin reports whether the registry closes c within d.
+func closedWithin(c *testClient, d time.Duration) bool {
+	_ = c.conn.SetReadDeadline(time.Now().Add(d))
+	_, err := c.conn.Read(make([]byte, 1))
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || (err != nil && !isTimeout(err))
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// Kamino 139: refused connections were held open with no limit, a goroutine
+// and a socket each for as long as the peer liked. Past the cap a refusal is
+// closed at once; the ones held stay held.
+func TestRefusedConnectionsAreCapped(t *testing.T) {
+	reg := NewRegistry(Options{Token: "s3cret"})
+	reg.maxHeld = 2
+	if err := reg.Listen("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	first := []*testClient{refusedClient(t, reg), refusedClient(t, reg)}
+	waitFor(t, "two refusals held", func() bool {
+		reg.mu.Lock()
+		defer reg.mu.Unlock()
+		return len(reg.held) == 2
+	})
+	extra := refusedClient(t, reg)
+	if !closedWithin(extra, 2*time.Second) {
+		t.Fatal("a refusal past the cap was held open")
+	}
+	for i, c := range first {
+		if closedWithin(c, 100*time.Millisecond) {
+			t.Fatalf("held refusal %d was closed by the one past the cap", i)
+		}
+	}
+	reg.mu.Lock()
+	n := len(reg.held)
+	reg.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("%d refusals held, want 2", n)
+	}
+}
+
+// Kamino 139: a held refusal has a deadline. A peer that never closes, or
+// streams bytes at the registry, is closed when it passes.
+func TestRefusedConnectionsHaveADeadline(t *testing.T) {
+	reg := NewRegistry(Options{Token: "s3cret"})
+	reg.holdFor = 300 * time.Millisecond
+	if err := reg.Listen("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	quiet := refusedClient(t, reg)
+	chatty := refusedClient(t, reg)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+				if _, err := chatty.conn.Write([]byte("keepalive\n")); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	if closedWithin(quiet, 50*time.Millisecond) {
+		t.Fatal("a refusal was closed at once; want it held until the deadline")
+	}
+	for name, c := range map[string]*testClient{"quiet": quiet, "chatty": chatty} {
+		if !closedWithin(c, 3*time.Second) {
+			t.Fatalf("the %s refusal was still open 3s after a 300ms hold", name)
+		}
+	}
+	waitFor(t, "no refusals held", func() bool {
+		reg.mu.Lock()
+		defer reg.mu.Unlock()
+		return len(reg.held) == 0
+	})
+}

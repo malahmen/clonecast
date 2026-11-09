@@ -45,6 +45,7 @@ Pure Go, mature, supports exporting objects (we need inbound calls, see 3.3).
 
 **2.5 Go 1.24 in go.mod.** (2026-09-07)
 Set by dependency requirements during `go get`, not by choice. Local toolchain auto-downloads.
+The patch is 1.24.13 (2026-11-09, Kamino 139), the last 1.24 release, which clears the stdlib advisories govulncheck found reachable at 1.24.2 except two: GO-2026-4971 (`net.Dial` on Windows, the agent) and GO-2026-4602 (`os.Root`), fixed only in Go 1.25.10 and 1.25.8.
 
 ---
 
