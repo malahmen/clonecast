@@ -29,7 +29,9 @@
 //
 // Hello fields, all optional and order-independent:
 //
-//	prefix=  the agent's WINEPREFIX, as the agent's environment reports it
+//	prefix=  the agent's Wine prefix: WINEPREFIX from its environment, or,
+//	         under plain `wine` which sets none, the prefix it is installed
+//	         in, worked out from its own path (AnnouncedPrefix)
 //	title=   the caption of the window the agent delivers to
 //	exe=     the agent's own image path (diagnostics only)
 //	pid=     the agent's Windows process id, decimal (diagnostics only)

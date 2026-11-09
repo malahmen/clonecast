@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -356,5 +358,43 @@ func TestPairingTitlelessHelloThenTheCaption(t *testing.T) {
 	p.recompute(context.Background(), agents)
 	if w, ok := p.windowFor(1); !ok || w != "game" {
 		t.Errorf("after the caption arrived the agent serves %q (ok=%v), want the game", w, ok)
+	}
+}
+
+// Kamino 276: a plain-`wine` game has no WINEPREFIX, so its window's prefix is
+// the default $HOME/.wine, and its agent, which has none either, announces the
+// prefix it derives from its own install path. The two must pair by prefix.
+// The captions are set up so a title match picks the OTHER agent, which is
+// what happened before: the window had no prefix and fell to the title.
+func TestPairingPlainWineWindowWithItsAgent(t *testing.T) {
+	realHome := t.TempDir()
+	if err := os.Mkdir(filepath.Join(realHome, ".wine"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The agent reaches the prefix through a symlinked home, the window's
+	// environment through the real one: they still name one directory.
+	linkHome := filepath.Join(t.TempDir(), "home")
+	if err := os.Symlink(realHome, linkHome); err != nil {
+		t.Fatal(err)
+	}
+	other := t.TempDir()
+	root := fakeProc(t, map[int][]string{9100: {"HOME=" + realHome, "DISPLAY=:0"}})
+	if err := os.WriteFile(filepath.Join(root, "9100", "cmdline"), []byte("C:\\Program Files\\WoW\\Wow.exe\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	announced := agentwire.AnnouncedPrefix("", linkHome+"/.wine/dosdevices/c:/clonecast/clonecast-agent.exe")
+	if announced == "" {
+		t.Fatal("the plain-wine agent announced no prefix")
+	}
+	wins := []broadcast.Window{{ID: "w1", Title: "World of Warcraft", PID: 9100}}
+	p := newTestPairing(t, func() ([]broadcast.Window, error) { return wins, nil }, root, nil)
+	agents := agentsFor(
+		agentwire.Hello{Prefix: announced, Title: "Renamed"},
+		agentwire.Hello{Prefix: other, Title: "World of Warcraft"},
+	)
+	p.recompute(context.Background(), agents)
+
+	if id, ok := p.agentFor("w1"); !ok || id != 1 {
+		t.Errorf("w1 paired with agent %d (ok=%v), want the ~/.wine agent (1) by prefix", id, ok)
 	}
 }

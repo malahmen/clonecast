@@ -84,11 +84,14 @@ signal it, which is what used to take the game down with it.
 
 **Agents register themselves.** clonecast listens on one loopback address
 (`--listen`, default `127.0.0.1:48800`) and every agent dials in, announcing its
-`WINEPREFIX`, its window title, its Windows pid and the window handle it found.
+its Wine prefix, its window title, its Windows pid and the window handle it found.
 clonecast pairs that announcement with a window in the compositor's list by
 reading `WINEPREFIX` out of that window's process (`/proc/<pid>/environ`, using
 the host pid KWin gets from the X server), falling back to matching the window
-title when the pid or its environment cannot be read. So there is no per-instance
+title when the pid or its environment cannot be read. A game started with plain
+`wine` sets no `WINEPREFIX` and runs in `~/.wine`, so both sides take that
+default: the window's process is placed in its `$HOME/.wine`, and the agent
+works its prefix out from the path it is installed at. So there is no per-instance
 port and no title→port map: a window with a live agent is marked `●` in the
 Targets list, and ticking it is the only action.
 

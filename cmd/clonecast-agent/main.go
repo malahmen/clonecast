@@ -9,7 +9,7 @@
 // under Wine; this installs none).
 //
 // It dials clonecast; clonecast does not dial it (REFERENCE.md 4.17). On
-// connect it announces its WINEPREFIX, its window's caption, its Windows pid and
+// connect it announces its prefix, its window's caption, its Windows pid and
 // the resolved HWND, and clonecast pairs that announcement with a window in
 // the compositor's list — so the user ticks a window in the TUI and nothing
 // else. Before this, every agent listened on a hand-picked port and the user
@@ -86,9 +86,12 @@ var (
 	procGetWindowRect    = user32.NewProc("GetWindowRect")
 	procGetWindowLongW   = user32.NewProc("GetWindowLongW")
 
-	kernel32        = syscall.NewLazyDLL("kernel32.dll")
-	procCreateMutex = kernel32.NewProc("CreateMutexW")
-	procTerminate   = kernel32.NewProc("TerminateProcess")
+	kernel32                = syscall.NewLazyDLL("kernel32.dll")
+	procCreateMutex         = kernel32.NewProc("CreateMutexW")
+	procTerminate           = kernel32.NewProc("TerminateProcess")
+	procWineGetUnixFileName = kernel32.NewProc("wine_get_unix_file_name")
+	procGetProcessHeap      = kernel32.NewProc("GetProcessHeap")
+	procHeapFree            = kernel32.NewProc("HeapFree")
 
 	ntdll                       = syscall.NewLazyDLL("ntdll.dll")
 	procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
@@ -582,16 +585,78 @@ func hello(title string, hwnd uintptr, caption string) agentwire.Hello {
 	return agentwire.Hello{
 		Token:   token,
 		Version: agentwire.Version,
-		// WINEPREFIX is what clonecast joins against the host pid of the KWin
+		// The prefix is what clonecast joins against the host pid of the KWin
 		// window (REFERENCE.md 4.17). Wine hands the Unix environment to
-		// Windows processes unchanged, so this is set under every launcher
-		// that sets it — and when it is not, clonecast falls back to Title.
-		Prefix: os.Getenv("WINEPREFIX"),
+		// Windows processes unchanged, so WINEPREFIX is set under every
+		// launcher that sets it; plain `wine` does not, and then the prefix
+		// comes from the agent's own path (Kamino 276). When neither gives
+		// one, clonecast falls back to Title.
+		Prefix: announcedPrefix(),
 		Title:  agentwire.AnnouncedTitle(title, caption),
 		Exe:    self,
 		PID:    os.Getpid(),
 		HWND:   uint64(hwnd),
 	}
+}
+
+// announcedPrefix is the prefix this agent announces, worked out once: its
+// exe never moves while it runs.
+var announcedPrefix = sync.OnceValue(func() string {
+	env := os.Getenv("WINEPREFIX")
+	if strings.TrimSpace(env) != "" {
+		return env
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	p := agentwire.AnnouncedPrefix(env, unixFileName(self))
+	if p == "" {
+		logf("no WINEPREFIX and %s is not an installed agent's path: clonecast will pair this agent by title only", self)
+	}
+	return p
+})
+
+// unixFileName is the host path of a Windows path, through Wine's own
+// kernel32 export wine_get_unix_file_name (the call winepath -u makes), or ""
+// when it fails or this is not Wine. The export is CDECL, which Go's syscall
+// calls correctly: the stub restores the stack pointer after the call. Wine
+// allocates the returned char* with HeapAlloc on the process heap and
+// documents that the caller frees it, so it is copied and HeapFree'd.
+func unixFileName(win string) string {
+	if procWineGetUnixFileName.Find() != nil {
+		return "" // real Windows: no such export
+	}
+	w, err := syscall.UTF16PtrFromString(win)
+	if err != nil {
+		return ""
+	}
+	r, _, _ := procWineGetUnixFileName.Call(uintptr(unsafe.Pointer(w)))
+	if r == 0 {
+		return ""
+	}
+	// Reinterpreting through &r rather than unsafe.Pointer(r) keeps vet's
+	// uintptr check quiet; the memory is Wine's heap, which Go never moves.
+	s := cString(*(*unsafe.Pointer)(unsafe.Pointer(&r)))
+	if heap, _, _ := procGetProcessHeap.Call(); heap != 0 {
+		procHeapFree.Call(heap, 0, r)
+	}
+	return s
+}
+
+// cString copies a NUL-terminated C string. Wine's Unix paths are bounded by
+// PATH_MAX, so the scan is capped there as a guard against a missing NUL.
+func cString(p unsafe.Pointer) string {
+	const limit = 4096
+	var b []byte
+	for i := 0; i < limit; i++ {
+		c := *(*byte)(unsafe.Add(p, i))
+		if c == 0 {
+			break
+		}
+		b = append(b, c)
+	}
+	return string(b)
 }
 
 // session runs one connection to clonecast: announce, keep alive, and post
@@ -612,7 +677,7 @@ func session(c net.Conn, res *resolver, title string) {
 		logf("hello: %v", err)
 		return
 	}
-	logf("registered with clonecast at %s (hwnd=0x%x, prefix=%q)", c.RemoteAddr(), announced, os.Getenv("WINEPREFIX"))
+	logf("registered with clonecast at %s (hwnd=0x%x, prefix=%q)", c.RemoteAddr(), announced, announcedPrefix())
 
 	done := make(chan struct{})
 	defer close(done)
